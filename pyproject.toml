@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sops-mcp"
-version = "0.9.0"
+version = "0.9.1"
 description = "MCP server for creating and managing SOPS-encrypted secrets"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-    "mcp>=1.6.0,<1.12.0",
+    "mcp>=1.23.0,<2.0.0",
+    "python-multipart>=0.0.26",
     "pyyaml>=6.0",
 ]
 
