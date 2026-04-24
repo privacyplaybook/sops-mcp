@@ -6,13 +6,17 @@ Designed for Claude Code (or any MCP client) to produce encrypted `secrets.enc.y
 
 ## Why
 
-**Keep secrets in your source tree without leaking them.** For a small project, running a full secrets manager (Vault, AWS Secrets Manager, etc.) is overkill for a handful of credentials. Encrypting secrets at rest in git and decrypting them in your CI/CD pipeline at deploy time is much cheaper:
+Two goals drive the design:
+
+**1. Keep secrets in your source tree without leaking them.** For a small project, running a full secrets manager (Vault, AWS Secrets Manager, etc.) is overkill for a handful of credentials. Encrypting secrets at rest in git and decrypting them in your CI/CD pipeline at deploy time is much cheaper:
 
 1. Create `secrets.enc.yaml` via this server — age-encrypted against your public key, safe to commit.
 2. Commit it alongside your code.
 3. Your CI/CD pipeline holds the age private key, decrypts at deploy time, and injects plaintext as environment variables into your container orchestrator.
 
-The age private key lives in exactly one place: your CI/CD secrets store. Everywhere else — your laptop, your git remote, your container images — sees only ciphertext. The MCP client also never sees plaintext: you give the server the public key, and even mutations that regenerate values return only metadata. See the [worked example](#example-integrating-with-a-cicd-deployment-pipeline) below.
+The age private key lives in exactly one place: your CI/CD secrets store. Everywhere else — your laptop, your git remote, your container images — sees only ciphertext. See the [worked example](#example-integrating-with-a-cicd-deployment-pipeline) below.
+
+**2. Let an AI coding agent generate secrets it can never read.** Claude (or any MCP client) can create passwords, rotate them, derive hashes, rename and delete them — but plaintext values never cross the MCP boundary back to the model. The server holds the encryption key; the client only submits requests and receives metadata. There is deliberately no "decrypt this one secret" tool. If a prompt injection or a misbehaving agent tried to exfiltrate a secret via tool output, there is no tool output to exfiltrate.
 
 This pattern assumes a single age recipient (the one CI private key). For multi-recipient / team key management, use the `sops` CLI directly for recipient rotations and this server for content management.
 
