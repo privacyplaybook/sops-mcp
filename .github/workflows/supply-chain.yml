@@ -1,0 +1,29 @@
+name: Supply chain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - requirements.in
+      - requirements.lock.txt
+      - base-images.lock.json
+      - lib/**
+      - .github/workflows/supply-chain.yml
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify requirements lockfile
+        run: python3 lib/verify_requirements.py
+      - name: Verify base images are digest-pinned
+        run: python3 lib/verify_base_images.py

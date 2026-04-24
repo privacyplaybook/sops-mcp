@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install sops and age
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 \
+            -o /tmp/sops
+          echo "5488e32bc471de7982ad895dd054bbab3ab91c417a118426134551e9626e4e85  /tmp/sops" \
+            | sha256sum -c -
+          sudo install -m 755 /tmp/sops /usr/local/bin/sops
+          curl -fsSL \
+            https://github.com/FiloSottile/age/releases/download/v1.2.0/age-v1.2.0-linux-amd64.tar.gz \
+            -o /tmp/age.tar.gz
+          echo "2ae71cb3ea761118937a944083f057cfd42f0ef11d197ce72fc2b8780d50c4ef  /tmp/age.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/age.tar.gz -C /tmp
+          sudo install -m 755 /tmp/age/age /usr/local/bin/age
+          sudo install -m 755 /tmp/age/age-keygen /usr/local/bin/age-keygen
+
+      - name: Install Python dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src/ tests/
+
+      - name: Test
+        run: pytest tests/ -v

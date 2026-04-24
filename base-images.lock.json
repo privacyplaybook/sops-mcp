@@ -1,0 +1,10 @@
+{
+  "python:3.12-slim": {
+    "cosign_detail": "cosign not installed",
+    "cosign_signed": false,
+    "digest": "sha256:3d5ed973e45820f5ba5e46bd065bd88b3a504ff0724d85980dcd05eab361fcf4",
+    "used_in": [
+      "Dockerfile"
+    ]
+  }
+}
