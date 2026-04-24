@@ -1281,31 +1281,69 @@ class SopsMcpServer:
                 self.server.create_initialization_options(),
             )
 
-    async def run_sse(
-        self, host: str = "0.0.0.0", port: int = 55090
-    ) -> None:
-        """Run the server with SSE transport over HTTP."""
-        import uvicorn
-        from mcp.server.sse import SseServerTransport
+    def _build_sse_app(
+        self,
+        allowed_hosts: list[str] | None = None,
+    ) -> Starlette:
+        """Build the Starlette app used by the SSE transport.
 
-        sse = SseServerTransport("/messages/")
+        Exposed as a separate method so the wired-up app — including the
+        DNS-rebinding middleware inside SseServerTransport — can be exercised
+        from tests without spinning up uvicorn.
+        """
+        from mcp.server.sse import SseServerTransport
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        if allowed_hosts is None:
+            allowed_hosts = [
+                "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
+            ]
+        security_settings = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=[],
+        )
+        sse = SseServerTransport(
+            "/messages/", security_settings=security_settings,
+        )
         api_token = os.environ.get("SOPS_MCP_API_TOKEN")
+
+        class _ResponseAlreadySent(Response):
+            """Return this from a Starlette endpoint when the underlying
+            ASGI response has already been written directly via send() —
+            e.g. by MCP's transport-security middleware. Its __call__ is
+            a no-op, so Starlette won't try to double-send."""
+
+            def __init__(self) -> None:
+                super().__init__(b"")
+
+            async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+                return
 
         async def handle_sse(request: Request) -> Response:
             if api_token and request.headers.get(
                 "authorization"
             ) != f"Bearer {api_token}":
                 return PlainTextResponse("Unauthorized", status_code=401)
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as (read_stream, write_stream):
-                await self.server.run(
-                    read_stream,
-                    write_stream,
-                    self.server.create_initialization_options(),
-                    stateless=True,
-                )
-            return Response()
+            try:
+                async with sse.connect_sse(
+                    request.scope, request.receive, request._send
+                ) as (read_stream, write_stream):
+                    await self.server.run(
+                        read_stream,
+                        write_stream,
+                        self.server.create_initialization_options(),
+                        stateless=True,
+                    )
+            except ValueError:
+                # SseServerTransport raises ValueError AFTER the transport-
+                # security middleware has already written a 4xx response
+                # (bad Host, bad Content-Type). Starlette would otherwise
+                # convert it to a 500 and try to double-send.
+                return _ResponseAlreadySent()
+            # After a normal SSE lifecycle, the stream has already been
+            # fully written — same "don't double-send" rule applies.
+            return _ResponseAlreadySent()
 
         async def handle_messages(
             scope: Any, receive: Any, send: Any
@@ -1325,7 +1363,7 @@ class SopsMcpServer:
         async def health(request: Request) -> PlainTextResponse:
             return PlainTextResponse("ok")
 
-        app = Starlette(
+        return Starlette(
             routes=[
                 Route("/health", health, methods=["GET"]),
                 Route("/sse", handle_sse, methods=["GET"]),
@@ -1333,6 +1371,22 @@ class SopsMcpServer:
             ],
         )
 
+    async def run_sse(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 55090,
+        allowed_hosts: list[str] | None = None,
+    ) -> None:
+        """Run the server with SSE transport over HTTP.
+
+        DNS rebinding protection is always enabled: the underlying
+        SseServerTransport is constructed with TransportSecuritySettings
+        that validate the Host header against `allowed_hosts`. When
+        `allowed_hosts` is None, the default is loopback only.
+        """
+        import uvicorn
+
+        app = self._build_sse_app(allowed_hosts=allowed_hosts)
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
         server = uvicorn.Server(config)
         await server.serve()
@@ -1368,8 +1422,33 @@ def main() -> None:
     server = create_server()
 
     if transport == "sse":
-        host = os.environ.get("SOPS_MCP_HOST", "0.0.0.0")
+        host = os.environ.get("SOPS_MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("SOPS_MCP_PORT", "55090"))
-        asyncio.run(server.run_sse(host=host, port=port))
+        api_token = os.environ.get("SOPS_MCP_API_TOKEN")
+        if host == "0.0.0.0" and not api_token:
+            raise RuntimeError(
+                "Refusing to bind the SSE transport to 0.0.0.0 without "
+                "SOPS_MCP_API_TOKEN. Either set the token, bind to "
+                "127.0.0.1, or place the server behind an authenticating "
+                "reverse proxy."
+            )
+        allowed_hosts_env = os.environ.get("SOPS_MCP_ALLOWED_HOSTS", "").strip()
+        allowed_hosts: list[str] | None = None
+        if allowed_hosts_env:
+            allowed_hosts = [
+                h.strip() for h in allowed_hosts_env.split(",") if h.strip()
+            ]
+        elif host != "127.0.0.1":
+            logger.warning(
+                "SOPS_MCP_HOST=%s but SOPS_MCP_ALLOWED_HOSTS is unset; "
+                "falling back to loopback-only allowed_hosts. Clients whose "
+                "Host header is not 127.0.0.1/localhost will be rejected. "
+                "Set SOPS_MCP_ALLOWED_HOSTS (comma-separated) to match your "
+                "deployment's expected Host header(s).",
+                host,
+            )
+        asyncio.run(
+            server.run_sse(host=host, port=port, allowed_hosts=allowed_hosts)
+        )
     else:
         asyncio.run(server.run())

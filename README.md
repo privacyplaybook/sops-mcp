@@ -131,8 +131,9 @@ Add to your project's `.mcp.json`:
 | `SOPS_MCP_LOG_LEVEL` | No | Log level (default: `WARNING`) |
 | `SOPS_AGE_KEY` | Sometimes | Age private key — required for any mutation tool (rotate, add, update, rename, delete) |
 | `SOPS_MCP_TRANSPORT` | No | `stdio` (default) or `sse` |
-| `SOPS_MCP_HOST` / `SOPS_MCP_PORT` | No | Bind host/port for SSE transport (default: `0.0.0.0:55090`) |
-| `SOPS_MCP_API_TOKEN` | No | If set, SSE transport requires `Authorization: Bearer <token>` |
+| `SOPS_MCP_HOST` / `SOPS_MCP_PORT` | No | Bind host/port for SSE transport (default: `127.0.0.1:55090`). Binding to `0.0.0.0` requires `SOPS_MCP_API_TOKEN` — the server refuses to start otherwise. |
+| `SOPS_MCP_ALLOWED_HOSTS` | No | Comma-separated allowlist for the SSE `Host` header (DNS rebinding protection). Default: `127.0.0.1,127.0.0.1:*,localhost,localhost:*`. Set explicitly when binding to a non-loopback address — e.g. `mcp.example.com,mcp.example.com:*`. |
+| `SOPS_MCP_API_TOKEN` | Sometimes | Required when SSE transport binds to `0.0.0.0`; otherwise optional. When set, SSE requires `Authorization: Bearer <token>`. |
 
 \* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set.
 
