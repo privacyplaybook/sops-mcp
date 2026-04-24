@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1]
+
+Security hardening release. Fixes two transitive CVEs and tightens defaults
+for the SSE-over-HTTP transport. No changes to the core tool surface or to
+the "no plaintext crosses the MCP boundary" property.
+
+### Security
+
+- **Upgrade `mcp` to >=1.23.0** (GHSA — DNS rebinding protection not enabled
+  by default in earlier versions of the MCP Python SDK). The low-level
+  `SseServerTransport` in this server is now constructed with explicit
+  `TransportSecuritySettings` that validate the `Host` header on every
+  request.
+- **Upgrade `python-multipart` to >=0.0.26** (GHSA — DoS via inefficient
+  parsing of crafted multipart preamble/epilogue data).
+- **Refuse to bind SSE transport to `0.0.0.0` without `SOPS_MCP_API_TOKEN`.**
+  The server now raises `RuntimeError` at startup rather than silently
+  exposing an unauthenticated interface on all network interfaces.
+- **Flip `SOPS_MCP_HOST` default from `0.0.0.0` to `127.0.0.1`** for the
+  direct `python -m sops_mcp` entrypoint. The published container still
+  binds `0.0.0.0` (because that's what makes a container reachable), which
+  combined with the above refusal means containerized deployments must now
+  set `SOPS_MCP_API_TOKEN`.
+- **Non-root Dockerfile.** The container runs as a dedicated UID (10001)
+  instead of root. Shrinks the blast radius of any remote-code-execution
+  class bug inside the server.
+
+### Added
+
+- `SOPS_MCP_ALLOWED_HOSTS` env var (comma-separated) to configure the
+  `Host`-header allowlist for the SSE transport. Defaults to loopback only;
+  deployments behind a reverse proxy or with non-loopback binds must set
+  this explicitly.
+
 ## [0.9.0]
 
 Release candidate for the first open-source release. Adds a third secret source
