@@ -4,6 +4,18 @@ MCP server for creating and managing [SOPS](https://github.com/getsops/sops)-enc
 
 Designed for Claude Code (or any MCP client) to produce encrypted `secrets.enc.yaml` files without the model ever seeing plaintext values. All file content is passed as text parameters and returned as text — the server has no filesystem access to the client.
 
+## Why
+
+**Keep secrets in your source tree without leaking them.** For a small project, running a full secrets manager (Vault, AWS Secrets Manager, etc.) is overkill for a handful of credentials. Encrypting secrets at rest in git and decrypting them in your CI/CD pipeline at deploy time is much cheaper:
+
+1. Create `secrets.enc.yaml` via this server — age-encrypted against your public key, safe to commit.
+2. Commit it alongside your code.
+3. Your CI/CD pipeline holds the age private key, decrypts at deploy time, and injects plaintext as environment variables into your container orchestrator.
+
+The age private key lives in exactly one place: your CI/CD secrets store. Everywhere else — your laptop, your git remote, your container images — sees only ciphertext. The MCP client also never sees plaintext: you give the server the public key, and even mutations that regenerate values return only metadata. See the [worked example](#example-integrating-with-a-cicd-deployment-pipeline) below.
+
+This pattern assumes a single age recipient (the one CI private key). For multi-recipient / team key management, use the `sops` CLI directly for recipient rotations and this server for content management.
+
 ## Design
 
 Three ideas shape the tool surface:
@@ -54,7 +66,28 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 
 - Python 3.11+
 - [sops](https://github.com/getsops/sops) CLI binary
-- An age keypair (generate with `age-keygen`)
+- An age keypair (see below)
+
+### Generating an age keypair
+
+If you don't already have one, install [age](https://github.com/FiloSottile/age) and run:
+
+```bash
+age-keygen -o age-key.txt
+```
+
+The file looks like:
+
+```
+# created: 2026-04-22T12:34:56Z
+# public key: age1abc...xyz
+AGE-SECRET-KEY-1HH...
+```
+
+- **Public key** (`age1...`) — pass to this server as `SOPS_MCP_AGE_PUBLIC_KEY`. Safe to share anywhere.
+- **Private key** (`AGE-SECRET-KEY-...`) — store as a CI/CD secret (commonly named `SOPS_AGE_KEY`). Never commit to source control. Anyone with this key can decrypt every `secrets.enc.yaml` encrypted to the matching public key.
+
+Back up the private key somewhere safe (password manager, hardware token). Losing it means losing access to every secret you've encrypted.
 
 ### Installation
 
@@ -202,7 +235,7 @@ ruff check src/ tests/
 
 A common pattern: use this server to produce `secrets.enc.yaml` files committed to your infrastructure repo, then decrypt them in CI and inject the plaintext values as environment variables to a container orchestrator (Portainer, Kubernetes, Nomad).
 
-1. Generate an age keypair once; give the private key to your CI as a secret, the public key to Claude Code as `SOPS_MCP_AGE_PUBLIC_KEY`.
+1. [Generate an age keypair](#generating-an-age-keypair) once. Give the private key to your CI as a secret (e.g. `SOPS_AGE_KEY`), the public key to Claude Code as `SOPS_MCP_AGE_PUBLIC_KEY`.
 2. Ask the model to produce a `secrets.enc.yaml` with `sops_create_secrets`.
 3. Commit the encrypted file.
 4. In your deploy workflow, run `sops decrypt secrets.enc.yaml > .env` (or equivalent) and pass the result to your orchestrator.
