@@ -1,5 +1,10 @@
 FROM python:3.12-slim@sha256:3d5ed973e45820f5ba5e46bd065bd88b3a504ff0724d85980dcd05eab361fcf4
 
+# Unprivileged runtime user. Created early; all build steps still run as root.
+RUN groupadd --system --gid=10001 sops-mcp && \
+    useradd --system --gid=10001 --uid=10001 \
+      --home-dir=/app --shell=/sbin/nologin sops-mcp
+
 # Install sops and age binaries with checksum verification
 RUN apt-get update && apt-get install -y --no-install-recommends curl && \
     curl -fsSL -o /usr/local/bin/sops \
@@ -25,8 +30,14 @@ COPY pyproject.toml .
 COPY src/ src/
 RUN pip install --no-cache-dir --no-deps .
 
+USER sops-mcp:sops-mcp
+
 ENV SOPS_MCP_TRANSPORT=sse
+ENV SOPS_MCP_HOST=0.0.0.0
 ENV SOPS_MCP_PORT=55090
+ENV SOPS_MCP_ALLOWED_HOSTS=localhost,localhost:*,127.0.0.1,127.0.0.1:*
 EXPOSE 55090
 
+# Container binds 0.0.0.0 by default, which means SOPS_MCP_API_TOKEN must be
+# set at runtime — the server refuses to start otherwise. See README.
 CMD ["sops-mcp"]
