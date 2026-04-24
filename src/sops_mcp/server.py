@@ -1282,13 +1282,34 @@ class SopsMcpServer:
             )
 
     async def run_sse(
-        self, host: str = "0.0.0.0", port: int = 55090
+        self,
+        host: str = "127.0.0.1",
+        port: int = 55090,
+        allowed_hosts: list[str] | None = None,
     ) -> None:
-        """Run the server with SSE transport over HTTP."""
+        """Run the server with SSE transport over HTTP.
+
+        DNS rebinding protection is always enabled: the SseServerTransport is
+        constructed with TransportSecuritySettings that validate the Host
+        header against `allowed_hosts`. When `allowed_hosts` is None, the
+        default is loopback only.
+        """
         import uvicorn
         from mcp.server.sse import SseServerTransport
+        from mcp.server.transport_security import TransportSecuritySettings
 
-        sse = SseServerTransport("/messages/")
+        if allowed_hosts is None:
+            allowed_hosts = [
+                "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
+            ]
+        security_settings = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=[],
+        )
+        sse = SseServerTransport(
+            "/messages/", security_settings=security_settings,
+        )
         api_token = os.environ.get("SOPS_MCP_API_TOKEN")
 
         async def handle_sse(request: Request) -> Response:
@@ -1368,8 +1389,33 @@ def main() -> None:
     server = create_server()
 
     if transport == "sse":
-        host = os.environ.get("SOPS_MCP_HOST", "0.0.0.0")
+        host = os.environ.get("SOPS_MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("SOPS_MCP_PORT", "55090"))
-        asyncio.run(server.run_sse(host=host, port=port))
+        api_token = os.environ.get("SOPS_MCP_API_TOKEN")
+        if host == "0.0.0.0" and not api_token:
+            raise RuntimeError(
+                "Refusing to bind the SSE transport to 0.0.0.0 without "
+                "SOPS_MCP_API_TOKEN. Either set the token, bind to "
+                "127.0.0.1, or place the server behind an authenticating "
+                "reverse proxy."
+            )
+        allowed_hosts_env = os.environ.get("SOPS_MCP_ALLOWED_HOSTS", "").strip()
+        allowed_hosts: list[str] | None = None
+        if allowed_hosts_env:
+            allowed_hosts = [
+                h.strip() for h in allowed_hosts_env.split(",") if h.strip()
+            ]
+        elif host != "127.0.0.1":
+            logger.warning(
+                "SOPS_MCP_HOST=%s but SOPS_MCP_ALLOWED_HOSTS is unset; "
+                "falling back to loopback-only allowed_hosts. Clients whose "
+                "Host header is not 127.0.0.1/localhost will be rejected. "
+                "Set SOPS_MCP_ALLOWED_HOSTS (comma-separated) to match your "
+                "deployment's expected Host header(s).",
+                host,
+            )
+        asyncio.run(
+            server.run_sse(host=host, port=port, allowed_hosts=allowed_hosts)
+        )
     else:
         asyncio.run(server.run())
