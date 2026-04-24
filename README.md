@@ -226,6 +226,39 @@ lib/compile_requirements.sh
 
 The `supply-chain.yml` workflow runs `lib/verify_requirements.py` and `lib/verify_base_images.py` on every push and PR. It checks that all lockfiles are well-formed and all Dockerfile `FROM` lines are digest-pinned.
 
+## Verifying a published release
+
+Every container image published to GHCR is signed by this repo's publish workflow using keyless [cosign](https://github.com/sigstore/cosign) via sigstore, and ships with SLSA v1.0 build provenance and an SPDX SBOM attached as OCI artifacts. Every commit on `main` and every release tag is SSH-signed. You can verify all of this without holding any long-lived key material — the signatures are anchored in sigstore's public transparency log.
+
+Install cosign: https://docs.sigstore.dev/system_config/installation
+
+**Verify the image signature.** A successful verification proves the image was built by this repository's `publish.yml` workflow, not just that its digest matches a reference someone sent you.
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/privacyplaybook/sops-mcp/\.github/workflows/publish\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/privacyplaybook/sops-mcp:<tag>
+```
+
+**Inspect the attestations.**
+
+```bash
+# List all artifacts attached to the image
+cosign tree ghcr.io/privacyplaybook/sops-mcp:<tag>
+
+# Download the SBOM (SPDX JSON)
+cosign download sbom ghcr.io/privacyplaybook/sops-mcp:<tag>
+
+# Verify the SLSA build provenance
+cosign verify-attestation --type slsaprovenance1 \
+  --certificate-identity-regexp 'https://github.com/privacyplaybook/sops-mcp/\.github/workflows/publish\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/privacyplaybook/sops-mcp:<tag>
+```
+
+**Verify git tags and commits.** The simplest check is the green **Verified** badge on the github.com [commits](https://github.com/privacyplaybook/sops-mcp/commits/main) and [tags](https://github.com/privacyplaybook/sops-mcp/tags) pages.
+
 ## Development
 
 ```bash
