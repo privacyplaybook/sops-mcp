@@ -27,6 +27,8 @@ GHCR_AUTH = "https://ghcr.io/token"
 GHCR_REGISTRY = "https://ghcr.io"
 QUAY_AUTH = "https://quay.io/v2/auth"
 QUAY_REGISTRY = "https://quay.io"
+CGR_AUTH = "https://cgr.dev/token"
+CGR_REGISTRY = "https://cgr.dev"
 
 # Accept headers for manifest list (multi-arch) and single manifest
 MANIFEST_ACCEPT = ",".join([
@@ -84,6 +86,11 @@ def _get_token(registry: str, repository: str) -> str:
             "service": "quay.io",
             "scope": f"repository:{repository}:pull",
         })
+    elif registry == "cgr.dev":
+        resp = requests.get(CGR_AUTH, params={
+            "service": "cgr.dev",
+            "scope": f"repository:{repository}:pull",
+        })
     else:
         raise ValueError(f"Unknown registry: {registry}")
 
@@ -98,6 +105,8 @@ def _get_registry_url(registry: str) -> str:
         return GHCR_REGISTRY
     elif registry == "quay.io":
         return QUAY_REGISTRY
+    elif registry == "cgr.dev":
+        return CGR_REGISTRY
     else:
         raise ValueError(f"Unknown registry: {registry}")
 
