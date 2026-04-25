@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0]
+
+Supply-chain hardening release. Migrates the published Docker image to a
+Chainguard / Wolfi Python base for a signed origin and a distroless
+runtime. Python 3.13 minimum runtime in the published image; the library
+itself still supports 3.11+. No changes to the tool surface or to the
+"no plaintext crosses the MCP boundary" property.
+
+### Changed
+
+- **Base image switched to `cgr.dev/chainguard/python`** (Wolfi). The
+  build stage uses `:latest-dev` (with apk + shell + build toolchain);
+  the runtime stage uses `:latest` (distroless: no shell, no apk, no
+  package manager). Both are digest-pinned in `base-images.lock.json`
+  and cosign-verified by the supply-chain workflow. Wins: signed origin
+  via Chainguard's release identity, smaller surface, glibc-based (so
+  no Alpine/musl gotchas).
+- **Container runs as Chainguard's built-in `nonroot` user (uid 65532)**
+  instead of a custom uid 10001. No bind mounts in the supported
+  deployment, so this is documentation-only for most users; deployments
+  that mount host directories into the container will need to chown.
+- **`sops` and `age` binaries now come from Wolfi's apk repo** (signed
+  by Chainguard) rather than separately curl-downloaded with pinned
+  checksums. They are pinned transitively by the digest of the build
+  base image — re-pinning the base also re-pins these binaries.
+- **Published image runtime is Python 3.13.** The library's
+  `requires-python` is unchanged (`>=3.11`); only the Docker runtime
+  bumped. CI matrix expanded to test 3.11, 3.12, and 3.13.
+- **CMD → ENTRYPOINT.** The container now uses an ENTRYPOINT pointing
+  at the venv-installed console script for clearer container semantics.
+
+### Added
+
+- **`cgr.dev` registry support in `lib/pin_base_images.py`** so the
+  digest-pin/cosign-verify pipeline works for Chainguard images.
+
 ## [0.9.1]
 
 Security hardening release. Fixes two transitive CVEs and tightens defaults
