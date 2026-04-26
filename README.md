@@ -1,5 +1,7 @@
 # sops-mcp
 
+<!-- mcp-name: io.github.privacyplaybook/sops-mcp -->
+
 MCP server for creating and managing [SOPS](https://github.com/getsops/sops)-encrypted secret files using [age](https://github.com/FiloSottile/age) encryption.
 
 Designed for Claude Code (or any MCP client) to produce encrypted `secrets.enc.yaml` files without the model ever seeing plaintext values. All file content is passed as text parameters and returned as text — the server has no filesystem access to the client.
