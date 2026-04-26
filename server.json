@@ -1,0 +1,56 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.privacyplaybook/sops-mcp",
+  "description": "MCP server for creating and managing SOPS-encrypted secret files. Generates secrets that the calling agent can never read back, derives values like Authelia PBKDF2 hashes, and tracks per-secret metadata so files can be rotated and audited without decryption.",
+  "repository": {
+    "url": "https://github.com/privacyplaybook/sops-mcp",
+    "source": "github"
+  },
+  "version": "0.10.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "sops-mcp",
+      "version": "0.10.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "python"
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/privacyplaybook/sops-mcp",
+      "version": "0.10.0",
+      "transport": {
+        "type": "sse",
+        "url": "http://{host}:{port}/sse"
+      },
+      "environmentVariables": [
+        {
+          "name": "SOPS_MCP_AGE_PUBLIC_KEY",
+          "description": "Age recipient public key. Required at startup.",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "SOPS_AGE_KEY",
+          "description": "Age private key. Required at call time for any mutation tool (decrypt + re-encrypt). Read-only tools do not need it.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SOPS_MCP_API_TOKEN",
+          "description": "Bearer token for the SSE transport. Required when SOPS_MCP_HOST is non-loopback (the server refuses to bind 0.0.0.0 without it).",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SOPS_MCP_ALLOWED_HOSTS",
+          "description": "Comma-separated Host-header allowlist for DNS-rebinding protection on the SSE transport. Defaults to loopback only.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
