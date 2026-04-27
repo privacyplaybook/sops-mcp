@@ -1,0 +1,106 @@
+name: Publish to MCP Registry
+
+# Registers (or updates) the io.github.privacyplaybook/sops-mcp entry on
+# https://registry.modelcontextprotocol.io for a tagged release.
+#
+# Authenticates with mcp-publisher using GitHub Actions OIDC (no
+# long-lived secret, same trust model as our cosign + PyPI Trusted
+# Publishing flows). The registry derives namespace ownership from the
+# OIDC claim, so as long as this workflow runs in privacyplaybook/sops-mcp
+# the io.github.privacyplaybook/* namespace is implicit.
+#
+# Trigger model: fires on `release: published` so it naturally runs AFTER
+# both publish.yml (GHCR image) and publish-pypi.yml (PyPI sdist+wheel)
+# have completed — you create the GitHub release once those two are
+# green, then this submits to the registry. Manual workflow_dispatch is
+# also wired up in case the registry needs a re-publish for the same tag.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.10.1). Defaults to the workflow ref name."
+        required: false
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for `mcp-publisher login github-oidc`
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.7.0/mcp-publisher_linux_amd64.tar.gz \
+            -o /tmp/mcp-publisher.tar.gz
+          echo "5c61dd7dd33bbf00c9c0f569d3dc2f95bbbbfec0c6951a681a2dd573cb376851  /tmp/mcp-publisher.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/mcp-publisher.tar.gz -C /tmp
+          sudo install -m 755 /tmp/mcp-publisher /usr/local/bin/mcp-publisher
+
+      - name: Resolve tag and sync server.json
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+        # Rewrites server.json in-place so the published entry matches the
+        # tag. Top-level version drops the v-prefix; PyPI package version
+        # drops the v-prefix; OCI package identifier KEEPS the v-prefix
+        # because that's how publish.yml tags the image in GHCR.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+
+          tag = os.environ["TAG"]
+          if not tag.startswith("v"):
+              sys.exit(f"::error::Expected v-prefixed tag (e.g. v0.10.1), got {tag!r}")
+          ver = tag[1:]
+
+          with open("server.json") as f:
+              s = json.load(f)
+          s["version"] = ver
+          for pkg in s.get("packages", []):
+              if pkg.get("registryType") == "oci":
+                  base = pkg["identifier"].split(":", 1)[0]
+                  pkg["identifier"] = f"{base}:{tag}"
+              elif "version" in pkg:
+                  pkg["version"] = ver
+          with open("server.json", "w") as f:
+              json.dump(s, f, indent=2)
+              f.write("\n")
+          print(f"server.json synced to {tag} (version field = {ver!r})")
+          PY
+          cat server.json
+
+      - name: Validate server.json
+        run: mcp-publisher validate
+
+      - name: Authenticate with the registry (GitHub OIDC)
+        run: mcp-publisher login github-oidc
+
+      - name: Publish to MCP registry
+        run: mcp-publisher publish
+
+      - name: Confirm registry entry
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          curl -sS \
+            "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.privacyplaybook/sops-mcp" \
+            | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          servers = d.get('servers', d) if isinstance(d, dict) else d
+          # Best-effort dump regardless of response shape.
+          print(json.dumps(d, indent=2))
+          "
