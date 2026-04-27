@@ -30,6 +30,11 @@ RUN pip install --no-cache-dir --no-deps .
 # the built-in `nonroot` user (uid 65532) by default.
 FROM cgr.dev/chainguard/python:latest@sha256:18a4fbda8c280978b6aa5329f7acd4dbb106876e76fdc87913855ebf4876f2ff
 
+# Anti-squatting annotation required by registry.modelcontextprotocol.io
+# when an OCI image is referenced by a server.json submission. The label
+# binds the published image to a registry namespace this repo owns.
+LABEL io.modelcontextprotocol.server.name="io.github.privacyplaybook/sops-mcp"
+
 COPY --from=build /usr/bin/sops /usr/bin/sops
 COPY --from=build /usr/bin/age /usr/bin/age
 COPY --from=build /usr/bin/age-keygen /usr/bin/age-keygen
