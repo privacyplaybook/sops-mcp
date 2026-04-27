@@ -604,9 +604,18 @@ class SopsMcpServer:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
             except (ValueError, SopsError) as e:
                 return [TextContent(type="text", text=f"Error: {e}")]
-            except Exception as e:
+            except Exception:
+                # Don't echo the exception text back to the client — a
+                # raised exception from deep in the encrypt/yaml/subprocess
+                # path could in principle include secret-bearing context.
+                # Detail goes to the server log only.
                 logger.exception("Unexpected error handling %s", name)
-                return [TextContent(type="text", text=f"Internal error: {e}")]
+                return [
+                    TextContent(
+                        type="text",
+                        text="Internal error — check the server log.",
+                    )
+                ]
 
     async def _create_secrets(
         self, arguments: dict[str, Any]
