@@ -11,6 +11,28 @@ class SopsError(Exception):
     """Raised when a sops CLI operation fails."""
 
 
+def _make_secure_tempdir() -> str:
+    """Create a 0700 temp dir on tmpfs (/dev/shm) when available, falling
+    back to the default temp dir.
+
+    Using tmpfs means the plaintext temp file backing the sops invocation
+    is never written to persistent storage — defends against later disk
+    forensics and against block-level remnants on flash/COW filesystems
+    that the zero-overwrite in `_secure_cleanup` can't reach.
+    """
+    parent: str | None = None
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        parent = "/dev/shm"
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="sops-mcp-", dir=parent)
+    except OSError:
+        if parent is None:
+            raise
+        tmpdir = tempfile.mkdtemp(prefix="sops-mcp-")
+    os.chmod(tmpdir, 0o700)
+    return tmpdir
+
+
 class SopsEncryptor:
     """Encrypt and decrypt YAML data using the sops CLI."""
 
@@ -31,8 +53,7 @@ class SopsEncryptor:
             SOPS-encrypted YAML string.
         """
         plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
-        tmpdir = tempfile.mkdtemp(prefix="sops-mcp-")
-        os.chmod(tmpdir, 0o700)
+        tmpdir = _make_secure_tempdir()
         tmpfile = os.path.join(tmpdir, "secrets.yaml")
 
         try:
@@ -79,8 +100,7 @@ class SopsEncryptor:
                 "SOPS_AGE_KEY environment variable is required for decryption"
             )
 
-        tmpdir = tempfile.mkdtemp(prefix="sops-mcp-")
-        os.chmod(tmpdir, 0o700)
+        tmpdir = _make_secure_tempdir()
         tmpfile = os.path.join(tmpdir, "secrets.enc.yaml")
 
         try:
