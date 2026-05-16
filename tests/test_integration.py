@@ -8,6 +8,9 @@ import subprocess
 import pytest
 import yaml
 
+PBKDF2_TEST_SALT = b"integration-test-salt"
+PBKDF2_TEST_ITERATIONS = 600_000
+
 from sops_mcp.server import SopsMcpServer
 from sops_mcp.sops import SopsEncryptor
 
@@ -67,9 +70,12 @@ async def test_full_lifecycle(server):
     values = server.encryptor.decrypt(encrypted)
     assert len(values["DB_PASSWORD"]) == 32
     assert values["SMTP_USER"] == "user@example.com"
-    assert values["DB_PASSWORD_HASH"] == hashlib.sha256(
-        values["DB_PASSWORD"].encode()
-    ).hexdigest()
+    assert values["DB_PASSWORD_HASH"] == hashlib.pbkdf2_hmac(
+        "sha256",
+        values["DB_PASSWORD"].encode(),
+        PBKDF2_TEST_SALT,
+        PBKDF2_TEST_ITERATIONS,
+    ).hex()
 
     # 2. List without decryption
     listed = await server._list_secrets({"encrypted_content": encrypted})
@@ -87,9 +93,12 @@ async def test_full_lifecycle(server):
     values_after = server.encryptor.decrypt(rotated)
     assert values_after["DB_PASSWORD"] != values_before["DB_PASSWORD"]
     assert values_after["SMTP_USER"] == values_before["SMTP_USER"]
-    assert values_after["DB_PASSWORD_HASH"] == hashlib.sha256(
-        values_after["DB_PASSWORD"].encode()
-    ).hexdigest()
+    assert values_after["DB_PASSWORD_HASH"] == hashlib.pbkdf2_hmac(
+        "sha256",
+        values_after["DB_PASSWORD"].encode(),
+        PBKDF2_TEST_SALT,
+        PBKDF2_TEST_ITERATIONS,
+    ).hex()
 
     # 4. Add another secret
     added_result = await server._add_secrets({
