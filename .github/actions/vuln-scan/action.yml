@@ -1,0 +1,28 @@
+name: Vulnerability scan
+description: >
+  Fail if any pinned dependency in requirements.lock.txt has a known
+  vulnerability (GitHub Advisory DB / OSV / PyPI Advisory DB). This is the
+  release-time, secret-free equivalent of a clean Dependabot bill of health:
+  pip-audit queries the same advisory data, but needs no token (the
+  Dependabot alerts API is not readable by the Actions GITHUB_TOKEN).
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+    - name: Install pip-audit
+      shell: bash
+      run: python3 -m pip install --quiet "pip-audit>=2.7"
+    - name: Audit requirements.lock.txt
+      shell: bash
+      # --no-deps audits exactly the pinned closure (the lockfile already
+      # lists every transitive dependency); pip-audit exits non-zero if any
+      # listed version has a known advisory.
+      #
+      # Allowlist: to suppress an advisory that is genuinely not exploitable
+      # in this server, append `--ignore-vuln <GHSA-or-CVE-or-PYSEC-id>` and
+      # leave a comment saying why. Keep this empty unless justified.
+      run: pip-audit --no-deps -r requirements.lock.txt
