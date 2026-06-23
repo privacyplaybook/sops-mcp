@@ -1,0 +1,86 @@
+name: Create GitHub Release
+
+# Creates the GitHub Release for a version tag, with notes pulled straight
+# from the matching CHANGELOG.md section (so the release body is never
+# retyped), then triggers the MCP registry publish for final releases.
+#
+# Invoked two ways, both TRUSTED contexts (no untrusted-checkout exposure —
+# this deliberately avoids `workflow_run`, which would run privileged while
+# checking out an attacker-influenceable ref):
+#   - workflow_call from publish-pypi.yml, gated behind the PyPI publish job
+#     so the wheel is live before the Release exists (the registry entry
+#     references the PyPI package).
+#   - workflow_dispatch, to (re)create the Release for an existing tag by hand.
+#
+# A Release created with GITHUB_TOKEN does NOT emit `release: published`
+# (Actions suppresses it to avoid recursion), so the registry publish is
+# dispatched explicitly here (workflow_dispatch is the allowed exception). A
+# Release created by hand in the UI fires `release: published` and reaches
+# publish-mcp-registry.yml directly instead.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.10.1). Must already exist."
+        required: true
+        type: string
+
+permissions:
+  contents: write # create/edit the GitHub Release
+  actions: write # dispatch publish-mcp-registry.yml
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Validate tag and build notes from CHANGELOG
+        id: meta
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Not a version tag: '$TAG'"; exit 1 ;;
+          esac
+          prerelease=false
+          case "$TAG" in *-*) prerelease=true ;; esac
+          echo "prerelease=$prerelease" >>"$GITHUB_OUTPUT"
+          python3 lib/extract_changelog.py "${TAG#v}" > release-notes.md
+          echo "--- release-notes.md ---"; cat release-notes.md
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; updating notes (no re-publish)."
+            gh release edit "$TAG" --notes-file release-notes.md --title "$TAG"
+          else
+            flags=(--title "$TAG" --notes-file release-notes.md --verify-tag)
+            [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+            gh release create "$TAG" "${flags[@]}"
+          fi
+
+      - name: Trigger MCP registry publish (final releases only)
+        if: steps.meta.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run "Publish to MCP Registry" --ref "$TAG" -f tag="$TAG"
+          echo "Dispatched MCP registry publish for $TAG."
