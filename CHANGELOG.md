@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1]
+
+Dependency / security maintenance release. Regenerates `requirements.lock.txt`
+to move every transitive dependency flagged by Dependabot onto a patched
+release, clearing all 17 open alerts. No changes to the tool surface, the
+metadata schema, or the "no plaintext crosses the MCP boundary" property.
+
+Most of the flagged code was never on a path sops-mcp executes — the alerts
+came from `mcp`'s hard requirement on its HTTP-server + `pyjwt[crypto]` auth
+stack, while sops-mcp uses stdio plus a thin SSE transport with a static
+bearer-token compare (no JWT verification, no multipart form parsing). The
+bump removes the noise regardless.
+
+### Security
+
+- **Upgraded locked dependencies to patched versions** (via `pip-compile
+  --upgrade`): `starlette` 0.52.1 → 1.3.1, `pyjwt` 2.12.1 → 2.13.0,
+  `python-multipart` 0.0.27 → 0.0.32, `cryptography` 46.0.7 → 49.0.0,
+  `pydantic-settings` 2.13.1 → 2.14.2, `idna` 3.11 → 3.18. Also pulls
+  `mcp` 1.27 → 1.28 plus `uvicorn`, `sse-starlette`, and `anyio`. Full
+  test suite (incl. transport-security) green and the supply-chain lock
+  gate verifies under the upgraded stack.
+
 ## [0.10.0]
 
 Supply-chain hardening release. Migrates the published Docker image to a
