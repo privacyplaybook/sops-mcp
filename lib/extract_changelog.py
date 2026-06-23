@@ -6,9 +6,14 @@ and nothing has to be retyped.
 
   python3 lib/extract_changelog.py 0.10.1        # -> section body on stdout
   python3 lib/extract_changelog.py v0.10.1       # leading 'v' is tolerated
+  python3 lib/extract_changelog.py v0.10.1-rc1   # falls back to the [0.10.1] section
 
-Exits non-zero if the version has no `## [x.y.z]` section, so the workflow
-fails loudly rather than publishing an empty release.
+A pre-release / build tag (e.g. 0.10.1-rc1) reuses the base version's
+section, since the changelog tracks the final version, not each RC.
+
+Exits non-zero if neither the exact version nor its base has a
+`## [x.y.z]` section, so the workflow fails loudly rather than publishing
+an empty release.
 """
 
 import re
@@ -42,8 +47,14 @@ def main() -> int:
         print("usage: extract_changelog.py <version>", file=sys.stderr)
         return 2
     version = sys.argv[1].lstrip("v")
-    section = extract(CHANGELOG.read_text(), version)
-    if section is None or not section:
+    text = CHANGELOG.read_text()
+    section = extract(text, version)
+    if not section:
+        # Pre-release/build tag (0.10.1-rc1, 0.10.1+build) -> base version.
+        base = re.split(r"[-+]", version, maxsplit=1)[0]
+        if base != version:
+            section = extract(text, base)
+    if not section:
         print(f"ERROR: no CHANGELOG.md section for [{version}]", file=sys.stderr)
         return 1
     print(section)
