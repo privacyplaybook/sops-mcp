@@ -49,32 +49,32 @@ async def test_full_lifecycle(server):
     # 1. Create with generated + external + derived (sha256_hex)
     result = await server._create_secrets({
         "secrets": [
-            {"key_name": "DB_PASSWORD", "source": "generated", "length": 32},
+            {"key_name": "DB_ACCESS_KEY", "source": "generated", "length": 32},
             {
                 "key_name": "SMTP_USER",
                 "source": "external",
                 "value": "user@example.com",
             },
             {
-                "key_name": "DB_PASSWORD_HASH",
+                "key_name": "DB_ACCESS_KEY_HASH",
                 "source": "derived",
                 "transform": "sha256_hex",
-                "from": "DB_PASSWORD",
+                "from": "DB_ACCESS_KEY",
             },
         ]
     })
     encrypted = result[0].text
     values = server.encryptor.decrypt(encrypted)
-    assert len(values["DB_PASSWORD"]) == 32
+    assert len(values["DB_ACCESS_KEY"]) == 32
     assert values["SMTP_USER"] == "user@example.com"
-    assert values["DB_PASSWORD_HASH"] == hashlib.sha256(
-        values["DB_PASSWORD"].encode()
+    assert values["DB_ACCESS_KEY_HASH"] == hashlib.sha256(
+        values["DB_ACCESS_KEY"].encode()
     ).hexdigest()
 
     # 2. List without decryption
     listed = await server._list_secrets({"encrypted_content": encrypted})
     listing = listed[0].text
-    assert "DB_PASSWORD" in listing
+    assert "DB_ACCESS_KEY" in listing
     assert "SMTP_USER" in listing
     assert "derived" in listing
 
@@ -85,10 +85,10 @@ async def test_full_lifecycle(server):
     rotated = rotated_result[0].text
     values_before = values
     values_after = server.encryptor.decrypt(rotated)
-    assert values_after["DB_PASSWORD"] != values_before["DB_PASSWORD"]
+    assert values_after["DB_ACCESS_KEY"] != values_before["DB_ACCESS_KEY"]
     assert values_after["SMTP_USER"] == values_before["SMTP_USER"]
-    assert values_after["DB_PASSWORD_HASH"] == hashlib.sha256(
-        values_after["DB_PASSWORD"].encode()
+    assert values_after["DB_ACCESS_KEY_HASH"] == hashlib.sha256(
+        values_after["DB_ACCESS_KEY"].encode()
     ).hexdigest()
 
     # 4. Add another secret
@@ -101,7 +101,7 @@ async def test_full_lifecycle(server):
     added = added_result[0].text
     values = server.encryptor.decrypt(added)
     assert values["API_KEY"] == "abc123"
-    assert values["DB_PASSWORD"] == values_after["DB_PASSWORD"]  # preserved
+    assert values["DB_ACCESS_KEY"] == values_after["DB_ACCESS_KEY"]  # preserved
 
     # 5. Update external
     updated_result = await server._update_external({
@@ -116,34 +116,34 @@ async def test_full_lifecycle(server):
     # 6. Rename — derivation reference must update
     renamed_result = await server._rename_secret({
         "encrypted_content": updated,
-        "old_name": "DB_PASSWORD",
-        "new_name": "DATABASE_PASSWORD",
+        "old_name": "DB_ACCESS_KEY",
+        "new_name": "DATABASE_ACCESS_KEY",
     })
     renamed = renamed_result[0].text
     parsed = yaml.safe_load(renamed)
-    assert "DATABASE_PASSWORD" in parsed
-    assert "DB_PASSWORD" not in parsed
+    assert "DATABASE_ACCESS_KEY" in parsed
+    assert "DB_ACCESS_KEY" not in parsed
     assert (
-        parsed["_meta_unencrypted"]["secrets"]["DB_PASSWORD_HASH"]
-        ["derivation"]["from"] == "DATABASE_PASSWORD"
+        parsed["_meta_unencrypted"]["secrets"]["DB_ACCESS_KEY_HASH"]
+        ["derivation"]["from"] == "DATABASE_ACCESS_KEY"
     )
 
     # 7. Delete — deleting a source without its dependent must fail
     with pytest.raises(ValueError, match="depend on it"):
         await server._delete_secrets({
             "encrypted_content": renamed,
-            "key_names": ["DATABASE_PASSWORD"],
+            "key_names": ["DATABASE_ACCESS_KEY"],
         })
 
     # 8. Deleting both together works
     deleted_result = await server._delete_secrets({
         "encrypted_content": renamed,
-        "key_names": ["DATABASE_PASSWORD", "DB_PASSWORD_HASH"],
+        "key_names": ["DATABASE_ACCESS_KEY", "DB_ACCESS_KEY_HASH"],
     })
     deleted = deleted_result[0].text
     parsed = yaml.safe_load(deleted)
-    assert "DATABASE_PASSWORD" not in parsed
-    assert "DB_PASSWORD_HASH" not in parsed
+    assert "DATABASE_ACCESS_KEY" not in parsed
+    assert "DB_ACCESS_KEY_HASH" not in parsed
     values = server.encryptor.decrypt(deleted)
     assert values["SMTP_USER"] == "user@example.com"
     assert values["API_KEY"] == "new-value"

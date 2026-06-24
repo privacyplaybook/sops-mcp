@@ -6,6 +6,11 @@ on:
     tags: ["v*.*.*"]
   workflow_dispatch:
 
+# Least-privilege default; the publish job re-grants what it needs
+# (packages: write, id-token: write) at the job level.
+permissions:
+  contents: read
+
 jobs:
   verify-supply-chain:
     runs-on: ubuntu-latest

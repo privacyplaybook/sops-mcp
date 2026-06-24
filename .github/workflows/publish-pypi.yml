@@ -19,6 +19,11 @@ on:
     tags: ["v*.*.*"]
   workflow_dispatch:
 
+# Least-privilege default; the publish job (id-token: write) and
+# create-release job (contents/actions: write) re-grant at the job level.
+permissions:
+  contents: read
+
 jobs:
   build:
     needs: []
