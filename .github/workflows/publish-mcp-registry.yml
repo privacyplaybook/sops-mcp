@@ -21,8 +21,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.10.1). Defaults to the workflow ref name."
-        required: false
+        # Required so a blank submit can't fall through to github.ref_name
+        # (e.g. "main"), which fails the "Resolve tag" step. Run this workflow
+        # from `main` (latest mcp-publisher) and enter the release tag here.
+        description: "Release tag to publish, e.g. v0.10.1 (run from main, not the tag)."
+        required: true
         type: string
 
 jobs:
@@ -32,7 +35,7 @@ jobs:
       contents: read
       id-token: write   # required for `mcp-publisher login github-oidc`
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
 
