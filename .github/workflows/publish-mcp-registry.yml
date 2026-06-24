@@ -40,9 +40,9 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsSL \
-            https://github.com/modelcontextprotocol/registry/releases/download/v1.7.0/mcp-publisher_linux_amd64.tar.gz \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.7.9/mcp-publisher_linux_amd64.tar.gz \
             -o /tmp/mcp-publisher.tar.gz
-          echo "5c61dd7dd33bbf00c9c0f569d3dc2f95bbbbfec0c6951a681a2dd573cb376851  /tmp/mcp-publisher.tar.gz" \
+          echo "ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac  /tmp/mcp-publisher.tar.gz" \
             | sha256sum -c -
           tar -xzf /tmp/mcp-publisher.tar.gz -C /tmp
           sudo install -m 755 /tmp/mcp-publisher /usr/local/bin/mcp-publisher
