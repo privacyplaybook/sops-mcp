@@ -27,6 +27,23 @@ class SopsError(Exception):
     """Raised when a sops CLI operation fails."""
 
 
+def _write_empty_config(tmpdir: str) -> str:
+    """Create the empty config file every sops invocation is pinned to.
+
+    sops looks for a `.sops.yaml` by walking up from its working directory,
+    which is this server's — typically the user's project, where a sops
+    user very likely keeps one. Its creation rules would then override what
+    this server intends: a `path_regex` that misses the temp file fails the
+    call outright, and an `encrypted_regex` collides with the
+    `--unencrypted-suffix` this server relies on. Pinning `--config` at an
+    empty file removes the whole class; recipients still come from `--age`.
+    """
+    path = os.path.join(tmpdir, "empty-sops-config.yaml")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    return path
+
+
 def _make_secure_tempdir() -> str:
     """Create a 0700 temp dir on tmpfs (/dev/shm) when available, falling
     back to the default temp dir.
@@ -53,12 +70,20 @@ def _make_secure_tempdir() -> str:
 # only, so a file carrying any of these would lose them on re-encryption.
 _NON_AGE_KEY_GROUPS = ("pgp", "kms", "gcp_kms", "azure_kv", "hc_vault")
 
-# Shamir key groups are a different shape entirely: recipients move into
-# `sops.key_groups` and the top-level `age` list is absent, so a file using
-# them reads as having no recipients at all. Re-encrypting one would
-# flatten an n-of-m threshold into a plain single-group file that any one
-# holder could open, which is a silent downgrade of the file's guarantee.
-_KEY_GROUP_FIELDS = ("key_groups", "shamir_threshold")
+# Envelope flags that change what this server can promise about a file.
+#
+# `key_groups` / `shamir_threshold`: recipients move into `sops.key_groups`
+# and the top-level `age` list is absent, so the file reads as having no
+# recipients at all. Re-encrypting would flatten an n-of-m threshold into a
+# plain single-group file any one holder could open.
+#
+# `mac_only_encrypted`: sops then MACs only the encrypted values, which
+# voids the guarantee the rest of this design leans on — that the plaintext
+# `_meta_unencrypted` block cannot be edited without breaking decryption.
+# With it set, a file's recorded domain and each secret's `source` are
+# freely rewritable by anyone who can edit the file, and `source` is what
+# decides whether a value may be overwritten in place.
+_UNSUPPORTED_FLAGS = ("key_groups", "shamir_threshold", "mac_only_encrypted")
 
 
 def _envelope_of(encrypted_content: str) -> dict:
@@ -86,19 +111,20 @@ def unsupported_key_features(encrypted_content: str) -> tuple[str, ...]:
     It always encrypts with ``--age <recipients>`` and nothing else, so any
     file whose access rules go beyond a flat age recipient list would come
     back weaker than it went in: a PGP or KMS holder dropped, or an n-of-m
-    Shamir threshold flattened into a list any single holder can open.
-    Callers refuse such files rather than silently downgrade them.
+    Shamir threshold flattened into a list any single holder can open. It
+    also refuses files whose metadata is unauthenticated, since the
+    recorded domain and each secret's source are only trustworthy while
+    the MAC covers them.
 
     A normal age file lists the other master-key groups empty and carries
-    no key-group fields, so this returns an empty tuple for it.
+    none of these flags, so this returns an empty tuple for it.
     """
     envelope = _envelope_of(encrypted_content)
-    found = [
-        group
-        for group in _NON_AGE_KEY_GROUPS
-        if isinstance(envelope.get(group), list) and envelope[group]
-    ]
-    found.extend(field for field in _KEY_GROUP_FIELDS if envelope.get(field))
+    # Truthiness throughout: sops writes lists for the master-key groups,
+    # but a truthy value of any other shape should still be treated as
+    # present rather than waved through on a type check.
+    found = [group for group in _NON_AGE_KEY_GROUPS if envelope.get(group)]
+    found.extend(flag for flag in _UNSUPPORTED_FLAGS if envelope.get(flag))
     return tuple(found)
 
 
@@ -187,6 +213,7 @@ class SopsEncryptor:
 
         try:
             os.mkdir(scratch_home, 0o700)
+            empty_config = _write_empty_config(tmpdir)
             fd = os.open(tmpfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(plaintext_yaml)
@@ -194,6 +221,7 @@ class SopsEncryptor:
             result = subprocess.run(
                 [
                     self.sops_binary,
+                    "--config", empty_config,
                     "encrypt",
                     "--age", domain.age_argument,
                     "--unencrypted-suffix", "_unencrypted",
@@ -248,6 +276,7 @@ class SopsEncryptor:
 
         try:
             os.mkdir(scratch_home, 0o700)
+            empty_config = _write_empty_config(tmpdir)
             fd = os.open(tmpfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(encrypted_content)
@@ -255,6 +284,7 @@ class SopsEncryptor:
             result = subprocess.run(
                 [
                     self.sops_binary,
+                    "--config", empty_config,
                     "decrypt",
                     "--input-type", "yaml",
                     "--output-type", "yaml",

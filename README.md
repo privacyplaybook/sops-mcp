@@ -27,7 +27,7 @@ The simplest setup uses a single age recipient (the one CI private key). If you 
 Three ideas shape the tool surface:
 
 1. **No plaintext crosses the MCP boundary.** Generated secret values are never returned to the client. There is deliberately no "decrypt this one key" tool. If you need plaintext, run `sops decrypt` yourself with the age private key.
-2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values, so a tampered block fails to decrypt — but tools that read it *without* a key cannot check that, which is why recipients are verified separately.
+2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values by default, so a tampered block fails to decrypt. Files that switch that off with `mac_only_encrypted` are refused. Tools that read the block *without* a key still cannot check the MAC, which is why recipients are verified separately.
 3. **No in-place value update for generated or derived secrets.** Those change only via rotation — the mutation model is deliberate, not accidental. External secrets (e.g. an upstream API key the user controls) can be updated with `sops_update_external`.
 
 ## Secret sources
@@ -224,6 +224,7 @@ SOPS can protect a file in ways this server cannot reproduce, because it always 
 
 - **Another master key alongside age** (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). Re-encrypting would drop that holder.
 - **Shamir key groups** (`key_groups` with a `shamir_threshold`). Re-encrypting would flatten an n-of-m threshold into a list any single holder could open.
+- **`mac_only_encrypted`**. It leaves the plaintext metadata block unauthenticated, so a file's recorded domain and each secret's `source` could be rewritten by anyone who can edit the file.
 
 Both are silent downgrades, so every mutation refuses these files and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
 
@@ -281,6 +282,8 @@ sops:
 ```
 
 Secret values are AES-256-GCM encrypted. The `_meta_unencrypted` block is stored in plaintext (using SOPS's `unencrypted_suffix` feature) so metadata is readable without decryption.
+
+Every `sops` call this server makes is pinned to an empty `--config`, so a `.sops.yaml` in the directory the server was started from cannot change how files are encrypted. Recipients come from the domain, and nothing else.
 
 The `sops:` block above is abridged. A real file also carries `lastmodified`, a `mac`, a `version`, and empty lists for the master-key types this server does not use (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). The MAC covers unencrypted values too, so an edited `_meta_unencrypted` block fails to decrypt. If any of those other key lists is non-empty, this server refuses to mutate the file — it encrypts to age alone and would otherwise drop that key holder silently.
 

@@ -297,3 +297,68 @@ def test_encrypt_only_advice_names_the_right_remedy(encryptor, two_domains):
 
     with pytest.raises(SopsError, match="only configures the 'default' domain"):
         encryptor.decrypt(blob, Domain("archive", alpha.recipients))
+
+
+def test_mac_only_encrypted_is_refused(encryptor, two_domains):
+    """It voids the authentication the metadata block's trust rests on.
+
+    With `mac_only_encrypted` set, sops MACs only the encrypted values, so
+    the plaintext `_meta_unencrypted` block — the recorded domain, and
+    each secret's `source`, which decides whether a value may be
+    overwritten in place — becomes freely rewritable by anyone who can
+    edit the file.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert unsupported_key_features(blob) == ()
+
+    parsed = yaml.safe_load(blob)
+    parsed["sops"]["mac_only_encrypted"] = True
+    assert unsupported_key_features(yaml.dump(parsed)) == ("mac_only_encrypted",)
+
+    # False is the normal state and must not trip it.
+    parsed["sops"]["mac_only_encrypted"] = False
+    assert unsupported_key_features(yaml.dump(parsed)) == ()
+
+
+def test_a_sops_config_in_the_working_directory_is_ignored(
+    encryptor, two_domains, tmp_path, monkeypatch
+):
+    """sops finds .sops.yaml by walking up from its working directory.
+
+    That is this server's working directory — typically the user's
+    project, where a sops user very likely keeps one. Its creation rules
+    would otherwise override what this server intends: a path_regex that
+    misses the temp file fails the call outright, and an encrypted_regex
+    collides with the --unencrypted-suffix this server relies on.
+    """
+    alpha, _ = two_domains
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".sops.yaml").write_text(
+        "creation_rules:\n"
+        f"  - age: {alpha.recipients[0]}\n"
+        "    encrypted_regex: '^(data|stringData)$'\n"
+    )
+    monkeypatch.chdir(project)
+
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert "s3cr3t-value" not in blob
+    assert encryptor.decrypt(blob, alpha)["API_TOKEN"] == "s3cr3t-value"
+
+
+def test_a_non_matching_path_regex_does_not_break_encryption(
+    encryptor, two_domains, tmp_path, monkeypatch
+):
+    """The other shape of the same problem: sops refuses to encrypt at all."""
+    alpha, _ = two_domains
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".sops.yaml").write_text(
+        "creation_rules:\n"
+        "  - path_regex: \\.enc\\.yaml$\n"
+        f"    age: {alpha.recipients[0]}\n"
+    )
+    monkeypatch.chdir(project)
+
+    assert encryptor.decrypt(encryptor.encrypt(PAYLOAD, alpha), alpha)

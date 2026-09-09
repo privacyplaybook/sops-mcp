@@ -86,6 +86,23 @@ v1 environment variables become a domain called `default`.
 
 ### Security
 
+- **Files with `mac_only_encrypted` are refused.** That option makes sops
+  MAC the ciphertext alone, leaving the plaintext `_meta_unencrypted`
+  block unauthenticated — so a file's recorded domain, and each secret's
+  `source`, could be rewritten by anyone able to edit the file. Since
+  `source` decides whether a value may be overwritten in place, a forged
+  one would let `sops_update_external` overwrite a generated secret.
+- **Every sops invocation is pinned to an empty `--config`.** sops
+  discovers a `.sops.yaml` by walking up from its working directory,
+  which is this server's — typically the user's project, where a sops
+  user very likely keeps one. Its creation rules could break every
+  encrypt: a `path_regex` that misses the temp file fails the call, and
+  an `encrypted_regex` collides with the `--unencrypted-suffix` this
+  server relies on. Recipients were never at risk, since `--age` wins.
+- **`sops_rekey`'s cross-domain guard now covers unlabelled files.** It
+  fired only when the file recorded a domain, so it was dead for any file
+  an older version had round-tripped. Where a rekey would revoke a reader
+  and another domain's recipients match the file exactly, it is refused.
 - **Files this server cannot faithfully re-encrypt are refused.** It
   always re-encrypts to a flat age recipient list, so a file carrying
   another master key (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`)

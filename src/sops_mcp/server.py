@@ -936,6 +936,10 @@ class SopsMcpServer:
             name = recorded or DEFAULT_DOMAIN
 
         domain = self.domains.get(name)
+        if unsupported:
+            # Said already, above. Adding a recipient mismatch here would
+            # only send the reader to sops_rekey, which refuses this file.
+            return lines
         if domain is None:
             lines.append(
                 f"  WARNING: domain '{name}' is not configured on this "
@@ -947,13 +951,6 @@ class SopsMcpServer:
                 f"'{name}' ({len(domain.recipients)} configured). Mutations "
                 "will be refused; run sops_rekey to reconcile."
             )
-        elif unsupported:
-            # Don't call this a match: the age recipients may line up, but
-            # the file still cannot be mutated here.
-            lines.append(
-                "  The feature(s) above block any mutation regardless of "
-                "the recipient list."
-            )
         else:
             lines.append("  Recipients match the configured domain.")
         return lines
@@ -964,13 +961,18 @@ class SopsMcpServer:
         """List configured domains. Public keys only — never key material."""
         lines = ["Configured domains:"]
         for name in sorted(self.domains):
-            domain = self.domains[name]
-            role = "encrypt-only" if domain.encrypt_only else "encrypt+decrypt"
+            # public_summary is the single place that decides what is safe
+            # to put in a response; render from it rather than reaching
+            # into the Domain and risking a field it deliberately omits.
+            summary = self.domains[name].public_summary()
+            role = (
+                "encrypt-only" if summary["encrypt_only"] else "encrypt+decrypt"
+            )
             lines.append("")
-            lines.append(f"{name}  ({role})")
-            lines.append(f"  private keys held: {len(domain.keys)}")
-            lines.append(f"  recipients ({len(domain.recipients)}):")
-            for recipient in domain.recipients:
+            lines.append(f"{summary['name']}  ({role})")
+            lines.append(f"  private keys held: {summary['key_count']}")
+            lines.append(f"  recipients ({summary['recipient_count']}):")
+            for recipient in summary["recipients"]:
                 lines.append(f"    - {recipient}")
         return [TextContent(type="text", text="\n".join(lines))]
 
@@ -1014,6 +1016,8 @@ class SopsMcpServer:
         ):
             recorded = meta_block["domain"].strip() or None
 
+        before = set(recipients_of(content))
+
         # Rekey re-encrypts a file onto its own domain's current recipient
         # list. It is not a way to move a file into a different domain:
         # that reads with one key set and writes to another, which is the
@@ -1028,7 +1032,40 @@ class SopsMcpServer:
                 "CLI and create it afresh in the target domain."
             )
 
-        before = set(recipients_of(content))
+        # A file with no recorded domain still belongs somewhere, and the
+        # guard above is dead for every file an older version has
+        # round-tripped — which the mixed-version notes call routine. Fall
+        # back to what the recipients say, but only where it matters and
+        # only where it is unambiguous:
+        #
+        #   * the rekey would revoke a reader the file currently has, and
+        #   * some other domain's recipients are exactly the file's.
+        #
+        # Widening never revokes anyone, so it stays allowed even when
+        # another domain happens to share the file's current list. And a
+        # rotation-era file, whose old recipient matches no configured
+        # domain, still rekeys onto the new list.
+        revokes = not before <= set(domain.recipients)
+        if recorded is None and revokes:
+            owner = next(
+                (
+                    other.name
+                    for other in self.domains.values()
+                    if other.name != domain.name
+                    and set(other.recipients) == before
+                ),
+                None,
+            )
+            if owner is not None:
+                raise ValueError(
+                    f"File records no domain, but its recipients are exactly "
+                    f"those of domain '{owner}', and rekeying to "
+                    f"'{domain.name}' would revoke access for "
+                    f"{len(before - set(domain.recipients))} of them. "
+                    f"Pass domain '{owner}' to re-apply its current "
+                    "recipient list, or use the sops CLI to move the file "
+                    "deliberately."
+                )
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
 

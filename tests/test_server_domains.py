@@ -457,7 +457,8 @@ async def test_rekey_does_not_stamp_metadata_onto_a_legacy_file(env):
     legacy = env.encryptor.encrypt({"TOKEN": "v"}, env.domains["alpha"])
     assert "_meta_unencrypted" not in yaml.safe_load(legacy)
 
-    result = await env._rekey({"encrypted_content": legacy, "domain": "shared"})
+    _widen(env, "alpha")
+    result = await env._rekey({"encrypted_content": legacy, "domain": "alpha"})
     rekeyed = result[0].text
     assert "_meta_unencrypted" not in yaml.safe_load(rekeyed)
     assert len(yaml.safe_load(rekeyed)["sops"]["age"]) == 2
@@ -466,11 +467,11 @@ async def test_rekey_does_not_stamp_metadata_onto_a_legacy_file(env):
     # The retrofit path is still open afterwards.
     retrofitted = await env._add_metadata({
         "encrypted_content": rekeyed,
-        "domain": "shared",
+        "domain": "alpha",
         "secret_metadata": {"TOKEN": {"source": "external"}},
     })
     meta = yaml.safe_load(retrofitted[0].text)["_meta_unencrypted"]
-    assert meta["domain"] == "shared"
+    assert meta["domain"] == "alpha"
     assert meta["secrets"]["TOKEN"]["source"] == "external"
 
 
@@ -594,3 +595,51 @@ async def test_require_domain_ignores_the_recorded_hint(env):
         {"encrypted_content": blob, "domain": "alpha"}
     )
     assert yaml.safe_load(ok[0].text)["_meta_unencrypted"]["domain"] == "alpha"
+
+
+# --- the rekey guard must not be dead for files an old version touched ---
+
+
+async def test_rekey_refuses_an_unlabelled_file_that_belongs_elsewhere(env):
+    """A file round-tripped by 0.10.1 loses its `domain`, not its identity.
+
+    Its recipients still say where it belongs. Without this the
+    cross-domain guard is dead for exactly the files the mixed-version
+    notes call routine, and a domain sharing a key could take one over.
+    """
+    blob = await _create(env, "shared")
+    plaintext = env.encryptor.decrypt(blob, env.domains["shared"])
+    meta = dict(plaintext["_meta_unencrypted"])
+    del meta["domain"]
+    plaintext["_meta_unencrypted"] = meta
+    unlabelled = env.encryptor.encrypt(plaintext, env.domains["shared"])
+
+    # 'alpha' holds shared's private key, so decryption would succeed and
+    # the second recipient would be dropped silently.
+    with pytest.raises(ValueError, match="recipients are exactly those of"):
+        await env._rekey({"encrypted_content": unlabelled, "domain": "alpha"})
+
+
+async def test_rekey_still_works_on_an_unlabelled_file_of_its_own_domain(env):
+    """The legitimate case must survive the guard above."""
+    blob = await _create(env, "alpha")
+    plaintext = env.encryptor.decrypt(blob, env.domains["alpha"])
+    meta = dict(plaintext["_meta_unencrypted"])
+    del meta["domain"]
+    plaintext["_meta_unencrypted"] = meta
+    unlabelled = env.encryptor.encrypt(plaintext, env.domains["alpha"])
+
+    _widen(env, "alpha")
+    result = await env._rekey({"encrypted_content": unlabelled, "domain": "alpha"})
+    assert len(yaml.safe_load(result[0].text)["sops"]["age"]) == 2
+
+
+async def test_listing_a_shamir_file_does_not_advise_rekey(env):
+    """rekey refuses these files, so pointing at it is bad advice."""
+    blob = await _create(env, "shared")
+    listed = await env._list_secrets(
+        {"encrypted_content": _as_key_groups(blob)}
+    )
+    text = listed[0].text
+    assert "cannot reproduce" in text
+    assert "run sops_rekey" not in text
