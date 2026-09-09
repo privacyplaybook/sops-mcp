@@ -35,3 +35,10 @@ jobs:
         run: python3 lib/verify_base_images.py
       - name: Verify version is single-sourced from pyproject
         run: python3 lib/verify_version.py
+      # Same gate the publish workflow runs. It lived only there, so a
+      # lockfile with a known advisory could merge unseen and only failed
+      # after landing on main, which is exactly what happened with
+      # cryptography 49.0.0 and mcp 1.28.0. Running it here fails the pull
+      # request instead.
+      - name: Gate on a clean dependency vulnerability scan
+        uses: ./.github/actions/vuln-scan
