@@ -56,7 +56,7 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 | `sops_create_oidc_secret` | Convenience: create an Authelia OIDC client secret as a `generated` + `derived` (`pbkdf2_sha512_authelia`) pair in one call. The hash is returned in the response for pasting into `configuration.yml`. |
 | `sops_list_domains` | List the configured key domains, their age recipients, and whether each can decrypt or only encrypt. Never returns private key material. |
 
-### Mutation (require `SOPS_AGE_KEY`)
+### Mutation (require a private key for the target domain)
 
 | Tool | What it does |
 |------|--------------|
@@ -68,7 +68,7 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 | `sops_add_metadata` | Retrofit `_meta_unencrypted` onto a legacy SOPS file that lacks it. Supports `generated`, `external`, and `derived` entries. |
 | `sops_rekey` | Re-encrypt a file onto its domain's current recipient list. Run this after a domain's recipients change, or to clear a "recipients do not match" refusal. Requires an explicit `domain`. Leaves a legacy file without a metadata block untouched in that respect, so `sops_add_metadata` still works on it. |
 
-Every tool except `sops_list_domains` takes an optional `domain` argument. See [Key domains](#key-domains).
+Every tool takes a `domain` argument except `sops_list_domains`, which needs none. It is optional everywhere but `sops_rekey`, where it is required because the call changes who can read the file. See [Key domains](#key-domains).
 
 ## Setup
 
@@ -135,7 +135,7 @@ Add to your project's `.mcp.json`:
 | `SOPS_AGE_RECIPIENTS` | Yes* | Alternative to `SOPS_MCP_AGE_PUBLIC_KEY` |
 | `SOPS_MCP_SOPS_BINARY` | No | Path to sops binary (default: `sops`) |
 | `SOPS_MCP_LOG_LEVEL` | No | Log level (default: `WARNING`) |
-| `SOPS_AGE_KEY` | Sometimes | Age private key — required for any mutation tool (rotate, add, update, rename, delete) |
+| `SOPS_AGE_KEY` | Sometimes | Age private key for the `default` domain — required to mutate a file belonging to it. Named domains take their keys from the domains file instead. |
 | `SOPS_MCP_DOMAINS_FILE` | No | Path to a YAML file defining named [key domains](#key-domains). Use when one server needs more than one recipient set. |
 | `SOPS_MCP_REQUIRE_DOMAIN` | No | Set to `1` to make every tool call name its domain explicitly instead of falling back to `default`. |
 | `SOPS_MCP_TRANSPORT` | No | `stdio` (default) or `sse` |
@@ -143,7 +143,7 @@ Add to your project's `.mcp.json`:
 | `SOPS_MCP_ALLOWED_HOSTS` | No | Comma-separated allowlist for the SSE `Host` header (DNS rebinding protection). Default: `127.0.0.1,127.0.0.1:*,localhost,localhost:*`. Set explicitly when binding to a non-loopback address — e.g. `mcp.example.com,mcp.example.com:*`. |
 | `SOPS_MCP_API_TOKEN` | Sometimes | Required when SSE transport binds to `0.0.0.0`; otherwise optional. When set, SSE requires `Authorization: Bearer <token>`. |
 
-\* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set, unless `SOPS_MCP_DOMAINS_FILE` supplies a `default` domain.
+\* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set, unless `SOPS_MCP_DOMAINS_FILE` supplies at least one domain. The server refuses to start with no domains at all.
 
 Both recipient variables accept a comma-separated list, and `SOPS_AGE_KEY` accepts several newline-separated keys. Together they form the `default` domain.
 
@@ -275,6 +275,8 @@ sops:
 
 Secret values are AES-256-GCM encrypted. The `_meta_unencrypted` block is stored in plaintext (using SOPS's `unencrypted_suffix` feature) so metadata is readable without decryption.
 
+The `sops:` block above is abridged. A real file also carries `lastmodified`, a `mac`, a `version`, and empty lists for the master-key types this server does not use (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). The MAC covers unencrypted values too, so an edited `_meta_unencrypted` block fails to decrypt. If any of those other key lists is non-empty, this server refuses to mutate the file — it encrypts to age alone and would otherwise drop that key holder silently.
+
 ## Why these tools and not others
 
 **Per-key read (decrypt-one-secret):** intentionally absent. Returning plaintext over the MCP boundary would give the model access to secret material during tool calls — an accidental exfiltration vector. If you need a plaintext value, run `sops decrypt` yourself with the age private key.
@@ -293,18 +295,18 @@ The Docker build is hardened with three layers of verification, enforced by a CI
 
 ### Base image digest pinning
 
-The Dockerfile pins `python:3.12-slim` by SHA-256 digest (`@sha256:...`) so Docker always pulls the exact image that was audited, not whatever the `slim` tag currently points to. The digest and cosign signature status are tracked in `base-images.lock.json`.
+The Dockerfile builds on `cgr.dev/chainguard/python` (Wolfi), pinned by SHA-256 digest (`@sha256:...`) so Docker always pulls the exact image that was audited rather than whatever the tag currently points to. Two stages are pinned separately: `:latest-dev` for the build stage, which has apk, a shell and a build toolchain, and `:latest` for the runtime stage, which is distroless — no shell, no package manager. Both digests and their cosign signature status are tracked in `base-images.lock.json`.
 
 Update the base image (when upstream publishes security patches):
 
 ```bash
-pip install requests  # one-time
+pip install requests  # one-time; cosign on PATH is needed for the signature checks
 python3 lib/pin_base_images.py
 ```
 
-### Binary checksum verification
+### Signed binaries from Wolfi
 
-The `sops` and `age` binaries downloaded in the Dockerfile are verified with `sha256sum -c` against checksums from the official release pages. A tampered binary fails the build.
+The `sops` and `age` binaries are installed with `apk` from Wolfi's package repository, whose index is signed by Chainguard. They are pinned transitively through the base image digest, so re-pinning the base image also re-pins these binaries.
 
 ### Python dependency hash pinning
 
@@ -319,7 +321,7 @@ lib/compile_requirements.sh
 
 ### CI verification
 
-The `supply-chain.yml` workflow runs `lib/verify_requirements.py` and `lib/verify_base_images.py` on every push and PR. It checks that all lockfiles are well-formed and all Dockerfile `FROM` lines are digest-pinned.
+The `supply-chain.yml` workflow runs `lib/verify_requirements.py`, `lib/verify_base_images.py` and `lib/verify_version.py`. It runs on every pull request to `main`, and on pushes to `main` that touch the Dockerfile, a lockfile, `pyproject.toml`, `server.json` or `lib/`. It checks that lockfiles are well-formed, that every Dockerfile `FROM` line is digest-pinned, and that `server.json` matches the version in `pyproject.toml`.
 
 ## Verifying a published release
 
@@ -359,7 +361,7 @@ cosign verify-attestation --type slsaprovenance1 \
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-pytest tests/ -v  # 29 tests including end-to-end sops round-trip
+pytest tests/ -v  # unit tests plus end-to-end sops round-trips
 ruff check src/ tests/
 ```
 

@@ -459,7 +459,7 @@ class SopsMcpServer:
                     description=(
                         "Re-generate 'generated' secrets with new random values "
                         "while preserving 'external' secrets. Requires "
-                        "SOPS_AGE_KEY env var for decryption."
+                        "a private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -482,7 +482,7 @@ class SopsMcpServer:
                         "re-encrypts — preserving all existing values and "
                         "metadata. Rejects keys that already exist in the "
                         "file. Supports generated, external, and derived "
-                        "sources. Requires SOPS_AGE_KEY env var."
+                        "sources. Requires a private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -508,8 +508,8 @@ class SopsMcpServer:
                         "Add _meta_unencrypted metadata to an existing "
                         "SOPS-encrypted file that lacks it. Decrypts the "
                         "file, adds metadata, and re-encrypts preserving "
-                        "original plaintext values. Requires SOPS_AGE_KEY "
-                        "env var for decryption."
+                        "original plaintext values. Requires a private key "
+                        "for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -563,7 +563,7 @@ class SopsMcpServer:
                         "value and the _meta_unencrypted entry. Rejects "
                         "deletion of keys that other derived secrets "
                         "depend on unless those dependents are also in "
-                        "the delete list. Requires SOPS_AGE_KEY env var."
+                        "the delete list. Requires a private key for the domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -591,7 +591,7 @@ class SopsMcpServer:
                         "file. Preserves the value, source type, and "
                         "metadata. Updates 'from' references in any "
                         "derived secrets that depend on the renamed "
-                        "key. Requires SOPS_AGE_KEY env var."
+                        "key. Requires a private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -629,7 +629,7 @@ class SopsMcpServer:
                         "key). Rejects attempts to update 'generated' "
                         "or 'derived' secrets — use sops_rotate_generated "
                         "for those. Recomputes any derived secrets that "
-                        "reference this key. Requires SOPS_AGE_KEY env var."
+                        "reference this key. Requires a private key for the domain."
                     ),
                     inputSchema={
                         "type": "object",
