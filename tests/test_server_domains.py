@@ -154,7 +154,7 @@ async def test_guard_message_does_not_list_other_domains_recipients(env):
     blob = await _create(env, "shared")
     mislabelled = blob.replace("domain: shared", "domain: alpha")
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ValueError, match="Refusing to re-encrypt") as excinfo:
         await env._rotate_generated(
             {"encrypted_content": mislabelled, "key_names": ["TOKEN"]}
         )
@@ -525,7 +525,7 @@ async def test_rekey_refuses_a_shamir_file(env):
     blob = await _create(env, "shared")
     shamir = _as_key_groups(blob)
 
-    with pytest.raises(ValueError, match="key_groups|shamir_threshold"):
+    with pytest.raises(ValueError, match=r"key_groups|shamir_threshold"):
         await env._rekey({"encrypted_content": shamir, "domain": "shared"})
 
 
@@ -538,7 +538,10 @@ async def test_mutations_refuse_a_shamir_file(env):
 
 async def test_listing_a_shamir_file_does_not_claim_zero_recipients(env):
     blob = await _create(env, "shared")
-    text = (await env._list_secrets({"encrypted_content": _as_key_groups(blob)}))[0].text
+    listed = await env._list_secrets(
+        {"encrypted_content": _as_key_groups(blob)}
+    )
+    text = listed[0].text
     assert "key_groups" in text
     assert "not a flat age list" in text
 
