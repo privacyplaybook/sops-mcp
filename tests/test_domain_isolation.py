@@ -99,7 +99,9 @@ def test_ambient_key_file_is_ignored(encryptor, two_domains, monkeypatch, tmp_pa
         encryptor.decrypt(blob, beta)
 
 
-def test_default_age_keys_file_is_ignored(encryptor, two_domains, monkeypatch, tmp_path):
+def test_default_age_keys_file_is_ignored(
+    encryptor, two_domains, monkeypatch, tmp_path
+):
     """sops falls back to ~/.config/sops/age/keys.txt when no env key is set.
 
     The scratch HOME handed to each invocation is what closes that path.
@@ -144,7 +146,12 @@ def test_default_age_keys_file_would_otherwise_have_worked(tmp_path, monkeypatch
     env["HOME"] = str(fake_home)
     env["XDG_CONFIG_HOME"] = str(fake_home / ".config")
     result = subprocess.run(
-        ["sops", "decrypt", "--input-type", "yaml", "--output-type", "yaml", str(target)],
+        [
+            "sops", "decrypt",
+            "--input-type", "yaml",
+            "--output-type", "yaml",
+            str(target),
+        ],
         capture_output=True, text=True, env=env, check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -283,8 +290,10 @@ def test_encrypt_subprocess_never_carries_a_private_key(encryptor, two_domains):
     private key.
     """
     alpha, _ = two_domains
-    assert "SOPS_AGE_KEY" not in encryptor._child_env(alpha, "/nonexistent", with_keys=False)
-    assert "SOPS_AGE_KEY" in encryptor._child_env(alpha, "/nonexistent", with_keys=True)
+    without = encryptor._child_env(alpha, "/nonexistent", with_keys=False)
+    with_keys = encryptor._child_env(alpha, "/nonexistent", with_keys=True)
+    assert "SOPS_AGE_KEY" not in without
+    assert "SOPS_AGE_KEY" in with_keys
 
 
 def test_encrypt_only_advice_names_the_right_remedy(encryptor, two_domains):

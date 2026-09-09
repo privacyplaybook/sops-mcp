@@ -57,6 +57,12 @@ v1 environment variables become a domain called `default`.
 
 ### Changed
 
+- **Lint coverage widened.** ruff now runs bugbear, bandit, pylint,
+  pyupgrade, simplify, perf, logging and pytest rule families instead of
+  its small default set, with the deliberate patterns in this codebase
+  (`/dev/shm` temp files, fixed-argv subprocess calls, long linear tool
+  handlers) exempted with reasons in `pyproject.toml`. Internal only; no
+  behaviour change.
 - **Python 3.14 is supported and tested.** Added to the CI matrix and the
   package classifiers. The published Docker image still runs 3.13; that is
   tracked separately.

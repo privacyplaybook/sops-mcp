@@ -31,13 +31,14 @@ def age_keys(tmp_path, monkeypatch):
     )
     private_key = None
     public_key = None
-    for line in key_file.read_text().splitlines():
-        line = line.strip()
+    for raw in key_file.read_text().splitlines():
+        line = raw.strip()
         if line.startswith("AGE-SECRET-KEY-"):
             private_key = line
         elif line.startswith("# public key: "):
             public_key = line.split(": ", 1)[1]
-    assert private_key and public_key
+    assert private_key
+    assert public_key
     monkeypatch.setenv("SOPS_AGE_KEY", private_key)
     monkeypatch.setenv("SOPS_MCP_AGE_PUBLIC_KEY", public_key)
     return public_key
@@ -246,7 +247,9 @@ async def test_derived_is_not_recomputed_when_source_unchanged(server):
         ]
     })
     encrypted = result[0].text
-    hash_before = server.encryptor.decrypt(encrypted, _domain(server))["FIXED_PASSWORD_HASH"]
+    hash_before = server.encryptor.decrypt(encrypted, _domain(server))[
+        "FIXED_PASSWORD_HASH"
+    ]
 
     rotated = await server._rotate_generated(
         {"encrypted_content": encrypted}

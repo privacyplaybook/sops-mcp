@@ -16,7 +16,7 @@ def test_hash_verifies():
     password = "my-secret-password"
     h = generate_authelia_pbkdf2_hash(password)
     parts = h.split("$")
-    # parts: ['', 'pbkdf2-sha512', '310000', '<salt>', '<hash>']
+    # Layout: '', 'pbkdf2-sha512', '310000', salt, hash
     salt_ab64 = parts[3]
     hash_ab64 = parts[4]
 
