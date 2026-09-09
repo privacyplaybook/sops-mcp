@@ -57,6 +57,9 @@ v1 environment variables become a domain called `default`.
 
 ### Changed
 
+- **Python 3.14 is supported and tested.** Added to the CI matrix and the
+  package classifiers. The published Docker image still runs 3.13; that is
+  tracked separately.
 - **An unmatched private key no longer stops the server booting.** A key
   whose public half is not in its domain's recipient list is the normal
   state mid recipient-rotation, and it still opens files encrypted before
