@@ -9,12 +9,11 @@ threat model.
 
 from mcp.types import CallToolRequest, CallToolRequestParams
 
-from sops_mcp.server import SopsMcpServer
-from sops_mcp.sops import SopsEncryptor
+from tests.helpers import make_server
 
 
 async def test_unexpected_exception_returns_generic_message(monkeypatch, caplog):
-    srv = SopsMcpServer(SopsEncryptor("age1dummy"))
+    srv = make_server()
 
     sentinel = "SECRET_LEAK_CANARY_zzz9876"
 
@@ -57,7 +56,7 @@ async def test_unexpected_exception_returns_generic_message(monkeypatch, caplog)
 # they're meant for the user (e.g. "Invalid key name FOO_bar"). Lock that
 # in so a future overzealous refactor doesn't make all errors generic.
 async def test_validation_errors_still_surface_to_client():
-    srv = SopsMcpServer(SopsEncryptor("age1dummy"))
+    srv = make_server()
 
     handler = srv.server.request_handlers[CallToolRequest]
     request = CallToolRequest(

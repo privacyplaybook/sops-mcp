@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sops-mcp"
-version = "0.10.1"
+version = "0.11.0"
 description = "MCP server for creating and managing SOPS-encrypted secrets"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,6 +34,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
+    "cryptography>=42.0",
     "mcp>=1.23.0,<2.0.0",
     "python-multipart>=0.0.26",
     "pyyaml>=6.0",

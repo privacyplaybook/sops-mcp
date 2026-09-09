@@ -20,14 +20,14 @@ The age private key lives in exactly one place: your CI/CD secrets store. Everyw
 
 **2. Let an AI coding agent generate secrets it can never read.** Claude (or any MCP client) can create passwords, rotate them, derive hashes, rename and delete them — but plaintext values never cross the MCP boundary back to the model. The server holds the encryption key; the client only submits requests and receives metadata. There is deliberately no "decrypt this one secret" tool. If a prompt injection or a misbehaving agent tried to exfiltrate a secret via tool output, there is no tool output to exfiltrate.
 
-This pattern assumes a single age recipient (the one CI private key). For multi-recipient / team key management, use the `sops` CLI directly for recipient rotations and this server for content management.
+The simplest setup uses a single age recipient (the one CI private key). If you need several — a CI key plus an operator's key, or separate key sets for separate parties — see [Key domains](#key-domains).
 
 ## Design
 
 Three ideas shape the tool surface:
 
 1. **No plaintext crosses the MCP boundary.** Generated secret values are never returned to the client. There is deliberately no "decrypt this one key" tool. If you need plaintext, run `sops decrypt` yourself with the age private key.
-2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, and when it was last rotated. This lets the server list and rotate secrets without decrypting.
+2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values, so a tampered block fails to decrypt — but tools that read it *without* a key cannot check that, which is why recipients are verified separately.
 3. **No in-place value update for generated or derived secrets.** Those change only via rotation — the mutation model is deliberate, not accidental. External secrets (e.g. an upstream API key the user controls) can be updated with `sops_update_external`.
 
 ## Secret sources
@@ -54,6 +54,7 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 | `sops_create_secrets` | Create a new encrypted file with one or more secrets (any mix of sources). |
 | `sops_list_secrets` | List keys, sources, and descriptions from a file **without decrypting**. |
 | `sops_create_oidc_secret` | Convenience: create an Authelia OIDC client secret as a `generated` + `derived` (`pbkdf2_sha512_authelia`) pair in one call. The hash is returned in the response for pasting into `configuration.yml`. |
+| `sops_list_domains` | List the configured key domains, their age recipients, and whether each can decrypt or only encrypt. Never returns private key material. |
 
 ### Mutation (require `SOPS_AGE_KEY`)
 
@@ -65,6 +66,9 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 | `sops_rename_secret` | Rename a key, preserving its value and metadata. Updates `from:` references in any derived secrets. |
 | `sops_delete_secrets` | Remove one or more keys. Rejects deleting a secret that another derived secret still references (unless the dependent is deleted in the same call). |
 | `sops_add_metadata` | Retrofit `_meta_unencrypted` onto a legacy SOPS file that lacks it. Supports `generated`, `external`, and `derived` entries. |
+| `sops_rekey` | Re-encrypt a file onto its domain's current recipient list. Run this after a domain's recipients change, or to clear a "recipients do not match" refusal. Requires an explicit `domain`. |
+
+Every tool except `sops_list_domains` takes an optional `domain` argument. See [Key domains](#key-domains).
 
 ## Setup
 
@@ -132,12 +136,89 @@ Add to your project's `.mcp.json`:
 | `SOPS_MCP_SOPS_BINARY` | No | Path to sops binary (default: `sops`) |
 | `SOPS_MCP_LOG_LEVEL` | No | Log level (default: `WARNING`) |
 | `SOPS_AGE_KEY` | Sometimes | Age private key — required for any mutation tool (rotate, add, update, rename, delete) |
+| `SOPS_MCP_DOMAINS_FILE` | No | Path to a YAML file defining named [key domains](#key-domains). Use when one server needs more than one recipient set. |
+| `SOPS_MCP_REQUIRE_DOMAIN` | No | Set to `1` to make every tool call name its domain explicitly instead of falling back to `default`. |
 | `SOPS_MCP_TRANSPORT` | No | `stdio` (default) or `sse` |
 | `SOPS_MCP_HOST` / `SOPS_MCP_PORT` | No | Bind host/port for SSE transport (default: `127.0.0.1:55090`). Binding to `0.0.0.0` requires `SOPS_MCP_API_TOKEN` — the server refuses to start otherwise. |
 | `SOPS_MCP_ALLOWED_HOSTS` | No | Comma-separated allowlist for the SSE `Host` header (DNS rebinding protection). Default: `127.0.0.1,127.0.0.1:*,localhost,localhost:*`. Set explicitly when binding to a non-loopback address — e.g. `mcp.example.com,mcp.example.com:*`. |
 | `SOPS_MCP_API_TOKEN` | Sometimes | Required when SSE transport binds to `0.0.0.0`; otherwise optional. When set, SSE requires `Authorization: Bearer <token>`. |
 
-\* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set.
+\* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set, unless `SOPS_MCP_DOMAINS_FILE` supplies a `default` domain.
+
+Both recipient variables accept a comma-separated list, and `SOPS_AGE_KEY` accepts several newline-separated keys. Together they form the `default` domain.
+
+## Key domains
+
+A **domain** is a named set of age recipients plus, optionally, the private keys the server holds for them. It is the unit the server encrypts to and decrypts with.
+
+You do not need to configure one. The environment variables above become a domain called `default`, and a single-recipient setup never has to mention domains again.
+
+### Why they exist
+
+Every mutation tool decrypts, changes, and re-encrypts. Re-encryption uses the server's configured recipients — so if a file was encrypted to a CI key *and* an operator key, but the server only knows about CI, the operator used to be dropped from the file silently. Domains fix that by making the recipient set a named, checked thing:
+
+- A mutation compares the file's actual recipients against the domain's. If they differ it refuses, rather than quietly changing who can read the file.
+- One server process can hold several independent key sets.
+- `sops_rekey` performs a deliberate recipient change, which is the `sops updatekeys` workflow.
+
+### Several recipients, one domain
+
+The common case needs no domains file. List every recipient in the usual variable:
+
+```bash
+SOPS_MCP_AGE_PUBLIC_KEY="age1ci...,age1operator..."
+SOPS_AGE_KEY="AGE-SECRET-KEY-1CI..."
+```
+
+Files are now encrypted to both, and mutations keep both. The server only needs whichever private key it will actually decrypt with.
+
+### Several domains
+
+Point `SOPS_MCP_DOMAINS_FILE` at a YAML file:
+
+```yaml
+version: 1
+domains:
+  homelab:
+    recipients:
+      - age1ci...          # CI runner
+      - age1operator...    # operator laptop
+    keys:
+      - AGE-SECRET-KEY-1CI...
+  client-acme:
+    recipients:
+      - age1acme...
+    key_file: /run/secrets/acme.agekey   # an age keys file
+  archive:
+    recipients:
+      - age1archive...
+    # no keys: this domain can encrypt but never decrypt
+```
+
+Any file holding private keys — the domains file itself, or a `key_file` — must be mode `0600` and owned by the user the server runs as. The server refuses to start otherwise.
+
+Startup also checks that every private key belongs to a recipient in its own domain. A key that cannot open what its domain produces is a configuration mistake, and it is better to learn that at boot than at the first rotation.
+
+### Which domain does a tool use?
+
+In order: the `domain` argument, then the domain recorded in the file's `_meta_unencrypted` block, then `default`. Set `SOPS_MCP_REQUIRE_DOMAIN=1` to remove the last step and force every call to be explicit.
+
+The recorded name is a hint. The check is the recipient list in the file's own SOPS envelope, which is why a mislabelled file is refused rather than re-keyed.
+
+### Recipient rotation
+
+Adding or removing a recipient is a two-step operation:
+
+1. Edit the domain's recipient list and restart the server.
+2. Run `sops_rekey` on each affected file, naming the domain.
+
+Until a file is rekeyed, mutations on it are refused with a message pointing here. `sops_list_secrets` reports the mismatch too, and needs no private key to do it.
+
+`sops_rekey` cannot move a file between domains. The only keys offered to `sops` are the target domain's own, so a file that domain cannot read is a file it cannot rekey. Moving secrets between domains is deliberately manual: decrypt with the `sops` CLI, then `sops_create_secrets` into the new domain.
+
+### What domains are not
+
+Domains separate key sets, not callers. On the SSE transport a single API token reaches every domain the server holds. If you need two parties that must not read each other's secrets, run a server process each.
 
 ## Security
 
@@ -157,6 +238,7 @@ SMTP_USER: ENC[AES256_GCM,data:...,tag:...,type:str]
 DB_PASSWORD_HASH: ENC[AES256_GCM,data:...,tag:...,type:str]
 _meta_unencrypted:
     version: 1
+    domain: default
     secrets:
         DB_PASSWORD:
             source: generated
@@ -191,7 +273,9 @@ Secret values are AES-256-GCM encrypted. The `_meta_unencrypted` block is stored
 
 **Per-key in-place update for generated/derived secrets:** intentionally absent. `sops_rotate_generated` is the one path that changes those values, so rotations leave an audit trail (`last_rotated` timestamp) and cascade cleanly to derived secrets.
 
-**Multi-recipient / team key management (`.sops.yaml`, `updatekeys`):** planned for a future release. v1 assumes a single age recipient. For multi-recipient setups, use the `sops` CLI directly for recipient rotations and this server for content management.
+**`.sops.yaml` creation rules:** out of scope. The server has no view of your filesystem, so path-based creation rules cannot apply. Recipients come from [key domains](#key-domains) instead, and `sops_rekey` covers the `updatekeys` workflow.
+
+**Tenant isolation on the SSE transport:** not yet. Domains separate key *sets*, not *callers*. A single `SOPS_MCP_API_TOKEN` grants every domain the server holds, so do not put two mutually distrusting parties behind one SSE server. Run one process each.
 
 **Other source types (imported, templated):** out of scope. Those are orchestration concerns — fetch values from Vault or compose URLs in your deployment templating layer, then pass the result here as an `external` secret.
 

@@ -8,6 +8,7 @@ import subprocess
 import pytest
 import yaml
 
+from sops_mcp.domains import load_domains
 from sops_mcp.server import SopsMcpServer
 from sops_mcp.sops import SopsEncryptor
 
@@ -40,9 +41,15 @@ def age_keys(tmp_path, monkeypatch):
     return public_key
 
 
+def _domain(server):
+    """The server's only domain — these tests run single-domain."""
+    return server.domains["default"]
+
+
 @pytest.fixture
 def server(age_keys):
-    return SopsMcpServer(SopsEncryptor(age_keys))
+    """Server built the way main() builds it, from the patched environment."""
+    return SopsMcpServer(SopsEncryptor(), load_domains())
 
 
 async def test_full_lifecycle(server):
@@ -64,7 +71,7 @@ async def test_full_lifecycle(server):
         ]
     })
     encrypted = result[0].text
-    values = server.encryptor.decrypt(encrypted)
+    values = server.encryptor.decrypt(encrypted, _domain(server))
     assert len(values["DB_ACCESS_KEY"]) == 32
     assert values["SMTP_USER"] == "user@example.com"
     assert values["DB_ACCESS_KEY_HASH"] == hashlib.sha256(
@@ -84,7 +91,7 @@ async def test_full_lifecycle(server):
     )
     rotated = rotated_result[0].text
     values_before = values
-    values_after = server.encryptor.decrypt(rotated)
+    values_after = server.encryptor.decrypt(rotated, _domain(server))
     assert values_after["DB_ACCESS_KEY"] != values_before["DB_ACCESS_KEY"]
     assert values_after["SMTP_USER"] == values_before["SMTP_USER"]
     assert values_after["DB_ACCESS_KEY_HASH"] == hashlib.sha256(
@@ -99,7 +106,7 @@ async def test_full_lifecycle(server):
         ],
     })
     added = added_result[0].text
-    values = server.encryptor.decrypt(added)
+    values = server.encryptor.decrypt(added, _domain(server))
     assert values["API_KEY"] == "abc123"
     assert values["DB_ACCESS_KEY"] == values_after["DB_ACCESS_KEY"]  # preserved
 
@@ -110,7 +117,7 @@ async def test_full_lifecycle(server):
         "value": "new-value",
     })
     updated = updated_result[0].text
-    values = server.encryptor.decrypt(updated)
+    values = server.encryptor.decrypt(updated, _domain(server))
     assert values["API_KEY"] == "new-value"
 
     # 6. Rename — derivation reference must update
@@ -144,7 +151,7 @@ async def test_full_lifecycle(server):
     parsed = yaml.safe_load(deleted)
     assert "DATABASE_ACCESS_KEY" not in parsed
     assert "DB_ACCESS_KEY_HASH" not in parsed
-    values = server.encryptor.decrypt(deleted)
+    values = server.encryptor.decrypt(deleted, _domain(server))
     assert values["SMTP_USER"] == "user@example.com"
     assert values["API_KEY"] == "new-value"
 
@@ -168,7 +175,7 @@ async def test_update_external_cascades_to_derived(server):
         ]
     })
     encrypted = result[0].text
-    values = server.encryptor.decrypt(encrypted)
+    values = server.encryptor.decrypt(encrypted, _domain(server))
     assert values["UPSTREAM_KEY_HASH"] == hashlib.sha256(
         b"original"
     ).hexdigest()
@@ -178,7 +185,7 @@ async def test_update_external_cascades_to_derived(server):
         "key_name": "UPSTREAM_KEY",
         "value": "new-upstream",
     })
-    values = server.encryptor.decrypt(updated[0].text)
+    values = server.encryptor.decrypt(updated[0].text, _domain(server))
     assert values["UPSTREAM_KEY"] == "new-upstream"
     assert values["UPSTREAM_KEY_HASH"] == hashlib.sha256(
         b"new-upstream"
@@ -205,7 +212,7 @@ async def test_oidc_convenience_creates_pair(server):
         "description": "OIDC client secret for Grafana",
     })
     encrypted = result[0].text
-    values = server.encryptor.decrypt(encrypted)
+    values = server.encryptor.decrypt(encrypted, _domain(server))
     assert len(values["GRAFANA_OIDC_CLIENT_SECRET"]) == 64
     assert values["GRAFANA_OIDC_CLIENT_SECRET"].isalnum()
     assert values["GRAFANA_OIDC_CLIENT_SECRET_HASH"].startswith(
@@ -237,12 +244,12 @@ async def test_derived_is_not_recomputed_when_source_unchanged(server):
         ]
     })
     encrypted = result[0].text
-    hash_before = server.encryptor.decrypt(encrypted)["FIXED_PASSWORD_HASH"]
+    hash_before = server.encryptor.decrypt(encrypted, _domain(server))["FIXED_PASSWORD_HASH"]
 
     rotated = await server._rotate_generated(
         {"encrypted_content": encrypted}
     )
-    values = server.encryptor.decrypt(rotated[0].text)
+    values = server.encryptor.decrypt(rotated[0].text, _domain(server))
     assert values["FIXED_PASSWORD_HASH"] == hash_before
 
 
@@ -259,9 +266,9 @@ async def test_add_metadata_accepts_derived(server):
     })
     encrypted = first[0].text
     # Decrypt, drop _meta_unencrypted, re-encrypt (simulating legacy file).
-    values = server.encryptor.decrypt(encrypted)
+    values = server.encryptor.decrypt(encrypted, _domain(server))
     values.pop("_meta_unencrypted", None)
-    legacy = server.encryptor.encrypt(values)
+    legacy = server.encryptor.encrypt(values, _domain(server))
 
     result = await server._add_metadata({
         "encrypted_content": legacy,
