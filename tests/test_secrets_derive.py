@@ -7,8 +7,8 @@ import pytest
 
 from sops_mcp.secrets_derive import (
     TRANSFORMS,
-    derive_secret,
     dependents_of,
+    derive_secret,
     topological_order,
 )
 

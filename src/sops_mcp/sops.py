@@ -159,6 +159,7 @@ class SopsEncryptor:
                 text=True,
                 timeout=30,
                 env=self._child_env(domain, scratch_home),
+                check=False,
             )
 
             if result.returncode != 0:
@@ -209,6 +210,7 @@ class SopsEncryptor:
                 text=True,
                 timeout=30,
                 env=self._child_env(domain, scratch_home),
+                check=False,
             )
 
             if result.returncode != 0:

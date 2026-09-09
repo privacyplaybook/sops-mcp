@@ -4,8 +4,9 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timezone
-from typing import Any, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 import yaml
 from mcp.server import Server
@@ -16,6 +17,13 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Mount, Route
 
+from .domains import (
+    DEFAULT_DOMAIN,
+    Domain,
+    DomainConfigError,
+    load_domains,
+    require_explicit_domain,
+)
 from .secrets_derive import (
     TRANSFORMS,
     VALID_TRANSFORMS,
@@ -24,13 +32,6 @@ from .secrets_derive import (
     topological_order,
 )
 from .secrets_generator import CHARSETS, generate_secret
-from .domains import (
-    DEFAULT_DOMAIN,
-    Domain,
-    DomainConfigError,
-    load_domains,
-    require_explicit_domain,
-)
 from .sops import SopsEncryptor, SopsError, recipients_of
 
 logger = logging.getLogger(__name__)
@@ -769,7 +770,7 @@ class SopsMcpServer:
 
         domain = self._resolve_domain(arguments)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         resolved, meta_secrets, summary, derived_plaintexts = _process_batch(
             secrets_list,
             existing_values={},
@@ -945,8 +946,10 @@ class SopsMcpServer:
         removed = len(before - after)
         summary = [
             f"Rekeyed onto domain '{domain.name}'.",
-            f"Recipients: {len(before)} -> {len(after)} "
-            f"({added} added, {removed} removed).",
+            (
+                f"Recipients: {len(before)} -> {len(after)} "
+                f"({added} added, {removed} removed)."
+            ),
         ]
         if removed:
             summary.append(
@@ -983,7 +986,7 @@ class SopsMcpServer:
 
         decrypted = self.encryptor.decrypt(content, domain)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         new_data: dict[str, Any] = {}
         rotated: list[str] = []
         recomputed: list[str] = []
@@ -1116,7 +1119,7 @@ class SopsMcpServer:
         }
         preserved = list(existing_values.keys())
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         resolved, merged_meta, summary, derived_plaintexts = _process_batch(
             secrets_list,
             existing_values=existing_values,
@@ -1240,7 +1243,7 @@ class SopsMcpServer:
 
         decrypted = self.encryptor.decrypt(content, domain)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         meta_secrets = {}
         for key_name, meta in secret_metadata.items():
             source = meta["source"]
@@ -1509,7 +1512,7 @@ class SopsMcpServer:
 
         decrypted = self.encryptor.decrypt(content, domain)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         new_data: dict[str, Any] = {}
         for key, value in decrypted.items():
             if key.startswith("_"):

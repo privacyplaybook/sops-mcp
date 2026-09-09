@@ -50,7 +50,7 @@ Changelog = "https://github.com/privacyplaybook/sops-mcp/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
+    "ruff==0.16.6",
 ]
 
 [project.scripts]
@@ -66,3 +66,12 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+
+[tool.ruff.lint]
+ignore = [
+    # The call_tool dispatcher catches (ValueError, SopsError) and returns
+    # the message to the client; anything else becomes a generic "Internal
+    # error". Raising TypeError for a malformed client payload would hide
+    # the reason from the caller, so ValueError is deliberate here.
+    "TRY004",
+]

@@ -231,7 +231,7 @@ def _write(tmp_path, text, mode=0o600, name="domains.yaml"):
 
 
 def test_domains_file_multiple_domains(keypairs, tmp_path):
-    (ident_a, pub_a), (ident_b, pub_b) = keypairs
+    (ident_a, pub_a), (_, pub_b) = keypairs
     path = _write(
         tmp_path,
         f"""
@@ -307,7 +307,7 @@ def test_world_readable_domains_file_with_inline_keys_is_fatal(keypairs, tmp_pat
 
 
 def test_default_in_both_file_and_env_is_fatal(keypairs, tmp_path):
-    ident_a, pub_a = keypairs[0]
+    _, pub_a = keypairs[0]
     path = _write(
         tmp_path,
         f"""
@@ -324,7 +324,7 @@ def test_default_in_both_file_and_env_is_fatal(keypairs, tmp_path):
 
 
 def test_file_and_env_default_coexist_when_file_omits_default(keypairs, tmp_path):
-    (ident_a, pub_a), (_, pub_b) = keypairs
+    (_, pub_a), (_, pub_b) = keypairs
     path = _write(
         tmp_path,
         f"""

@@ -11,8 +11,8 @@ import asyncio
 import pytest
 from starlette.testclient import TestClient
 
-from tests.helpers import DUMMY_RECIPIENT, make_server
 from sops_mcp.server import main
+from tests.helpers import DUMMY_RECIPIENT, make_server
 
 
 def test_main_refuses_0000_bind_without_api_token(monkeypatch):

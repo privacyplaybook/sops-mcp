@@ -15,7 +15,9 @@ from sops_mcp.sops import SopsEncryptor
 
 
 def _require(binary: str) -> None:
-    if subprocess.run(["which", binary], capture_output=True).returncode != 0:
+    if subprocess.run(
+        ["which", binary], capture_output=True, check=False
+    ).returncode != 0:
         pytest.skip(f"{binary} not installed")
 
 

@@ -19,10 +19,10 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 __all__ = [
     "AgeKeyError",
+    "is_plugin_identity",
     "is_plugin_recipient",
     "parse_identity",
     "parse_recipient",
-    "is_plugin_identity",
     "recipient_from_identity",
     "recipient_is_derivable",
     "validate_recipient",

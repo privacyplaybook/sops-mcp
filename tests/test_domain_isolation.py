@@ -16,7 +16,9 @@ from sops_mcp.sops import SopsEncryptor, SopsError, recipients_of
 
 
 def _require(binary: str) -> None:
-    if subprocess.run(["which", binary], capture_output=True).returncode != 0:
+    if subprocess.run(
+        ["which", binary], capture_output=True, check=False
+    ).returncode != 0:
         pytest.skip(f"{binary} not installed")
 
 
@@ -137,7 +139,7 @@ def test_default_age_keys_file_would_otherwise_have_worked(tmp_path, monkeypatch
     env["XDG_CONFIG_HOME"] = str(fake_home / ".config")
     result = subprocess.run(
         ["sops", "decrypt", "--input-type", "yaml", "--output-type", "yaml", str(target)],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, check=False,
     )
     assert result.returncode == 0, result.stderr
     assert "s3cr3t-value" in result.stdout
