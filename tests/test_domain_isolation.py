@@ -1,0 +1,364 @@
+"""Integration tests for per-domain key isolation.
+
+These exercise the real sops CLI. They are the tests that matter most in
+this change: they assert that a domain can decrypt only what it was
+encrypted to, and that no key reachable through the ambient environment
+can widen that.
+"""
+
+import os
+import subprocess
+
+import pytest
+import yaml
+
+from sops_mcp.domains import Domain
+from sops_mcp.sops import (
+    SopsEncryptor,
+    SopsError,
+    recipients_of,
+    unsupported_key_features,
+)
+
+
+def _require(binary: str) -> None:
+    if subprocess.run(
+        ["which", binary], capture_output=True, check=False
+    ).returncode != 0:
+        pytest.skip(f"{binary} not installed")
+
+
+def _keypair() -> tuple[str, str]:
+    out = subprocess.run(
+        ["age-keygen"], capture_output=True, text=True, check=True
+    ).stdout
+    ident = next(
+        line.strip() for line in out.splitlines() if line.startswith("AGE-SECRET-KEY-")
+    )
+    pub = subprocess.run(
+        ["age-keygen", "-y"], input=ident, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return ident, pub
+
+
+@pytest.fixture
+def two_domains():
+    _require("sops")
+    _require("age-keygen")
+    ident_a, pub_a = _keypair()
+    ident_b, pub_b = _keypair()
+    return (
+        Domain(name="alpha", recipients=(pub_a,), keys=(ident_a,)),
+        Domain(name="beta", recipients=(pub_b,), keys=(ident_b,)),
+    )
+
+
+@pytest.fixture
+def encryptor():
+    return SopsEncryptor()
+
+
+PAYLOAD = {"API_TOKEN": "s3cr3t-value", "_meta_unencrypted": {"version": 1}}
+
+
+def test_round_trip_within_a_domain(encryptor, two_domains):
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert "s3cr3t-value" not in blob
+    assert encryptor.decrypt(blob, alpha)["API_TOKEN"] == "s3cr3t-value"
+
+
+def test_other_domain_cannot_decrypt(encryptor, two_domains):
+    """The core isolation property."""
+    alpha, beta = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    with pytest.raises(SopsError, match="sops decrypt failed"):
+        encryptor.decrypt(blob, beta)
+
+
+def test_ambient_sops_age_key_is_ignored(encryptor, two_domains, monkeypatch):
+    """A key in the parent environment must not widen a domain's reach.
+
+    Before domains, sops inherited SOPS_AGE_KEY from the server process, so
+    whatever was in it could decrypt anything.
+    """
+    alpha, beta = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    monkeypatch.setenv("SOPS_AGE_KEY", alpha.keys[0])
+    with pytest.raises(SopsError, match="sops decrypt failed"):
+        encryptor.decrypt(blob, beta)
+
+
+def test_ambient_key_file_is_ignored(encryptor, two_domains, monkeypatch, tmp_path):
+    alpha, beta = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    keyfile = tmp_path / "keys.txt"
+    keyfile.write_text(alpha.keys[0] + "\n")
+    monkeypatch.setenv("SOPS_AGE_KEY_FILE", str(keyfile))
+    with pytest.raises(SopsError, match="sops decrypt failed"):
+        encryptor.decrypt(blob, beta)
+
+
+def test_default_age_keys_file_is_ignored(encryptor, two_domains, monkeypatch, tmp_path):
+    """sops falls back to ~/.config/sops/age/keys.txt when no env key is set.
+
+    The scratch HOME handed to each invocation is what closes that path.
+    """
+    alpha, beta = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+
+    fake_home = tmp_path / "home"
+    keydir = fake_home / ".config" / "sops" / "age"
+    keydir.mkdir(parents=True)
+    (keydir / "keys.txt").write_text(alpha.keys[0] + "\n")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
+
+    with pytest.raises(SopsError, match="sops decrypt failed"):
+        encryptor.decrypt(blob, beta)
+
+
+def test_default_age_keys_file_would_otherwise_have_worked(tmp_path, monkeypatch):
+    """Control for the previous test: prove the planted key really is usable.
+
+    Without this, that test could pass because the key file was malformed
+    rather than because the isolation worked.
+    """
+    _require("sops")
+    _require("age-keygen")
+    ident, pub = _keypair()
+    encryptor = SopsEncryptor()
+    domain = Domain(name="alpha", recipients=(pub,), keys=(ident,))
+    blob = encryptor.encrypt(PAYLOAD, domain)
+
+    fake_home = tmp_path / "home"
+    keydir = fake_home / ".config" / "sops" / "age"
+    keydir.mkdir(parents=True)
+    (keydir / "keys.txt").write_text(ident + "\n")
+
+    # Invoke sops directly, the way it behaved before this change.
+    target = tmp_path / "secrets.enc.yaml"
+    target.write_text(blob)
+    env = dict(os.environ)
+    env.pop("SOPS_AGE_KEY", None)
+    env["HOME"] = str(fake_home)
+    env["XDG_CONFIG_HOME"] = str(fake_home / ".config")
+    result = subprocess.run(
+        ["sops", "decrypt", "--input-type", "yaml", "--output-type", "yaml", str(target)],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "s3cr3t-value" in result.stdout
+
+
+def test_encrypt_only_domain_refuses_to_decrypt(encryptor, two_domains):
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    encrypt_only = Domain(name="archive", recipients=alpha.recipients)
+    with pytest.raises(SopsError, match="no private key configured"):
+        encryptor.decrypt(blob, encrypt_only)
+
+
+def test_multi_recipient_encrypt_readable_by_each(encryptor, two_domains):
+    """A two-recipient domain produces a file either key can open."""
+    alpha, beta = two_domains
+    shared = Domain(
+        name="shared",
+        recipients=alpha.recipients + beta.recipients,
+        keys=alpha.keys,
+    )
+    blob = encryptor.encrypt(PAYLOAD, shared)
+    assert len(recipients_of(blob)) == 2
+
+    for holder in (alpha, beta):
+        solo = Domain(name="shared", recipients=shared.recipients, keys=holder.keys)
+        assert encryptor.decrypt(blob, solo)["API_TOKEN"] == "s3cr3t-value"
+
+
+def test_recipients_of_reads_envelope_without_a_key(encryptor, two_domains):
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert recipients_of(blob) == alpha.recipients
+
+
+def test_recipients_of_rejects_non_sops_content():
+    with pytest.raises(SopsError, match="no 'sops' metadata block"):
+        recipients_of("KEY: value\n")
+
+
+def test_recipients_of_rejects_invalid_yaml():
+    with pytest.raises(SopsError, match="not valid YAML"):
+        recipients_of("key: [unclosed\n")
+
+
+def test_scratch_dirs_are_cleaned_up(encryptor, two_domains):
+    alpha, _ = two_domains
+    before = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    encryptor.decrypt(blob, alpha)
+    after = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
+    assert not {d for d in after - before if d.startswith("sops-mcp-")}
+
+
+def test_unencrypted_metadata_is_covered_by_the_mac(encryptor, two_domains):
+    """sops MACs unencrypted values too, so tampering is caught on decrypt.
+
+    This is not a sops feature the server opts into — it is the default,
+    and `--mac-only-encrypted` would turn it off. The assertion exists so
+    that adding that flag cannot silently make the `_meta_unencrypted`
+    block forgeable. Note the MAC is only checked when decrypting: tools
+    that read metadata without a key still see unauthenticated data, which
+    is why mutations verify recipients before trusting the recorded domain.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(
+        {
+            "TOKEN": "v",
+            "_meta_unencrypted": {
+                "version": 1,
+                "domain": "alpha",
+                "secrets": {"TOKEN": {"source": "generated"}},
+            },
+        },
+        alpha,
+    )
+    assert encryptor.decrypt(blob, alpha)["TOKEN"] == "v"
+
+    for original, replacement in [
+        ("domain: alpha", "domain: beta"),
+        ("source: generated", "source: external"),
+    ]:
+        tampered = blob.replace(original, replacement)
+        assert tampered != blob
+        with pytest.raises(SopsError, match="MAC mismatch"):
+            encryptor.decrypt(tampered, alpha)
+
+
+def test_unsupported_key_features_are_reported(encryptor, two_domains):
+    """Anything this server cannot reproduce on re-encryption is flagged.
+
+    It encrypts with a flat age recipient list, so another master key
+    would be dropped and a Shamir threshold flattened — both silent
+    downgrades of the file's guarantee.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert unsupported_key_features(blob) == ()
+
+    parsed = yaml.safe_load(blob)
+    parsed["sops"]["pgp"] = [{"fp": "DEADBEEF", "enc": "..."}]
+    assert unsupported_key_features(yaml.dump(parsed)) == ("pgp",)
+
+    parsed["sops"]["kms"] = [{"arn": "arn:aws:kms:...", "enc": "..."}]
+    assert set(unsupported_key_features(yaml.dump(parsed))) == {"pgp", "kms"}
+
+
+def test_shamir_key_groups_are_reported(encryptor, two_domains):
+    """Key groups hide the recipients, so the plain checks see nothing.
+
+    A key-group file lists no top-level `age` entries and leaves the other
+    master-key groups empty, so without this it reads as an ordinary file
+    with zero recipients.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    parsed = yaml.safe_load(blob)
+    del parsed["sops"]["age"]
+    parsed["sops"]["key_groups"] = [{"age": [{"recipient": "age1a", "enc": "x"}]}]
+    parsed["sops"]["shamir_threshold"] = 2
+    doctored = yaml.dump(parsed)
+
+    assert recipients_of(doctored) == ()
+    assert set(unsupported_key_features(doctored)) == {
+        "key_groups",
+        "shamir_threshold",
+    }
+
+
+def test_encrypt_subprocess_never_carries_a_private_key(encryptor, two_domains):
+    """Encryption needs recipients on the command line and nothing else.
+
+    Keeping identities out of that environment keeps them out of
+    /proc/<pid>/environ for the tools the README lists as needing no
+    private key.
+    """
+    alpha, _ = two_domains
+    assert "SOPS_AGE_KEY" not in encryptor._child_env(alpha, "/nonexistent", with_keys=False)
+    assert "SOPS_AGE_KEY" in encryptor._child_env(alpha, "/nonexistent", with_keys=True)
+
+
+def test_encrypt_only_advice_names_the_right_remedy(encryptor, two_domains):
+    """SOPS_AGE_KEY only ever feeds the implicit 'default' domain."""
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+
+    with pytest.raises(SopsError, match="Set SOPS_AGE_KEY"):
+        encryptor.decrypt(blob, Domain("default", alpha.recipients))
+
+    with pytest.raises(SopsError, match="only configures the 'default' domain"):
+        encryptor.decrypt(blob, Domain("archive", alpha.recipients))
+
+
+def test_mac_only_encrypted_is_refused(encryptor, two_domains):
+    """It voids the authentication the metadata block's trust rests on.
+
+    With `mac_only_encrypted` set, sops MACs only the encrypted values, so
+    the plaintext `_meta_unencrypted` block — the recorded domain, and
+    each secret's `source`, which decides whether a value may be
+    overwritten in place — becomes freely rewritable by anyone who can
+    edit the file.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert unsupported_key_features(blob) == ()
+
+    parsed = yaml.safe_load(blob)
+    parsed["sops"]["mac_only_encrypted"] = True
+    assert unsupported_key_features(yaml.dump(parsed)) == ("mac_only_encrypted",)
+
+    # False is the normal state and must not trip it.
+    parsed["sops"]["mac_only_encrypted"] = False
+    assert unsupported_key_features(yaml.dump(parsed)) == ()
+
+
+def test_a_sops_config_in_the_working_directory_is_ignored(
+    encryptor, two_domains, tmp_path, monkeypatch
+):
+    """sops finds .sops.yaml by walking up from its working directory.
+
+    That is this server's working directory — typically the user's
+    project, where a sops user very likely keeps one. Its creation rules
+    would otherwise override what this server intends: a path_regex that
+    misses the temp file fails the call outright, and an encrypted_regex
+    collides with the --unencrypted-suffix this server relies on.
+    """
+    alpha, _ = two_domains
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".sops.yaml").write_text(
+        "creation_rules:\n"
+        f"  - age: {alpha.recipients[0]}\n"
+        "    encrypted_regex: '^(data|stringData)$'\n"
+    )
+    monkeypatch.chdir(project)
+
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert "s3cr3t-value" not in blob
+    assert encryptor.decrypt(blob, alpha)["API_TOKEN"] == "s3cr3t-value"
+
+
+def test_a_non_matching_path_regex_does_not_break_encryption(
+    encryptor, two_domains, tmp_path, monkeypatch
+):
+    """The other shape of the same problem: sops refuses to encrypt at all."""
+    alpha, _ = two_domains
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".sops.yaml").write_text(
+        "creation_rules:\n"
+        "  - path_regex: \\.enc\\.yaml$\n"
+        f"    age: {alpha.recipients[0]}\n"
+    )
+    monkeypatch.chdir(project)
+
+    assert encryptor.decrypt(encryptor.encrypt(PAYLOAD, alpha), alpha)

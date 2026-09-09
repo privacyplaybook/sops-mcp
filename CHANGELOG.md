@@ -5,6 +5,134 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0]
+
+Adds **key domains**: a named set of age recipients plus the private keys
+the server holds for them. One server process can now serve several
+independent recipient sets, and — the reason this is a minor rather than a
+patch — mutations no longer silently change who can read a file.
+
+Existing single-recipient deployments need no configuration change. The
+v1 environment variables become a domain called `default`.
+
+### Fixed
+
+- **Re-encryption no longer drops recipients.** Every mutation decrypts,
+  changes and re-encrypts; re-encryption used the server's configured
+  recipients, so a file encrypted to two parties handled by a server that
+  knew about one came back readable by one, with no error. Mutations now
+  compare the file's actual recipients against the resolved domain and
+  refuse on any difference, pointing at `sops_rekey`.
+- **Private keys no longer leak between key sets.** sops inherited
+  `SOPS_AGE_KEY` from the server process and fell back to
+  `~/.config/sops/age/keys.txt`. Each invocation now gets an environment
+  carrying only the keys of the domain for that call, with every other age
+  key variable stripped and `HOME` / `XDG_CONFIG_HOME` pointed at an empty
+  directory.
+
+### Added
+
+- `SOPS_MCP_DOMAINS_FILE` — YAML defining named domains, each with
+  `recipients` and optional `keys` / `key_file`. A domain with no keys can
+  encrypt but never decrypt. Files holding key material must be mode 0600
+  and owned by the server's user.
+- `SOPS_MCP_REQUIRE_DOMAIN` — require every call to name its domain
+  instead of falling back to `default`.
+- `sops_list_domains` — report configured domains, their recipients, and
+  whether each can decrypt. Never returns private key material.
+- `sops_rekey` — re-encrypt a file onto its domain's current recipient
+  list. This is the `sops updatekeys` workflow, and the way to clear the
+  new mismatch refusal. Requires an explicit `domain`; it cannot move a
+  file between domains.
+- Every other tool takes an optional `domain` argument.
+- `_meta_unencrypted.domain` records which domain a file belongs to. It is
+  a hint for resolution, not an authority — the recipient check is what
+  makes trusting it safe. Files without it resolve to `default`.
+- `sops_list_secrets` reports the domain, recipient count, and any
+  mismatch, still without needing a private key.
+- Startup validates every recipient and private key, and rejects a domain
+  whose private key does not belong to it.
+- `docs/design/domains.md` — design, threat model, and the deferred phase 2
+  (binding SSE bearer tokens to domains for real tenant isolation).
+
+### Changed
+
+- **An unmatched private key no longer stops the server booting.** A key
+  whose public half is not in its domain's recipient list is the normal
+  state mid recipient-rotation, and it still opens files encrypted before
+  the change. It is now a warning, and `sops_rekey` migrates those files.
+- **`SOPS_MCP_REQUIRE_DOMAIN` now means what its name says.** It was
+  checked only after the file's recorded domain, so a call omitting
+  `domain` still succeeded whenever the client-supplied content named
+  one. The flag now requires the caller to name the domain.
+- **Key-file permission rules fit container secrets.** A file holding
+  private keys may be group-readable, with a warning, and may be owned by
+  root as well as by the server's user. World-readable and group-writable
+  remain fatal. The previous rules rejected the Docker secret path the
+  README documents.
+- **`sops_list_secrets` honours its `domain` argument.** It advertised one
+  and ignored it, reporting a mismatch against `default` for a file the
+  caller had asked about under another domain.
+- **Behaviour change.** A file whose recipients do not match the resolved
+  domain is now refused rather than silently re-encrypted. This is the bug
+  fix above; the only way to hit it is a configuration that was already
+  losing recipients. Run `sops_rekey` to reconcile.
+- `cryptography` is now a direct dependency (it was already present
+  transitively via `mcp`). It is used to derive an age recipient from an
+  identity during startup validation.
+- `SopsEncryptor(age_public_key, sops_binary)` is now
+  `SopsEncryptor(sops_binary)`, with `encrypt` / `decrypt` taking a
+  `Domain`. `SopsMcpServer` takes a domain mapping.
+
+### Security
+
+- **Files with `mac_only_encrypted` are refused.** That option makes sops
+  MAC the ciphertext alone, leaving the plaintext `_meta_unencrypted`
+  block unauthenticated — so a file's recorded domain, and each secret's
+  `source`, could be rewritten by anyone able to edit the file. Since
+  `source` decides whether a value may be overwritten in place, a forged
+  one would let `sops_update_external` overwrite a generated secret.
+- **Every sops invocation is pinned to an empty `--config`.** sops
+  discovers a `.sops.yaml` by walking up from its working directory,
+  which is this server's — typically the user's project, where a sops
+  user very likely keeps one. Its creation rules could break every
+  encrypt: a `path_regex` that misses the temp file fails the call, and
+  an `encrypted_regex` collides with the `--unencrypted-suffix` this
+  server relies on. Recipients were never at risk, since `--age` wins.
+- **`sops_rekey`'s cross-domain guard now covers unlabelled files.** It
+  fired only when the file recorded a domain, so it was dead for any file
+  an older version had round-tripped. Where a rekey would revoke a reader
+  and another domain's recipients match the file exactly, it is refused.
+- **Files this server cannot faithfully re-encrypt are refused.** It
+  always re-encrypts to a flat age recipient list, so a file carrying
+  another master key (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`)
+  would come back with that holder dropped, and a Shamir file
+  (`key_groups` + `shamir_threshold`) would have its n-of-m threshold
+  flattened into a list any single holder could open. Both are silent
+  downgrades. Mutations refuse them and `sops_list_secrets` flags them.
+- **`sops_rekey` refuses to move a file between domains.** Two domains
+  sharing a private key would otherwise let a file be moved quietly,
+  dropping the recipients the target domain does not have — decryption
+  succeeds, so nothing else catches it.
+- **The domains file is integrity-checked even without inline keys.** It
+  decides which recipients everything is encrypted to, so a
+  group-writable one let a local attacker add their own recipient. The
+  server now refuses to start on a domains file writable by group or
+  other, or owned by a third party, regardless of whether it holds key
+  material.
+- **Private keys reach the sops subprocess only when decrypting.**
+  Encryption takes its recipients from the command line, so an encrypt
+  call no longer carries an identity in the child environment where
+  `/proc/<pid>/environ` would expose it.
+- Domains separate key sets, not callers. On the SSE transport one API
+  token still reaches every domain the server holds; two mutually
+  distrusting parties need separate processes. Documented in SECURITY.md.
+- Corrected a prior audit note: SOPS's MAC *does* cover unencrypted
+  values, so a tampered `_meta_unencrypted` block fails to decrypt. Pinned
+  by a test so `--mac-only-encrypted` cannot be introduced silently. Paths
+  that read metadata without decrypting remain unverified, which is why
+  recipients are checked independently.
+
 ## [0.10.1]
 
 Dependency / security maintenance release. Regenerates `requirements.lock.txt`

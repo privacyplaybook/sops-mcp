@@ -4,8 +4,9 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timezone
-from typing import Any, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 import yaml
 from mcp.server import Server
@@ -16,6 +17,13 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Mount, Route
 
+from .domains import (
+    DEFAULT_DOMAIN,
+    Domain,
+    DomainConfigError,
+    load_domains,
+    require_explicit_domain,
+)
 from .secrets_derive import (
     TRANSFORMS,
     VALID_TRANSFORMS,
@@ -24,7 +32,12 @@ from .secrets_derive import (
     topological_order,
 )
 from .secrets_generator import CHARSETS, generate_secret
-from .sops import SopsEncryptor, SopsError
+from .sops import (
+    SopsEncryptor,
+    SopsError,
+    recipients_of,
+    unsupported_key_features,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,18 +293,130 @@ def _process_batch(
     return resolved, merged_meta, summary, derived_plaintexts
 
 
+DOMAIN_SCHEMA_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Name of the key domain to encrypt to / decrypt with. Optional. "
+        "Defaults to the domain recorded in the file's _meta_unencrypted "
+        "block, and failing that to 'default'. Call sops_list_domains to "
+        "see what this server has configured."
+    ),
+}
+
+
 class SopsMcpServer:
     """MCP server that creates and manages SOPS-encrypted secrets."""
 
-    def __init__(self, encryptor: SopsEncryptor):
+    def __init__(
+        self,
+        encryptor: SopsEncryptor,
+        domains: dict[str, Domain],
+        require_domain: bool = False,
+    ):
+        if not domains:
+            raise ValueError("at least one domain must be configured")
         self.encryptor = encryptor
+        self.domains = domains
+        self.require_domain = require_domain
         self.server = Server("sops-mcp")
         self._setup_handlers()
+
+    def _domain_names(self) -> str:
+        return ", ".join(sorted(self.domains))
+
+    def _resolve_domain(
+        self, arguments: dict[str, Any], meta: Any = None
+    ) -> Domain:
+        """Pick the domain for one call.
+
+        Precedence: the explicit argument, then the name recorded in the
+        file's metadata, then 'default'. The recorded name is only a hint —
+        :meth:`_check_recipients` is what makes trusting it safe.
+        """
+        requested = str(arguments.get("domain") or "").strip()
+        source = "the 'domain' argument"
+
+        # Checked before the file's hint, not after: the point of the flag
+        # is that the caller names the domain, and a hint read out of
+        # client-supplied content is not the caller naming it.
+        if not requested and self.require_domain:
+            raise ValueError(
+                "No domain given and SOPS_MCP_REQUIRE_DOMAIN is set, so "
+                "every call must name its domain rather than inheriting one "
+                "from the file or falling back to "
+                f"'{DEFAULT_DOMAIN}'. Configured domains: "
+                f"{self._domain_names()}."
+            )
+
+        if not requested and isinstance(meta, dict):
+            recorded = meta.get("domain")
+            if isinstance(recorded, str) and recorded.strip():
+                requested = recorded.strip()
+                source = "the file's _meta_unencrypted block"
+
+        if not requested:
+            requested = DEFAULT_DOMAIN
+            source = "the default fallback"
+
+        domain = self.domains.get(requested)
+        if domain is None:
+            raise ValueError(
+                f"Unknown domain '{requested}' (from {source}). "
+                f"Configured domains: {self._domain_names()}."
+            )
+        return domain
+
+    @staticmethod
+    def _reject_unsupported_key_features(content: str) -> None:
+        """Refuse a file whose access rules this server cannot reproduce.
+
+        It re-encrypts with a flat age recipient list, so a PGP or KMS
+        holder would be dropped and an n-of-m Shamir threshold would be
+        flattened into a list any single holder could open. Both are silent
+        downgrades — the same failure the recipient check exists to
+        prevent. Use the sops CLI for those files.
+        """
+        features = unsupported_key_features(content)
+        if features:
+            raise ValueError(
+                f"File uses sops features this server cannot reproduce: "
+                f"{', '.join(features)}. It re-encrypts to a flat age "
+                "recipient list, which would drop other master keys or "
+                "collapse a Shamir threshold, silently weakening the file. "
+                "Manage it with the sops CLI instead."
+            )
+
+    def _check_recipients(self, content: str, domain: Domain) -> None:
+        """Refuse to re-encrypt a file onto a different recipient set.
+
+        Counts rather than lists the recipients: a wrong domain name should
+        not turn this into a way to enumerate another domain's keys.
+        """
+        self._reject_unsupported_key_features(content)
+        actual = set(recipients_of(content))
+        expected = set(domain.recipients)
+        if actual != expected:
+            raise ValueError(
+                f"File is encrypted to {len(actual)} recipient(s) that do "
+                f"not match domain '{domain.name}' ({len(expected)} "
+                "configured). Refusing to re-encrypt because that would "
+                "change who can read the file. Run sops_rekey to move the "
+                "file onto the domain's current recipient list."
+            )
+
+    @staticmethod
+    def _meta_block(meta_secrets: dict, domain: Domain, version: Any = 1) -> dict:
+        """Assemble the _meta_unencrypted block, stamped with its domain."""
+        return {
+            "version": version,
+            "domain": domain.name,
+            "secrets": meta_secrets,
+        }
 
     def _setup_handlers(self) -> None:
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
-            return [
+            tools = [
                 Tool(
                     name="sops_create_secrets",
                     description=(
@@ -342,7 +467,7 @@ class SopsMcpServer:
                     description=(
                         "Re-generate 'generated' secrets with new random values "
                         "while preserving 'external' secrets. Requires "
-                        "SOPS_AGE_KEY env var for decryption."
+                        "a private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -365,7 +490,7 @@ class SopsMcpServer:
                         "re-encrypts — preserving all existing values and "
                         "metadata. Rejects keys that already exist in the "
                         "file. Supports generated, external, and derived "
-                        "sources. Requires SOPS_AGE_KEY env var."
+                        "sources. Requires a private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -391,8 +516,8 @@ class SopsMcpServer:
                         "Add _meta_unencrypted metadata to an existing "
                         "SOPS-encrypted file that lacks it. Decrypts the "
                         "file, adds metadata, and re-encrypts preserving "
-                        "original plaintext values. Requires SOPS_AGE_KEY "
-                        "env var for decryption."
+                        "original plaintext values. Requires a private key "
+                        "for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -446,7 +571,7 @@ class SopsMcpServer:
                         "value and the _meta_unencrypted entry. Rejects "
                         "deletion of keys that other derived secrets "
                         "depend on unless those dependents are also in "
-                        "the delete list. Requires SOPS_AGE_KEY env var."
+                        "the delete list. Requires a private key for the domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -474,7 +599,7 @@ class SopsMcpServer:
                         "file. Preserves the value, source type, and "
                         "metadata. Updates 'from' references in any "
                         "derived secrets that depend on the renamed "
-                        "key. Requires SOPS_AGE_KEY env var."
+                        "key. Requires a private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -512,7 +637,7 @@ class SopsMcpServer:
                         "key). Rejects attempts to update 'generated' "
                         "or 'derived' secrets — use sops_rotate_generated "
                         "for those. Recomputes any derived secrets that "
-                        "reference this key. Requires SOPS_AGE_KEY env var."
+                        "reference this key. Requires a private key for the domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -575,7 +700,65 @@ class SopsMcpServer:
                         "required": ["key_name"],
                     },
                 ),
+                Tool(
+                    name="sops_list_domains",
+                    description=(
+                        "List the key domains this server is configured "
+                        "with: their names, age recipients (public keys), "
+                        "how many private keys the server holds for each, "
+                        "and whether the domain can decrypt or only "
+                        "encrypt. Never returns private key material."
+                    ),
+                    inputSchema={"type": "object", "properties": {}},
+                ),
+                Tool(
+                    name="sops_rekey",
+                    description=(
+                        "Re-encrypt a SOPS file onto the current recipient "
+                        "list of the named domain, updating its recorded "
+                        "domain. This is the tool to run after a domain's "
+                        "recipients change, and the way to clear the "
+                        "'recipients do not match' refusal from the other "
+                        "mutation tools. It changes who can read the file, "
+                        "so 'domain' is required rather than inferred. "
+                        "Requires a private key for that domain."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "encrypted_content": {
+                                "type": "string",
+                                "description": (
+                                    "Contents of a secrets.enc.yaml file"
+                                ),
+                            },
+                            "domain": {
+                                "type": "string",
+                                "description": (
+                                    "Required. The domain whose current "
+                                    "recipient list the file is re-encrypted "
+                                    "to. This changes who can read the file, "
+                                    "so it is never inferred from the file "
+                                    "or defaulted. Call sops_list_domains to "
+                                    "see the options."
+                                ),
+                            },
+                        },
+                        "required": ["encrypted_content", "domain"],
+                    },
+                ),
             ]
+
+            # Every tool but the domain listing takes an optional domain.
+            # Injecting it here rather than repeating it in nine schemas
+            # means a tool added later cannot silently miss it.
+            for tool in tools:
+                if tool.name == "sops_list_domains":
+                    continue
+                properties = tool.inputSchema.setdefault("properties", {})
+                properties.setdefault("domain", dict(DOMAIN_SCHEMA_PROPERTY))
+
+            return tools
 
         @self.server.call_tool()
         async def call_tool(
@@ -600,6 +783,10 @@ class SopsMcpServer:
                     return await self._update_external(arguments)
                 elif name == "sops_create_oidc_secret":
                     return await self._create_oidc_secret(arguments)
+                elif name == "sops_list_domains":
+                    return await self._list_domains(arguments)
+                elif name == "sops_rekey":
+                    return await self._rekey(arguments)
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
             except (ValueError, SopsError) as e:
@@ -624,7 +811,9 @@ class SopsMcpServer:
         if not secrets_list:
             raise ValueError("No secrets provided")
 
-        now = datetime.now(timezone.utc).isoformat()
+        domain = self._resolve_domain(arguments)
+
+        now = datetime.now(UTC).isoformat()
         resolved, meta_secrets, summary, derived_plaintexts = _process_batch(
             secrets_list,
             existing_values={},
@@ -633,9 +822,9 @@ class SopsMcpServer:
         )
 
         data: dict[str, Any] = {k: v for k, v in resolved.items()}
-        data["_meta_unencrypted"] = {"version": 1, "secrets": meta_secrets}
+        data["_meta_unencrypted"] = self._meta_block(meta_secrets, domain)
 
-        encrypted_yaml = self.encryptor.encrypt(data)
+        encrypted_yaml = self.encryptor.encrypt(data, domain)
 
         summary_lines = ["Created secrets:"] + summary
         responses = [
@@ -687,7 +876,246 @@ class SopsMcpServer:
         if not secret_keys:
             lines.append("  (no secret keys found)")
 
+        requested = str(arguments.get("domain") or "").strip()
+        if requested:
+            # Validate it so an unknown name is an error rather than a
+            # confusing report about some other domain.
+            self._resolve_domain(arguments)
+        lines.extend(self._domain_report(content, meta, requested or None))
+
         return [TextContent(type="text", text="\n".join(lines))]
+
+    def _domain_report(
+        self, content: str, meta: Any, requested: str | None = None
+    ) -> list[str]:
+        """Describe a file's domain binding for sops_list_secrets.
+
+        Surfaces a recipient mismatch here so it can be seen before a
+        mutation refuses, and never needs a private key to do it.
+
+        ``requested`` is the caller's explicit ``domain`` argument. When
+        given it is what the file is compared against, so the answer is
+        about the domain that was asked about rather than the one the file
+        happens to name.
+        """
+        recorded = None
+        if isinstance(meta, dict) and isinstance(meta.get("domain"), str):
+            recorded = meta["domain"].strip() or None
+
+        try:
+            actual = recipients_of(content)
+            unsupported = unsupported_key_features(content)
+        except SopsError:
+            return ["", "Domain: (file has no readable sops metadata block)"]
+
+        lines = ["", f"Recipients: {len(actual)}"]
+        if unsupported:
+            lines.append(
+                f"  WARNING: this file uses {', '.join(unsupported)}, which "
+                "this server cannot reproduce. Mutations will be refused; "
+                "use the sops CLI."
+            )
+            if not actual:
+                lines.append(
+                    "  (its recipients are not a flat age list, so the "
+                    "count above is not meaningful)"
+                )
+
+        if recorded is None:
+            lines.append(
+                "Domain: not recorded (pre-domains file; treated as "
+                f"'{DEFAULT_DOMAIN}')"
+            )
+        else:
+            lines.append(f"Domain: {recorded}")
+
+        if requested:
+            name = requested
+            lines.append(f"Compared against the requested domain: {name}")
+        else:
+            name = recorded or DEFAULT_DOMAIN
+
+        domain = self.domains.get(name)
+        if unsupported:
+            # Said already, above. Adding a recipient mismatch here would
+            # only send the reader to sops_rekey, which refuses this file.
+            return lines
+        if domain is None:
+            lines.append(
+                f"  WARNING: domain '{name}' is not configured on this "
+                f"server. Configured: {self._domain_names()}."
+            )
+        elif set(domain.recipients) != set(actual):
+            lines.append(
+                f"  WARNING: the file's recipients do not match domain "
+                f"'{name}' ({len(domain.recipients)} configured). Mutations "
+                "will be refused; run sops_rekey to reconcile."
+            )
+        else:
+            lines.append("  Recipients match the configured domain.")
+        return lines
+
+    async def _list_domains(
+        self, arguments: dict[str, Any]
+    ) -> Sequence[TextContent]:
+        """List configured domains. Public keys only — never key material."""
+        lines = ["Configured domains:"]
+        for name in sorted(self.domains):
+            # public_summary is the single place that decides what is safe
+            # to put in a response; render from it rather than reaching
+            # into the Domain and risking a field it deliberately omits.
+            summary = self.domains[name].public_summary()
+            role = (
+                "encrypt-only" if summary["encrypt_only"] else "encrypt+decrypt"
+            )
+            lines.append("")
+            lines.append(f"{summary['name']}  ({role})")
+            lines.append(f"  private keys held: {summary['key_count']}")
+            lines.append(f"  recipients ({summary['recipient_count']}):")
+            for recipient in summary["recipients"]:
+                lines.append(f"    - {recipient}")
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _rekey(
+        self, arguments: dict[str, Any]
+    ) -> Sequence[TextContent]:
+        """Re-encrypt a file onto its domain's current recipient list.
+
+        The one tool exempt from the recipient check, because changing the
+        recipient set is its purpose. It still cannot move a file between
+        domains: the keys offered to sops are the target domain's own, so a
+        file this domain cannot read is a file this tool cannot rekey.
+        """
+        content = arguments.get("encrypted_content", "")
+        if not content:
+            raise ValueError("No encrypted content provided")
+
+        if not str(arguments.get("domain") or "").strip():
+            raise ValueError(
+                "sops_rekey requires an explicit 'domain' — it changes who "
+                "can read the file, so the target must be named rather than "
+                f"inferred. Configured domains: {self._domain_names()}."
+            )
+
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("Content is not valid YAML")
+
+        domain = self._resolve_domain(arguments)
+        # Rekey is exempt from the recipient check — changing the recipient
+        # set is its purpose — but not from this one: it cannot reproduce a
+        # non-age master key or a Shamir threshold any more than the other
+        # tools can.
+        self._reject_unsupported_key_features(content)
+
+        had_meta = "_meta_unencrypted" in parsed
+        meta_block = parsed.get("_meta_unencrypted")
+        recorded = None
+        if isinstance(meta_block, dict) and isinstance(
+            meta_block.get("domain"), str
+        ):
+            recorded = meta_block["domain"].strip() or None
+
+        before = set(recipients_of(content))
+
+        # Rekey re-encrypts a file onto its own domain's current recipient
+        # list. It is not a way to move a file into a different domain:
+        # that reads with one key set and writes to another, which is the
+        # one operation this design deliberately makes hard. Two domains
+        # sharing a private key would otherwise let it happen quietly.
+        if recorded is not None and recorded != domain.name:
+            raise ValueError(
+                f"File belongs to domain '{recorded}', not '{domain.name}'. "
+                "sops_rekey re-encrypts a file onto its own domain's "
+                "current recipient list; it does not move files between "
+                "domains. To move it deliberately, decrypt with the sops "
+                "CLI and create it afresh in the target domain."
+            )
+
+        # A file with no recorded domain still belongs somewhere, and the
+        # guard above is dead for every file an older version has
+        # round-tripped — which the mixed-version notes call routine. Fall
+        # back to what the recipients say, but only where it matters and
+        # only where it is unambiguous:
+        #
+        #   * the rekey would revoke a reader the file currently has, and
+        #   * some other domain's recipients are exactly the file's.
+        #
+        # Widening never revokes anyone, so it stays allowed even when
+        # another domain happens to share the file's current list. And a
+        # rotation-era file, whose old recipient matches no configured
+        # domain, still rekeys onto the new list.
+        revokes = not before <= set(domain.recipients)
+        if recorded is None and revokes:
+            owner = next(
+                (
+                    other.name
+                    for other in self.domains.values()
+                    if other.name != domain.name
+                    and set(other.recipients) == before
+                ),
+                None,
+            )
+            if owner is not None:
+                raise ValueError(
+                    f"File records no domain, but its recipients are exactly "
+                    f"those of domain '{owner}', and rekeying to "
+                    f"'{domain.name}' would revoke access for "
+                    f"{len(before - set(domain.recipients))} of them. "
+                    f"Pass domain '{owner}' to re-apply its current "
+                    "recipient list, or use the sops CLI to move the file "
+                    "deliberately."
+                )
+        meta = parsed.get("_meta_unencrypted", {})
+        meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
+
+        decrypted = self.encryptor.decrypt(content, domain)
+
+        new_data: dict[str, Any] = {
+            key: value
+            for key, value in decrypted.items()
+            if not key.startswith("_")
+        }
+        # A legacy file has no metadata block, and stamping an empty one on
+        # would lock out sops_add_metadata (which refuses a file that
+        # already has a block) while sops_rotate_generated still refuses a
+        # block with no secrets. Leave it legacy so the retrofit path stays
+        # open; the recipient check, not the recorded name, is what guards
+        # the next mutation.
+        if had_meta:
+            new_data["_meta_unencrypted"] = self._meta_block(
+                meta_secrets,
+                domain,
+                meta.get("version", 1) if isinstance(meta, dict) else 1,
+            )
+
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+
+        after = set(domain.recipients)
+        added = len(after - before)
+        removed = len(before - after)
+        summary = [
+            f"Rekeyed onto domain '{domain.name}'.",
+            (
+                f"Recipients: {len(before)} -> {len(after)} "
+                f"({added} added, {removed} removed)."
+            ),
+        ]
+        if removed:
+            summary.append(
+                f"{removed} recipient(s) can no longer read this file once "
+                "you write it back."
+            )
+        if not had_meta:
+            summary.append(
+                "This file has no _meta_unencrypted block, so the domain "
+                "was not recorded in it. Run sops_add_metadata to retrofit "
+                "one, or pass 'domain' explicitly on later calls."
+            )
+        return [
+            TextContent(type="text", text=encrypted_yaml),
+            TextContent(type="text", text="\n".join(summary)),
+        ]
 
     async def _rotate_generated(
         self, arguments: dict[str, Any]
@@ -709,9 +1137,12 @@ class SopsMcpServer:
                 "Cannot determine which secrets to rotate."
             )
 
-        decrypted = self.encryptor.decrypt(content)
+        domain = self._resolve_domain(arguments, meta)
+        self._check_recipients(content, domain)
 
-        now = datetime.now(timezone.utc).isoformat()
+        decrypted = self.encryptor.decrypt(content, domain)
+
+        now = datetime.now(UTC).isoformat()
         new_data: dict[str, Any] = {}
         rotated: list[str] = []
         recomputed: list[str] = []
@@ -772,12 +1203,11 @@ class SopsMcpServer:
                 new_data[key] = decrypted[key]
                 preserved.append(key)
 
-        new_data["_meta_unencrypted"] = {
-            "version": meta.get("version", 1),
-            "secrets": meta_secrets,
-        }
+        new_data["_meta_unencrypted"] = self._meta_block(
+            meta_secrets, domain, meta.get("version", 1)
+        )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data)
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
         summary_lines = ["Rotation complete:"]
         if rotated:
@@ -835,14 +1265,17 @@ class SopsMcpServer:
                 "existing secrets."
             )
 
-        decrypted = self.encryptor.decrypt(content)
+        domain = self._resolve_domain(arguments, meta)
+        self._check_recipients(content, domain)
+
+        decrypted = self.encryptor.decrypt(content, domain)
 
         existing_values = {
             k: v for k, v in decrypted.items() if not k.startswith("_")
         }
         preserved = list(existing_values.keys())
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         resolved, merged_meta, summary, derived_plaintexts = _process_batch(
             secrets_list,
             existing_values=existing_values,
@@ -851,12 +1284,13 @@ class SopsMcpServer:
         )
 
         new_data: dict[str, Any] = {k: v for k, v in resolved.items()}
-        new_data["_meta_unencrypted"] = {
-            "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
-            "secrets": merged_meta,
-        }
+        new_data["_meta_unencrypted"] = self._meta_block(
+            merged_meta,
+            domain,
+            meta.get("version", 1) if isinstance(meta, dict) else 1,
+        )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data)
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
         summary_lines = ["Secrets added:"] + summary
         if preserved:
@@ -957,9 +1391,15 @@ class SopsMcpServer:
                         f"{from_key!r} is not in the file"
                     )
 
-        decrypted = self.encryptor.decrypt(content)
+        # A legacy file has no _meta_unencrypted block to read a domain
+        # hint from — that is the whole point of this tool — so the domain
+        # comes from the argument or the default.
+        domain = self._resolve_domain(arguments)
+        self._check_recipients(content, domain)
 
-        now = datetime.now(timezone.utc).isoformat()
+        decrypted = self.encryptor.decrypt(content, domain)
+
+        now = datetime.now(UTC).isoformat()
         meta_secrets = {}
         for key_name, meta in secret_metadata.items():
             source = meta["source"]
@@ -986,12 +1426,9 @@ class SopsMcpServer:
                 continue
             new_data[key] = decrypted[key]
 
-        new_data["_meta_unencrypted"] = {
-            "version": 1,
-            "secrets": meta_secrets,
-        }
+        new_data["_meta_unencrypted"] = self._meta_block(meta_secrets, domain)
 
-        encrypted_yaml = self.encryptor.encrypt(new_data)
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
         summary_lines = ["Added metadata:"]
         for key_name, entry in meta_secrets.items():
@@ -1032,7 +1469,12 @@ class SopsMcpServer:
             base_spec["description"] = description
             hash_spec["description"] = f"{description} (Authelia hash)"
 
-        return await self._create_secrets({"secrets": [base_spec, hash_spec]})
+        return await self._create_secrets(
+            {
+                "secrets": [base_spec, hash_spec],
+                "domain": arguments.get("domain"),
+            }
+        )
 
     async def _delete_secrets(
         self, arguments: dict[str, Any]
@@ -1073,7 +1515,10 @@ class SopsMcpServer:
                     "first."
                 )
 
-        decrypted = self.encryptor.decrypt(content)
+        domain = self._resolve_domain(arguments, meta)
+        self._check_recipients(content, domain)
+
+        decrypted = self.encryptor.decrypt(content, domain)
 
         new_data: dict[str, Any] = {}
         for key, value in decrypted.items():
@@ -1086,12 +1531,13 @@ class SopsMcpServer:
         new_meta = {
             k: v for k, v in meta_secrets.items() if k not in to_delete
         }
-        new_data["_meta_unencrypted"] = {
-            "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
-            "secrets": new_meta,
-        }
+        new_data["_meta_unencrypted"] = self._meta_block(
+            new_meta,
+            domain,
+            meta.get("version", 1) if isinstance(meta, dict) else 1,
+        )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data)
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
         summary = f"Deleted: {', '.join(sorted(to_delete))}"
         return [
@@ -1131,7 +1577,10 @@ class SopsMcpServer:
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
 
-        decrypted = self.encryptor.decrypt(content)
+        domain = self._resolve_domain(arguments, meta)
+        self._check_recipients(content, domain)
+
+        decrypted = self.encryptor.decrypt(content, domain)
 
         new_data: dict[str, Any] = {}
         for key, value in decrypted.items():
@@ -1158,12 +1607,13 @@ class SopsMcpServer:
             else:
                 new_meta[target_key] = entry
 
-        new_data["_meta_unencrypted"] = {
-            "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
-            "secrets": new_meta,
-        }
+        new_data["_meta_unencrypted"] = self._meta_block(
+            new_meta,
+            domain,
+            meta.get("version", 1) if isinstance(meta, dict) else 1,
+        )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data)
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
         summary_lines = [f"Renamed {old_name} -> {new_name}"]
         if dependents_updated:
@@ -1213,9 +1663,12 @@ class SopsMcpServer:
                 "or derived secrets."
             )
 
-        decrypted = self.encryptor.decrypt(content)
+        domain = self._resolve_domain(arguments, meta)
+        self._check_recipients(content, domain)
 
-        now = datetime.now(timezone.utc).isoformat()
+        decrypted = self.encryptor.decrypt(content, domain)
+
+        now = datetime.now(UTC).isoformat()
         new_data: dict[str, Any] = {}
         for key, value in decrypted.items():
             if key.startswith("_"):
@@ -1251,12 +1704,13 @@ class SopsMcpServer:
                 recomputed.append(k)
                 derived_plaintexts.append(f"{k} = {new_data[k]}")
 
-        new_data["_meta_unencrypted"] = {
-            "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
-            "secrets": meta_secrets,
-        }
+        new_data["_meta_unencrypted"] = self._meta_block(
+            meta_secrets,
+            domain,
+            meta.get("version", 1) if isinstance(meta, dict) else 1,
+        )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data)
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
         summary_lines = [f"Updated external secret: {key_name}"]
         if recomputed:
@@ -1402,21 +1856,34 @@ class SopsMcpServer:
 
 
 def create_server() -> SopsMcpServer:
-    """Create a server from environment variables."""
-    age_public_key = (
-        os.environ.get("SOPS_MCP_AGE_PUBLIC_KEY")
-        or os.environ.get("SOPS_AGE_RECIPIENTS")
-    )
-    if not age_public_key:
-        raise RuntimeError(
-            "Age public key required. "
-            "Set SOPS_MCP_AGE_PUBLIC_KEY or SOPS_AGE_RECIPIENTS."
-        )
+    """Create a server from environment variables.
+
+    The v1 variables (SOPS_MCP_AGE_PUBLIC_KEY / SOPS_AGE_RECIPIENTS, plus
+    SOPS_AGE_KEY) become the 'default' domain, so an existing deployment
+    needs no configuration change. SOPS_MCP_DOMAINS_FILE adds named
+    domains alongside it.
+    """
+    try:
+        domains = load_domains()
+    except DomainConfigError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     sops_binary = os.environ.get("SOPS_MCP_SOPS_BINARY", "sops")
-    encryptor = SopsEncryptor(age_public_key, sops_binary)
+    encryptor = SopsEncryptor(sops_binary)
 
-    return SopsMcpServer(encryptor)
+    for name in sorted(domains):
+        domain = domains[name]
+        logger.info(
+            "domain %r: %d recipient(s), %d private key(s)%s",
+            name,
+            len(domain.recipients),
+            len(domain.keys),
+            " (encrypt-only)" if domain.encrypt_only else "",
+        )
+
+    return SopsMcpServer(
+        encryptor, domains, require_domain=require_explicit_domain()
+    )
 
 
 def main() -> None:

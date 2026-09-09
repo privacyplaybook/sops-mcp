@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sops-mcp"
-version = "0.10.1"
+version = "0.11.0"
 description = "MCP server for creating and managing SOPS-encrypted secrets"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,6 +34,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
+    "cryptography>=42.0",
     "mcp>=1.23.0,<2.0.0",
     "python-multipart>=0.0.26",
     "pyyaml>=6.0",
@@ -49,7 +50,7 @@ Changelog = "https://github.com/privacyplaybook/sops-mcp/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
+    "ruff==0.16.6",
 ]
 
 [project.scripts]
@@ -65,3 +66,12 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+
+[tool.ruff.lint]
+ignore = [
+    # The call_tool dispatcher catches (ValueError, SopsError) and returns
+    # the message to the client; anything else becomes a generic "Internal
+    # error". Raising TypeError for a malformed client payload would hide
+    # the reason from the caller, so ValueError is deliberate here.
+    "TRY004",
+]

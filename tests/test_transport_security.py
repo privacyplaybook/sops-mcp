@@ -11,8 +11,8 @@ import asyncio
 import pytest
 from starlette.testclient import TestClient
 
-from sops_mcp.server import SopsMcpServer, main
-from sops_mcp.sops import SopsEncryptor
+from sops_mcp.server import main
+from tests.helpers import DUMMY_RECIPIENT, make_server
 
 
 def test_main_refuses_0000_bind_without_api_token(monkeypatch):
@@ -21,7 +21,7 @@ def test_main_refuses_0000_bind_without_api_token(monkeypatch):
     """
     monkeypatch.setenv("SOPS_MCP_TRANSPORT", "sse")
     monkeypatch.setenv("SOPS_MCP_HOST", "0.0.0.0")
-    monkeypatch.setenv("SOPS_MCP_AGE_PUBLIC_KEY", "age1dummy")
+    monkeypatch.setenv("SOPS_MCP_AGE_PUBLIC_KEY", DUMMY_RECIPIENT)
     monkeypatch.delenv("SOPS_MCP_API_TOKEN", raising=False)
 
     # If the refusal check is ever removed, main() would reach asyncio.run
@@ -45,7 +45,7 @@ def test_sse_endpoint_rejects_bogus_host_header():
     on the allowlist. Without this, a malicious webpage could use DNS
     rebinding to send requests to a local MCP server on the user's behalf.
     """
-    srv = SopsMcpServer(SopsEncryptor("age1dummy"))
+    srv = make_server()
     app = srv._build_sse_app()  # default: loopback-only allowlist
 
     with TestClient(app) as client:
@@ -60,7 +60,7 @@ def test_sse_endpoint_honors_explicit_allowed_hosts():
     hosts outside the custom list still rejected — while /health remains
     outside the SSE security middleware entirely.
     """
-    srv = SopsMcpServer(SopsEncryptor("age1dummy"))
+    srv = make_server()
     app = srv._build_sse_app(allowed_hosts=["mcp.example.com"])
 
     with TestClient(app) as client:
