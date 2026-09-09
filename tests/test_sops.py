@@ -30,7 +30,8 @@ def test_tempdir_prefers_shm_when_available(monkeypatch):
 
     real_mkdtemp = _tempfile.mkdtemp
 
-    def fake_mkdtemp(prefix=None, dir=None):
+    # 'dir' shadows a builtin but must match tempfile.mkdtemp's signature.
+    def fake_mkdtemp(prefix=None, dir=None):  # noqa: A002
         captured["dir"] = dir
         return real_mkdtemp(prefix=prefix, dir=dir)
 
@@ -47,7 +48,11 @@ def test_tempdir_prefers_shm_when_available(monkeypatch):
 def test_tempdir_falls_back_when_shm_missing(monkeypatch):
     """On platforms without /dev/shm (e.g. macOS, hardened containers),
     the helper must transparently fall back to the default temp dir."""
-    monkeypatch.setattr(os.path, "isdir", lambda p: False if p == "/dev/shm" else os.path.isdir(p))
+    monkeypatch.setattr(
+        os.path,
+        "isdir",
+        lambda p: False if p == "/dev/shm" else os.path.isdir(p),
+    )
 
     d = _make_secure_tempdir()
     try:

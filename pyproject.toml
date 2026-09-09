@@ -69,10 +69,76 @@ line-length = 88
 target-version = "py311"
 
 [tool.ruff.lint]
+select = [
+    "A",      # shadowed builtins
+    "ASYNC",  # async correctness
+    "B",      # bugbear: real bugs, not style
+    "C4",     # comprehensions
+    "DTZ",    # naive datetimes — metadata timestamps must stay tz-aware
+    "E",      # pycodestyle errors
+    "ERA",    # commented-out code
+    "F",      # pyflakes
+    "FLY",    # static join -> f-string
+    "FURB",   # modernisation
+    "G",      # logging call shape
+    "I",      # import sorting
+    "INP",    # implicit namespace packages
+    "ISC",    # implicit string concatenation
+    "LOG",    # logging misuse
+    "N",      # naming
+    "PERF",   # obvious inefficiencies
+    "PGH",    # blanket noqa / type: ignore
+    "PIE",    # misc correctness
+    "PL",     # pylint subset
+    "PT",     # pytest style
+    "RET",    # return consistency
+    "RUF",    # ruff-specific
+    "S",      # bandit — this project handles key material
+    "SIM",    # simplification
+    "SLF",    # private member access
+    "T20",    # stray print/pprint: a print here could surface a secret
+    "TID",    # tidy imports
+    "TRY",    # exception handling
+    "UP",     # pyupgrade
+    "W",      # pycodestyle warnings
+]
 ignore = [
     # The call_tool dispatcher catches (ValueError, SopsError) and returns
     # the message to the client; anything else becomes a generic "Internal
     # error". Raising TypeError for a malformed client payload would hide
     # the reason from the caller, so ValueError is deliberate here.
     "TRY004",
+    # Error messages here are user-facing guidance ("run sops_rekey to...")
+    # and are deliberately written at the raise site rather than baked into
+    # exception subclasses.
+    "TRY003",
+    # Every subprocess call is a fixed argv list — never a shell string,
+    # never interpolated user input. That is the safe pattern this rule is
+    # steering towards, but it fires on all subprocess use regardless.
+    "S603",
+    # The sops binary is resolved from PATH on purpose, and is overridable
+    # via SOPS_MCP_SOPS_BINARY.
+    "S607",
+    # /dev/shm is a deliberate choice, and the opposite of the risk this
+    # rule describes: plaintext temp files live on tmpfs so they never
+    # reach persistent storage. The paths themselves come from mkdtemp
+    # into a 0700 directory, so they are neither predictable nor shared.
+    "S108",
+    # The tool handlers are linear validate-then-act procedures and the
+    # dispatcher is an if/elif over tool names. Both are long by shape
+    # rather than by tangle, and splitting them to satisfy a counter would
+    # cost more readability than it buys.
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S101",     # assert is the point of a test
+    "S105",     # test fixtures embed throwaway key material
+    "S106",
+    "SLF001",   # tests drive the server's private tool handlers directly
+    "PLR2004",  # magic values are fine in assertions
+    "PLC0415",  # local imports keep some tests self-contained
 ]

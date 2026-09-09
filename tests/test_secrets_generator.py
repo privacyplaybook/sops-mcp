@@ -29,7 +29,9 @@ def test_numeric_charset():
 
 
 def test_exclude_chars():
-    secret = generate_secret(length=100, charset="alphanumeric", exclude_chars="aeiouAEIOU")
+    secret = generate_secret(
+        length=100, charset="alphanumeric", exclude_chars="aeiouAEIOU"
+    )
     assert not any(c in "aeiouAEIOU" for c in secret)
 
 

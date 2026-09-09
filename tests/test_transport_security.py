@@ -20,7 +20,7 @@ def test_main_refuses_0000_bind_without_api_token(monkeypatch):
     fail closed at startup, not silently expose an unauthenticated interface.
     """
     monkeypatch.setenv("SOPS_MCP_TRANSPORT", "sse")
-    monkeypatch.setenv("SOPS_MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("SOPS_MCP_HOST", "0.0.0.0")  # noqa: S104 - the refusal
     monkeypatch.setenv("SOPS_MCP_AGE_PUBLIC_KEY", DUMMY_RECIPIENT)
     monkeypatch.delenv("SOPS_MCP_API_TOKEN", raising=False)
 

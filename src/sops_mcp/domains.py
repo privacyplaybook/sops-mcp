@@ -98,8 +98,8 @@ class Domain:
 def _split_keys(blob: str) -> list[str]:
     """Split an age keys blob into identities, dropping comments/blanks."""
     keys = []
-    for line in blob.splitlines():
-        line = line.strip()
+    for raw in blob.splitlines():
+        line = raw.strip()
         if not line or line.startswith("#"):
             continue
         keys.append(line)
@@ -191,7 +191,9 @@ def _require_private_mode(path: str, what: str) -> None:
         )
 
 
-def _validate_domain(name: str, recipients: tuple[str, ...], keys: tuple[str, ...]) -> Domain:
+def _validate_domain(
+    name: str, recipients: tuple[str, ...], keys: tuple[str, ...]
+) -> Domain:
     """Validate one domain's key material, returning the frozen Domain."""
     if not DOMAIN_NAME_RE.match(name):
         raise DomainConfigError(

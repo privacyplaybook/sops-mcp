@@ -544,7 +544,7 @@ def test_software_key_still_warned_when_domain_has_plugin_recipient(
 # --- require_explicit_domain ---------------------------------------------
 
 
-@pytest.mark.parametrize("value,expected", [
+@pytest.mark.parametrize(("value", "expected"), [
     ("1", True), ("true", True), ("TRUE", True), ("yes", True),
     ("0", False), ("", False), ("no", False),
 ])
