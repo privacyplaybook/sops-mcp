@@ -16,8 +16,8 @@ from sops_mcp.domains import Domain
 from sops_mcp.sops import (
     SopsEncryptor,
     SopsError,
-    non_age_key_groups,
     recipients_of,
+    unsupported_key_features,
 )
 
 
@@ -234,23 +234,45 @@ def test_unencrypted_metadata_is_covered_by_the_mac(encryptor, two_domains):
             encryptor.decrypt(tampered, alpha)
 
 
-def test_non_age_master_keys_are_reported(encryptor, two_domains):
-    """A file readable by a PGP or KMS key must be visible as such.
+def test_unsupported_key_features_are_reported(encryptor, two_domains):
+    """Anything this server cannot reproduce on re-encryption is flagged.
 
-    This server encrypts with --age alone, so re-encrypting such a file
-    would drop the other key holder silently — the same failure the
-    recipient check exists to prevent.
+    It encrypts with a flat age recipient list, so another master key
+    would be dropped and a Shamir threshold flattened — both silent
+    downgrades of the file's guarantee.
     """
     alpha, _ = two_domains
     blob = encryptor.encrypt(PAYLOAD, alpha)
-    assert non_age_key_groups(blob) == ()
+    assert unsupported_key_features(blob) == ()
 
     parsed = yaml.safe_load(blob)
     parsed["sops"]["pgp"] = [{"fp": "DEADBEEF", "enc": "..."}]
-    assert non_age_key_groups(yaml.dump(parsed)) == ("pgp",)
+    assert unsupported_key_features(yaml.dump(parsed)) == ("pgp",)
 
     parsed["sops"]["kms"] = [{"arn": "arn:aws:kms:...", "enc": "..."}]
-    assert set(non_age_key_groups(yaml.dump(parsed))) == {"pgp", "kms"}
+    assert set(unsupported_key_features(yaml.dump(parsed))) == {"pgp", "kms"}
+
+
+def test_shamir_key_groups_are_reported(encryptor, two_domains):
+    """Key groups hide the recipients, so the plain checks see nothing.
+
+    A key-group file lists no top-level `age` entries and leaves the other
+    master-key groups empty, so without this it reads as an ordinary file
+    with zero recipients.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    parsed = yaml.safe_load(blob)
+    del parsed["sops"]["age"]
+    parsed["sops"]["key_groups"] = [{"age": [{"recipient": "age1a", "enc": "x"}]}]
+    parsed["sops"]["shamir_threshold"] = 2
+    doctored = yaml.dump(parsed)
+
+    assert recipients_of(doctored) == ()
+    assert set(unsupported_key_features(doctored)) == {
+        "key_groups",
+        "shamir_threshold",
+    }
 
 
 def test_encrypt_subprocess_never_carries_a_private_key(encryptor, two_domains):

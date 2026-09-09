@@ -47,7 +47,20 @@ def env():
         "shared": Domain("shared", (pub_a, pub_b), (ident_a,)),
         "default": Domain("default", (pub_a,), (ident_a,)),
     }
-    return SopsMcpServer(SopsEncryptor(), domains)
+    server = SopsMcpServer(SopsEncryptor(), domains)
+    # Stash the spare keypair so tests can widen a domain in place, which
+    # is what a recipient rotation actually looks like: same domain name,
+    # a different recipient list.
+    server.test_pub_b = pub_b
+    return server
+
+
+def _widen(server, name):
+    """Add a second recipient to an existing domain, as a config edit would."""
+    old = server.domains[name]
+    server.domains[name] = Domain(
+        name, (*old.recipients, server.test_pub_b), old.keys
+    )
 
 
 SPEC = {"secrets": [{"key_name": "TOKEN", "source": "generated", "length": 16}]}
@@ -162,26 +175,36 @@ async def test_matching_recipients_allow_mutation(env):
 # --- sops_rekey -----------------------------------------------------------
 
 
-async def test_rekey_adds_a_recipient(env):
-    """The updatekeys workflow: widen a domain, then rekey the file."""
+async def test_rekey_applies_a_widened_recipient_list(env):
+    """The updatekeys workflow: the domain's recipients change, then rekey.
+
+    This is what a recipient rotation looks like — the same domain, a
+    different list — not a move between domains.
+    """
     blob = await _create(env, "alpha")
     assert len(yaml.safe_load(blob)["sops"]["age"]) == 1
 
-    # alpha's key also opens 'shared', which has both recipients.
-    result = await env._rekey({"encrypted_content": blob, "domain": "shared"})
-    rekeyed = result[0].text
-    parsed = yaml.safe_load(rekeyed)
+    _widen(env, "alpha")
+    result = await env._rekey({"encrypted_content": blob, "domain": "alpha"})
+    parsed = yaml.safe_load(result[0].text)
     assert len(parsed["sops"]["age"]) == 2
-    assert parsed["_meta_unencrypted"]["domain"] == "shared"
+    assert parsed["_meta_unencrypted"]["domain"] == "alpha"
     assert "1 added" in result[1].text
 
 
 async def test_rekey_clears_the_mutation_refusal(env):
     blob = await _create(env, "alpha")
-    rekeyed = (await env._rekey({"encrypted_content": blob, "domain": "shared"}))[0].text
-    rotated = await env._rotate_generated(
-        {"encrypted_content": rekeyed, "key_names": ["TOKEN"]}
-    )
+    _widen(env, "alpha")
+
+    with pytest.raises(ValueError, match="Refusing to re-encrypt"):
+        await env._rotate_generated(
+            {"encrypted_content": blob, "key_names": ["TOKEN"]}
+        )
+
+    rekeyed = (
+        await env._rekey({"encrypted_content": blob, "domain": "alpha"})
+    )[0].text
+    rotated = await env._rotate_generated({"encrypted_content": rekeyed})
     assert len(yaml.safe_load(rotated[0].text)["sops"]["age"]) == 2
 
 
@@ -197,8 +220,11 @@ async def test_rekey_preserves_secret_values_and_metadata(env):
     blob = created[0].text
     before = env.encryptor.decrypt(blob, env.domains["alpha"])
 
-    rekeyed = (await env._rekey({"encrypted_content": blob, "domain": "shared"}))[0].text
-    after = env.encryptor.decrypt(rekeyed, env.domains["shared"])
+    _widen(env, "alpha")
+    rekeyed = (
+        await env._rekey({"encrypted_content": blob, "domain": "alpha"})
+    )[0].text
+    after = env.encryptor.decrypt(rekeyed, env.domains["alpha"])
 
     assert after["TOKEN"] == before["TOKEN"]
     assert after["USER"] == "alice"
@@ -207,27 +233,45 @@ async def test_rekey_preserves_secret_values_and_metadata(env):
     assert meta["TOKEN"]["generation"]["length"] == 16
 
 
-async def test_rekey_cannot_move_a_file_between_domains(env):
-    """beta's keys are the only ones offered, so an alpha file stays shut."""
-    blob = await _create(env, "alpha")
-    from sops_mcp.sops import SopsError
+async def test_rekey_reports_removed_recipients(env):
+    """Narrowing a domain revokes a reader; say so plainly."""
+    blob = await _create(env, "shared")
+    env.domains["shared"] = Domain(
+        "shared",
+        env.domains["shared"].recipients[:1],
+        env.domains["shared"].keys,
+    )
+    result = await env._rekey({"encrypted_content": blob, "domain": "shared"})
+    assert len(yaml.safe_load(result[0].text)["sops"]["age"]) == 1
+    assert "1 removed" in result[1].text
+    assert "can no longer read" in result[1].text
 
-    with pytest.raises(SopsError, match="sops decrypt failed"):
+
+async def test_rekey_refuses_to_move_a_file_to_another_domain(env):
+    """Reading with one key set and writing to another stays hard."""
+    blob = await _create(env, "alpha")
+    with pytest.raises(ValueError, match="does not move files between"):
         await env._rekey({"encrypted_content": blob, "domain": "beta"})
+
+
+async def test_rekey_refuses_the_move_even_when_a_key_is_shared(env):
+    """The dangerous case: two domains holding the same private key.
+
+    'shared' and 'alpha' both hold alpha's identity, so decryption would
+    succeed and the second recipient would be dropped silently. Nothing
+    but the domain check stands in the way.
+    """
+    blob = await _create(env, "shared")
+    assert len(yaml.safe_load(blob)["sops"]["age"]) == 2
+
+    with pytest.raises(ValueError, match="belongs to domain 'shared'"):
+        await env._rekey({"encrypted_content": blob, "domain": "alpha"})
 
 
 async def test_rekey_requires_an_explicit_domain(env):
     blob = await _create(env, "alpha")
     with pytest.raises(ValueError, match="requires an explicit 'domain'"):
         await env._rekey({"encrypted_content": blob})
-
-
-async def test_rekey_reports_removed_recipients(env):
-    blob = await _create(env, "shared")
-    result = await env._rekey({"encrypted_content": blob, "domain": "alpha"})
-    assert len(yaml.safe_load(result[0].text)["sops"]["age"]) == 1
-    assert "1 removed" in result[1].text
-    assert "can no longer read" in result[1].text
 
 
 # --- sops_list_domains ----------------------------------------------------
@@ -382,21 +426,21 @@ async def test_mutations_refuse_a_file_with_a_pgp_master_key(env):
         (env._rename_secret, {"old_name": "TOKEN", "new_name": "TOKEN2"}),
     ]
     for handler, extra in calls:
-        with pytest.raises(ValueError, match="pgp master key"):
+        with pytest.raises(ValueError, match="cannot reproduce"):
             await handler({"encrypted_content": withpgp, **extra})
 
 
-async def test_rekey_also_refuses_a_non_age_master_key(env):
+async def test_rekey_also_refuses_unsupported_key_features(env):
     """Rekey skips the recipient check but not this one."""
     blob = await _create(env, "alpha")
-    with pytest.raises(ValueError, match="pgp master key"):
+    with pytest.raises(ValueError, match="cannot reproduce"):
         await env._rekey({"encrypted_content": _with_pgp(blob), "domain": "alpha"})
 
 
 async def test_listing_does_not_call_a_pgp_file_a_match(env):
     blob = await _create(env, "alpha")
     text = (await env._list_secrets({"encrypted_content": _with_pgp(blob)}))[0].text
-    assert "pgp master key" in text
+    assert "cannot reproduce" in text
     assert "Recipients match the configured domain." not in text
 
 
@@ -432,8 +476,9 @@ async def test_rekey_does_not_stamp_metadata_onto_a_legacy_file(env):
 
 async def test_rekey_still_stamps_a_file_that_had_metadata(env):
     blob = await _create(env, "alpha")
-    result = await env._rekey({"encrypted_content": blob, "domain": "shared"})
-    assert yaml.safe_load(result[0].text)["_meta_unencrypted"]["domain"] == "shared"
+    _widen(env, "alpha")
+    result = await env._rekey({"encrypted_content": blob, "domain": "alpha"})
+    assert yaml.safe_load(result[0].text)["_meta_unencrypted"]["domain"] == "alpha"
 
 
 async def test_rekey_domain_schema_does_not_contradict_itself(env):
@@ -455,3 +500,97 @@ async def test_rekey_domain_schema_does_not_contradict_itself(env):
     ]
     for tool in others:
         assert "Optional" in tool.inputSchema["properties"]["domain"]["description"]
+
+
+# --- Shamir key groups ----------------------------------------------------
+
+
+def _as_key_groups(blob):
+    """Rewrite a file's envelope into the shape sops uses for key groups."""
+    parsed = yaml.safe_load(blob)
+    age_entries = parsed["sops"].pop("age")
+    parsed["sops"]["key_groups"] = [{"age": [e]} for e in age_entries]
+    parsed["sops"]["shamir_threshold"] = 2
+    return yaml.dump(parsed)
+
+
+async def test_rekey_refuses_a_shamir_file(env):
+    """Flattening an n-of-m threshold is a silent downgrade.
+
+    Key groups hide the recipients from the plain checks — the file reads
+    as having none — so without an explicit refusal rekey would turn a
+    2-of-2 file into a list either holder alone could open.
+    """
+    blob = await _create(env, "shared")
+    shamir = _as_key_groups(blob)
+
+    with pytest.raises(ValueError, match="key_groups|shamir_threshold"):
+        await env._rekey({"encrypted_content": shamir, "domain": "shared"})
+
+
+async def test_mutations_refuse_a_shamir_file(env):
+    blob = await _create(env, "shared")
+    shamir = _as_key_groups(blob)
+    with pytest.raises(ValueError, match="cannot reproduce"):
+        await env._rotate_generated({"encrypted_content": shamir})
+
+
+async def test_listing_a_shamir_file_does_not_claim_zero_recipients(env):
+    blob = await _create(env, "shared")
+    text = (await env._list_secrets({"encrypted_content": _as_key_groups(blob)}))[0].text
+    assert "key_groups" in text
+    assert "not a flat age list" in text
+
+
+# --- sops_list_secrets honours an explicit domain -------------------------
+
+
+async def test_list_secrets_compares_against_the_requested_domain(env):
+    """Advertising a `domain` argument and ignoring it gives wrong advice.
+
+    A file encrypted to 'shared' with no recorded domain used to be
+    reported as mismatching 'default', telling the caller to rekey, even
+    when it asked about 'shared'.
+    """
+    blob = await _create(env, "shared")
+    legacy = env.encryptor.encrypt(
+        {"TOKEN": "v"}, env.domains["shared"]
+    )
+    del blob
+
+    asked = (await env._list_secrets(
+        {"encrypted_content": legacy, "domain": "shared"}
+    ))[0].text
+    assert "Compared against the requested domain: shared" in asked
+    assert "Recipients match the configured domain." in asked
+    assert "WARNING" not in asked
+
+    unasked = (await env._list_secrets({"encrypted_content": legacy}))[0].text
+    assert "WARNING" in unasked
+
+
+async def test_list_secrets_rejects_an_unknown_requested_domain(env):
+    blob = await _create(env, "alpha")
+    with pytest.raises(ValueError, match="Unknown domain 'ghost'"):
+        await env._list_secrets({"encrypted_content": blob, "domain": "ghost"})
+
+
+# --- SOPS_MCP_REQUIRE_DOMAIN ---------------------------------------------
+
+
+async def test_require_domain_ignores_the_recorded_hint(env):
+    """The flag means the caller names the domain, not the file.
+
+    A hint read out of client-supplied content is not the caller naming
+    it, so it must not satisfy the requirement.
+    """
+    blob = await _create(env, "alpha")
+    strict = SopsMcpServer(env.encryptor, env.domains, require_domain=True)
+
+    with pytest.raises(ValueError, match="every call must name its domain"):
+        await strict._rotate_generated({"encrypted_content": blob})
+
+    ok = await strict._rotate_generated(
+        {"encrypted_content": blob, "domain": "alpha"}
+    )
+    assert yaml.safe_load(ok[0].text)["_meta_unencrypted"]["domain"] == "alpha"

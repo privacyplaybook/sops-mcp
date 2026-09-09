@@ -53,6 +53,13 @@ def _make_secure_tempdir() -> str:
 # only, so a file carrying any of these would lose them on re-encryption.
 _NON_AGE_KEY_GROUPS = ("pgp", "kms", "gcp_kms", "azure_kv", "hc_vault")
 
+# Shamir key groups are a different shape entirely: recipients move into
+# `sops.key_groups` and the top-level `age` list is absent, so a file using
+# them reads as having no recipients at all. Re-encrypting one would
+# flatten an n-of-m threshold into a plain single-group file that any one
+# holder could open, which is a silent downgrade of the file's guarantee.
+_KEY_GROUP_FIELDS = ("key_groups", "shamir_threshold")
+
 
 def _envelope_of(encrypted_content: str) -> dict:
     """Return the `sops` metadata block, or raise if it isn't there."""
@@ -73,20 +80,26 @@ def _envelope_of(encrypted_content: str) -> dict:
     return envelope
 
 
-def non_age_key_groups(encrypted_content: str) -> tuple[str, ...]:
-    """Names of the non-age master-key groups a file actually carries.
+def unsupported_key_features(encrypted_content: str) -> tuple[str, ...]:
+    """Envelope features this server cannot reproduce when re-encrypting.
 
-    A normal age file lists these groups empty. A non-empty one means the
-    file is also readable by a PGP or KMS key, which this server cannot
-    reproduce: it always encrypts with --age alone, so re-encrypting would
-    drop that key holder silently. Callers refuse rather than do that.
+    It always encrypts with ``--age <recipients>`` and nothing else, so any
+    file whose access rules go beyond a flat age recipient list would come
+    back weaker than it went in: a PGP or KMS holder dropped, or an n-of-m
+    Shamir threshold flattened into a list any single holder can open.
+    Callers refuse such files rather than silently downgrade them.
+
+    A normal age file lists the other master-key groups empty and carries
+    no key-group fields, so this returns an empty tuple for it.
     """
     envelope = _envelope_of(encrypted_content)
-    return tuple(
+    found = [
         group
         for group in _NON_AGE_KEY_GROUPS
         if isinstance(envelope.get(group), list) and envelope[group]
-    )
+    ]
+    found.extend(field for field in _KEY_GROUP_FIELDS if envelope.get(field))
+    return tuple(found)
 
 
 def recipients_of(encrypted_content: str) -> tuple[str, ...]:

@@ -137,7 +137,7 @@ Add to your project's `.mcp.json`:
 | `SOPS_MCP_LOG_LEVEL` | No | Log level (default: `WARNING`) |
 | `SOPS_AGE_KEY` | Sometimes | Age private key for the `default` domain — required to mutate a file belonging to it. Named domains take their keys from the domains file instead. |
 | `SOPS_MCP_DOMAINS_FILE` | No | Path to a YAML file defining named [key domains](#key-domains). Use when one server needs more than one recipient set. |
-| `SOPS_MCP_REQUIRE_DOMAIN` | No | Set to `1` to make every tool call name its domain explicitly instead of falling back to `default`. |
+| `SOPS_MCP_REQUIRE_DOMAIN` | No | Set to `1` to require every tool call to name its domain. The file's recorded domain and the `default` fallback are both disabled. |
 | `SOPS_MCP_TRANSPORT` | No | `stdio` (default) or `sse` |
 | `SOPS_MCP_HOST` / `SOPS_MCP_PORT` | No | Bind host/port for SSE transport (default: `127.0.0.1:55090`). Binding to `0.0.0.0` requires `SOPS_MCP_API_TOKEN` — the server refuses to start otherwise. |
 | `SOPS_MCP_ALLOWED_HOSTS` | No | Comma-separated allowlist for the SSE `Host` header (DNS rebinding protection). Default: `127.0.0.1,127.0.0.1:*,localhost,localhost:*`. Set explicitly when binding to a non-loopback address — e.g. `mcp.example.com,mcp.example.com:*`. |
@@ -195,9 +195,11 @@ domains:
     # no keys: this domain can encrypt but never decrypt
 ```
 
-Any file holding private keys — the domains file itself, or a `key_file` — must be mode `0600` and owned by the user the server runs as. The server refuses to start otherwise.
+The domains file must not be writable by group or other, and must be owned by the user the server runs as or by root. That check applies whether or not it holds key material, because the file decides which recipients everything is encrypted to.
 
-Startup also checks that every private key belongs to a recipient in its own domain. A key that cannot open what its domain produces is a configuration mistake, and it is better to learn that at boot than at the first rotation.
+A file holding private keys — the domains file with inline `keys:`, or any `key_file` — must additionally not be world-readable. Group-readable is allowed with a warning, so a container secret mounted root-owned and readable by the runtime group works. In the published image the server runs as uid 65532, so a Docker or compose secret needs a `uid:`/`gid:`/`mode:` that lets that user read it; `mode: 0640` with a matching group is the usual answer.
+
+Startup checks that every private key parses, and warns about any whose public half is not in its domain's recipient list. That is a warning rather than an error because it is the normal state mid recipient-rotation: the old key still opens files encrypted before the change, and `sops_rekey` is how those get migrated.
 
 ### Which domain does a tool use?
 
@@ -214,11 +216,16 @@ Adding or removing a recipient is a two-step operation:
 
 Until a file is rekeyed, mutations on it are refused with a message pointing here. `sops_list_secrets` reports the mismatch too, and needs no private key to do it.
 
-`sops_rekey` cannot move a file between domains. The only keys offered to `sops` are the target domain's own, so a file that domain cannot read is a file it cannot rekey. Moving secrets between domains is deliberately manual: decrypt with the `sops` CLI, then `sops_create_secrets` into the new domain.
+`sops_rekey` will not move a file between domains. A file that records a domain can only be rekeyed onto that same domain's current recipient list; naming a different one is refused. This matters when two domains share a private key, where decryption would otherwise succeed and quietly drop the recipients the other domain does not have. Moving secrets between domains is deliberately manual: decrypt with the `sops` CLI, then `sops_create_secrets` into the new domain.
 
-### Files with non-age master keys
+### Files this server will not touch
 
-SOPS can encrypt one file to an age recipient *and* a PGP or KMS key. This server encrypts with age alone, so re-encrypting such a file would drop the other key holder without an error. Every mutation refuses these files, and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
+SOPS can protect a file in ways this server cannot reproduce, because it always re-encrypts to a flat age recipient list:
+
+- **Another master key alongside age** (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). Re-encrypting would drop that holder.
+- **Shamir key groups** (`key_groups` with a `shamir_threshold`). Re-encrypting would flatten an n-of-m threshold into a list any single holder could open.
+
+Both are silent downgrades, so every mutation refuses these files and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
 
 ### Running mixed versions
 

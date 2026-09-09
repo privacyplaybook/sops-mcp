@@ -200,10 +200,22 @@ def test_encrypt_only_default_domain(keypairs):
     assert domains[DEFAULT_DOMAIN].encrypt_only is True
 
 
-def test_key_not_matching_recipient_is_fatal(keypairs):
+def test_key_not_matching_recipient_warns_but_still_starts(keypairs, caplog):
+    """A rotation-era key must not stop the server from booting.
+
+    Mid recipient-rotation, SOPS_AGE_KEY holds the old identity as well as
+    the new one. That key still opens files encrypted before the change,
+    and sops_rekey is how they get migrated — refusing to start would
+    strand exactly that deployment.
+    """
     (ident_a, _), (_, pub_b) = keypairs
-    with pytest.raises(DomainConfigError, match="does not match any"):
-        load_domains({"SOPS_MCP_AGE_PUBLIC_KEY": pub_b, "SOPS_AGE_KEY": ident_a})
+    with caplog.at_level("WARNING"):
+        domains = load_domains(
+            {"SOPS_MCP_AGE_PUBLIC_KEY": pub_b, "SOPS_AGE_KEY": ident_a}
+        )
+    assert domains[DEFAULT_DOMAIN].keys == (ident_a,)
+    assert "matches none of its" in caplog.text
+    assert ident_a not in caplog.text
 
 
 def test_invalid_recipient_is_fatal():
@@ -285,7 +297,7 @@ def test_world_readable_key_file_is_fatal(keypairs, tmp_path):
             key_file: {keyfile}
         """,
     )
-    with pytest.raises(DomainConfigError, match="must not be readable by group"):
+    with pytest.raises(DomainConfigError, match="readable by any user"):
         load_domains({"SOPS_MCP_DOMAINS_FILE": path})
 
 
@@ -302,7 +314,92 @@ def test_world_readable_domains_file_with_inline_keys_is_fatal(keypairs, tmp_pat
         """,
         mode=0o644,
     )
-    with pytest.raises(DomainConfigError, match="must not be readable by group"):
+    with pytest.raises(DomainConfigError, match="readable by any user"):
+        load_domains({"SOPS_MCP_DOMAINS_FILE": path})
+
+
+def test_group_readable_key_file_warns_but_starts(keypairs, tmp_path, caplog):
+    """Container secret mounts routinely arrive group-readable.
+
+    Refusing them pushes operators back to putting the key in an
+    environment variable, which /proc and `docker inspect` both expose.
+    """
+    ident_a, pub_a = keypairs[0]
+    keyfile = tmp_path / "a.agekey"
+    keyfile.write_text(ident_a + "\n")
+    os.chmod(keyfile, 0o640)
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        domains:
+          homelab:
+            recipients: [{pub_a}]
+            key_file: {keyfile}
+        """,
+    )
+    with caplog.at_level("WARNING"):
+        domains = load_domains({"SOPS_MCP_DOMAINS_FILE": path})
+    assert domains["homelab"].keys == (ident_a,)
+    assert "group-readable" in caplog.text
+
+
+def test_root_owned_key_file_is_accepted(keypairs, tmp_path, monkeypatch):
+    """A Docker secret is typically root-owned, not owned by the runtime user."""
+    ident_a, pub_a = keypairs[0]
+    keyfile = tmp_path / "a.agekey"
+    keyfile.write_text(ident_a + "\n")
+    os.chmod(keyfile, 0o600)
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        domains:
+          homelab:
+            recipients: [{pub_a}]
+            key_file: {keyfile}
+        """,
+    )
+    real_stat = os.stat
+
+    def as_root(target, *args, **kwargs):
+        info = real_stat(target, *args, **kwargs)
+        if str(target) in {str(keyfile), path}:
+            return type(info)((
+                info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                0, info.st_gid, info.st_size,
+                info.st_atime, info.st_mtime, info.st_ctime,
+            ))
+        return info
+
+    monkeypatch.setattr(os, "stat", as_root)
+    assert load_domains({"SOPS_MCP_DOMAINS_FILE": path})["homelab"].keys
+
+
+def test_group_writable_domains_file_is_fatal_even_without_inline_keys(
+    keypairs, tmp_path
+):
+    """The domains file decides recipients, so its integrity matters alone.
+
+    Anyone who can rewrite it can add their own recipient and have the
+    server encrypt to it on the next restart.
+    """
+    ident_a, pub_a = keypairs[0]
+    keyfile = tmp_path / "a.agekey"
+    keyfile.write_text(ident_a + "\n")
+    os.chmod(keyfile, 0o600)
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        domains:
+          homelab:
+            recipients: [{pub_a}]
+            key_file: {keyfile}
+        """,
+        mode=0o662,
+    )
+    with pytest.raises(DomainConfigError, match="writable by group or other"):
         load_domains({"SOPS_MCP_DOMAINS_FILE": path})
 
 
@@ -423,7 +520,10 @@ def test_plugin_recipient_domain_needs_no_software_key(tmp_path):
     assert domains["hardware"].encrypt_only is True
 
 
-def test_software_key_still_checked_when_domain_has_plugin_recipient(keypairs, tmp_path):
+def test_software_key_still_warned_when_domain_has_plugin_recipient(
+    keypairs, tmp_path, caplog
+):
+    """The plugin recipient must not suppress the warning for a real key."""
     ident_a, _ = keypairs[0]
     _, pub_b = keypairs[1]
     path = _write(
@@ -436,8 +536,9 @@ def test_software_key_still_checked_when_domain_has_plugin_recipient(keypairs, t
             keys: [{ident_a}]
         """,
     )
-    with pytest.raises(DomainConfigError, match="does not match any"):
+    with caplog.at_level("WARNING"):
         load_domains({"SOPS_MCP_DOMAINS_FILE": path})
+    assert "matches none of its" in caplog.text
 
 
 # --- require_explicit_domain ---------------------------------------------

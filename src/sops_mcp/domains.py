@@ -13,6 +13,7 @@ traceback would print every identity the server holds.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ __all__ = [
     "DomainConfigError",
     "load_domains",
 ]
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DOMAIN = "default"
 DOMAIN_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
@@ -120,24 +123,71 @@ def _dedupe(items: list[str]) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _require_private_mode(path: str, what: str) -> None:
-    """Refuse to read key material from a world- or group-readable file."""
+def _stat_or_fail(path: str, what: str) -> os.stat_result:
+    try:
+        return os.stat(path)
+    except OSError as exc:
+        raise DomainConfigError(
+            f"cannot read {what} {path!r}: {exc.strerror}"
+        ) from exc
+
+
+def _require_trusted_writer(path: str, what: str) -> None:
+    """Refuse a file that someone other than the server or root can rewrite.
+
+    This is the integrity half, and it applies to the domains file whether
+    or not it holds key material: that file decides which recipients every
+    secret is encrypted to, so a group-writable one lets a local attacker
+    add their own recipient and have the server encrypt to it on the next
+    restart.
+    """
     if os.name != "posix":
         return
-    try:
-        info = os.stat(path)
-    except OSError as exc:
-        raise DomainConfigError(f"cannot read {what} {path!r}: {exc.strerror}") from exc
-    if info.st_mode & 0o077:
+    info = _stat_or_fail(path, what)
+
+    if info.st_mode & 0o022:
         raise DomainConfigError(
-            f"{what} {path!r} is mode {info.st_mode & 0o777:04o}; it holds "
-            "private key material and must not be readable by group or "
-            "other. Run: chmod 600 " + path
+            f"{what} {path!r} is mode {info.st_mode & 0o777:04o} and is "
+            "writable by group or other. It controls which recipients "
+            "secrets are encrypted to, so anyone who can rewrite it can "
+            f"redirect them. Run: chmod go-w {path}"
         )
-    if info.st_uid != os.geteuid():
+    if info.st_uid not in (os.geteuid(), 0):
         raise DomainConfigError(
-            f"{what} {path!r} is owned by uid {info.st_uid}, not the uid "
-            f"this server runs as ({os.geteuid()})."
+            f"{what} {path!r} is owned by uid {info.st_uid}, which is "
+            f"neither this server's uid ({os.geteuid()}) nor root. Its "
+            "owner could rewrite it at any time."
+        )
+
+
+def _require_private_mode(path: str, what: str) -> None:
+    """The rules for a file holding private keys.
+
+    Integrity first, then confidentiality: world-readable is fatal, and
+    group-readable earns a warning rather than a refusal. Container secret
+    mounts routinely arrive root-owned and group-readable to the runtime
+    user, and refusing those outright pushes operators back to putting the
+    key in an environment variable, which is worse — /proc and
+    `docker inspect` both expose it.
+    """
+    if os.name != "posix":
+        return
+    _require_trusted_writer(path, what)
+    info = _stat_or_fail(path, what)
+
+    if info.st_mode & 0o004:
+        raise DomainConfigError(
+            f"{what} {path!r} is mode {info.st_mode & 0o777:04o} and is "
+            "readable by any user on the host. It holds private key "
+            f"material. Run: chmod o-r {path}"
+        )
+    if info.st_mode & 0o040:
+        logger.warning(
+            "%s %r is group-readable (mode %04o); anyone in that group can "
+            "read the private key.",
+            what,
+            path,
+            info.st_mode & 0o777,
         )
 
 
@@ -174,16 +224,23 @@ def _validate_domain(name: str, recipients: tuple[str, ...], keys: tuple[str, ..
             raise DomainConfigError(
                 f"domain {name!r} private key #{index + 1} is invalid: {exc}"
             ) from exc
-        # A software identity always has a plain X25519 public half, so it
-        # must match one of the derivable recipients even when the domain
-        # also carries plugin recipients.
+        # A software identity always has a plain X25519 public half. One
+        # that matches no current recipient is usually a key being rotated
+        # out: it still opens files encrypted before the change, and
+        # sops_rekey is how those get migrated. Refusing to start would
+        # strand exactly the deployment that is mid-rotation, so warn and
+        # keep it.
         if derived not in derivable:
-            raise DomainConfigError(
-                f"domain {name!r} private key #{index + 1} does not match any "
-                f"of its {len(recipients)} recipient(s). Its public half is "
-                f"{derived}. A key that cannot decrypt what the domain "
-                "encrypts is a configuration mistake — add the matching "
-                "recipient, or move the key to the right domain."
+            logger.warning(
+                "domain %r holds a private key (#%d) that matches none of "
+                "its %d recipient(s); its public half is %s. It can still "
+                "decrypt files encrypted before a recipient change — use "
+                "sops_rekey to migrate them — but it cannot read anything "
+                "this domain encrypts from now on.",
+                name,
+                index + 1,
+                len(recipients),
+                derived,
             )
 
     return Domain(name=name, recipients=recipients, keys=keys)
@@ -225,6 +282,9 @@ def _domains_from_file(path: str) -> dict[str, Domain]:
     )
     if file_has_inline_keys:
         _require_private_mode(path, "domains file")
+    else:
+        # No key material in it, but it still decides the recipients.
+        _require_trusted_writer(path, "domains file")
 
     domains: dict[str, Domain] = {}
     for name, body in spec.items():

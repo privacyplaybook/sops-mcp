@@ -35,8 +35,8 @@ from .secrets_generator import CHARSETS, generate_secret
 from .sops import (
     SopsEncryptor,
     SopsError,
-    non_age_key_groups,
     recipients_of,
+    unsupported_key_features,
 )
 
 logger = logging.getLogger(__name__)
@@ -336,6 +336,18 @@ class SopsMcpServer:
         requested = str(arguments.get("domain") or "").strip()
         source = "the 'domain' argument"
 
+        # Checked before the file's hint, not after: the point of the flag
+        # is that the caller names the domain, and a hint read out of
+        # client-supplied content is not the caller naming it.
+        if not requested and self.require_domain:
+            raise ValueError(
+                "No domain given and SOPS_MCP_REQUIRE_DOMAIN is set, so "
+                "every call must name its domain rather than inheriting one "
+                "from the file or falling back to "
+                f"'{DEFAULT_DOMAIN}'. Configured domains: "
+                f"{self._domain_names()}."
+            )
+
         if not requested and isinstance(meta, dict):
             recorded = meta.get("domain")
             if isinstance(recorded, str) and recorded.strip():
@@ -343,12 +355,6 @@ class SopsMcpServer:
                 source = "the file's _meta_unencrypted block"
 
         if not requested:
-            if self.require_domain:
-                raise ValueError(
-                    "No domain given and SOPS_MCP_REQUIRE_DOMAIN is set. "
-                    "Pass 'domain' explicitly. Configured domains: "
-                    f"{self._domain_names()}."
-                )
             requested = DEFAULT_DOMAIN
             source = "the default fallback"
 
@@ -361,21 +367,23 @@ class SopsMcpServer:
         return domain
 
     @staticmethod
-    def _reject_non_age_keys(content: str) -> None:
-        """Refuse a file that other master-key types can also open.
+    def _reject_unsupported_key_features(content: str) -> None:
+        """Refuse a file whose access rules this server cannot reproduce.
 
-        This server encrypts with --age alone, so re-encrypting a file that
-        also carries a PGP or KMS key would drop that key holder with no
-        error — the same silent-revocation failure the recipient check
-        exists to prevent. Use the sops CLI for those files.
+        It re-encrypts with a flat age recipient list, so a PGP or KMS
+        holder would be dropped and an n-of-m Shamir threshold would be
+        flattened into a list any single holder could open. Both are silent
+        downgrades — the same failure the recipient check exists to
+        prevent. Use the sops CLI for those files.
         """
-        groups = non_age_key_groups(content)
-        if groups:
+        features = unsupported_key_features(content)
+        if features:
             raise ValueError(
-                f"File also has {', '.join(groups)} master key(s). This "
-                "server encrypts to age recipients only, so re-encrypting "
-                "would drop them and silently revoke access. Manage this "
-                "file with the sops CLI instead."
+                f"File uses sops features this server cannot reproduce: "
+                f"{', '.join(features)}. It re-encrypts to a flat age "
+                "recipient list, which would drop other master keys or "
+                "collapse a Shamir threshold, silently weakening the file. "
+                "Manage it with the sops CLI instead."
             )
 
     def _check_recipients(self, content: str, domain: Domain) -> None:
@@ -384,7 +392,7 @@ class SopsMcpServer:
         Counts rather than lists the recipients: a wrong domain name should
         not turn this into a way to enumerate another domain's keys.
         """
-        self._reject_non_age_keys(content)
+        self._reject_unsupported_key_features(content)
         actual = set(recipients_of(content))
         expected = set(domain.recipients)
         if actual != expected:
@@ -868,15 +876,27 @@ class SopsMcpServer:
         if not secret_keys:
             lines.append("  (no secret keys found)")
 
-        lines.extend(self._domain_report(content, meta))
+        requested = str(arguments.get("domain") or "").strip()
+        if requested:
+            # Validate it so an unknown name is an error rather than a
+            # confusing report about some other domain.
+            self._resolve_domain(arguments)
+        lines.extend(self._domain_report(content, meta, requested or None))
 
         return [TextContent(type="text", text="\n".join(lines))]
 
-    def _domain_report(self, content: str, meta: Any) -> list[str]:
+    def _domain_report(
+        self, content: str, meta: Any, requested: str | None = None
+    ) -> list[str]:
         """Describe a file's domain binding for sops_list_secrets.
 
         Surfaces a recipient mismatch here so it can be seen before a
         mutation refuses, and never needs a private key to do it.
+
+        ``requested`` is the caller's explicit ``domain`` argument. When
+        given it is what the file is compared against, so the answer is
+        about the domain that was asked about rather than the one the file
+        happens to name.
         """
         recorded = None
         if isinstance(meta, dict) and isinstance(meta.get("domain"), str):
@@ -884,26 +904,36 @@ class SopsMcpServer:
 
         try:
             actual = recipients_of(content)
-            other_groups = non_age_key_groups(content)
+            unsupported = unsupported_key_features(content)
         except SopsError:
             return ["", "Domain: (file has no readable sops metadata block)"]
 
         lines = ["", f"Recipients: {len(actual)}"]
-        if other_groups:
+        if unsupported:
             lines.append(
-                f"  WARNING: this file also has {', '.join(other_groups)} "
-                "master key(s). This server encrypts to age only and will "
-                "refuse to mutate it; use the sops CLI."
+                f"  WARNING: this file uses {', '.join(unsupported)}, which "
+                "this server cannot reproduce. Mutations will be refused; "
+                "use the sops CLI."
             )
+            if not actual:
+                lines.append(
+                    "  (its recipients are not a flat age list, so the "
+                    "count above is not meaningful)"
+                )
+
         if recorded is None:
             lines.append(
                 "Domain: not recorded (pre-domains file; treated as "
                 f"'{DEFAULT_DOMAIN}')"
             )
-            name = DEFAULT_DOMAIN
         else:
             lines.append(f"Domain: {recorded}")
-            name = recorded
+
+        if requested:
+            name = requested
+            lines.append(f"Compared against the requested domain: {name}")
+        else:
+            name = recorded or DEFAULT_DOMAIN
 
         domain = self.domains.get(name)
         if domain is None:
@@ -917,12 +947,12 @@ class SopsMcpServer:
                 f"'{name}' ({len(domain.recipients)} configured). Mutations "
                 "will be refused; run sops_rekey to reconcile."
             )
-        elif other_groups:
-            # Don't call this a match: the age recipients line up, but the
-            # file still cannot be mutated here.
+        elif unsupported:
+            # Don't call this a match: the age recipients may line up, but
+            # the file still cannot be mutated here.
             lines.append(
-                "  Age recipients match the configured domain, but the "
-                "non-age master key(s) above block any mutation."
+                "  The feature(s) above block any mutation regardless of "
+                "the recipient list."
             )
         else:
             lines.append("  Recipients match the configured domain.")
@@ -972,11 +1002,33 @@ class SopsMcpServer:
         domain = self._resolve_domain(arguments)
         # Rekey is exempt from the recipient check — changing the recipient
         # set is its purpose — but not from this one: it cannot reproduce a
-        # non-age master key any more than the other tools can.
-        self._reject_non_age_keys(content)
-        before = set(recipients_of(content))
+        # non-age master key or a Shamir threshold any more than the other
+        # tools can.
+        self._reject_unsupported_key_features(content)
 
         had_meta = "_meta_unencrypted" in parsed
+        meta_block = parsed.get("_meta_unencrypted")
+        recorded = None
+        if isinstance(meta_block, dict) and isinstance(
+            meta_block.get("domain"), str
+        ):
+            recorded = meta_block["domain"].strip() or None
+
+        # Rekey re-encrypts a file onto its own domain's current recipient
+        # list. It is not a way to move a file into a different domain:
+        # that reads with one key set and writes to another, which is the
+        # one operation this design deliberately makes hard. Two domains
+        # sharing a private key would otherwise let it happen quietly.
+        if recorded is not None and recorded != domain.name:
+            raise ValueError(
+                f"File belongs to domain '{recorded}', not '{domain.name}'. "
+                "sops_rekey re-encrypts a file onto its own domain's "
+                "current recipient list; it does not move files between "
+                "domains. To move it deliberately, decrypt with the sops "
+                "CLI and create it afresh in the target domain."
+            )
+
+        before = set(recipients_of(content))
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
 

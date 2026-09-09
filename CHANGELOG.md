@@ -57,6 +57,22 @@ v1 environment variables become a domain called `default`.
 
 ### Changed
 
+- **An unmatched private key no longer stops the server booting.** A key
+  whose public half is not in its domain's recipient list is the normal
+  state mid recipient-rotation, and it still opens files encrypted before
+  the change. It is now a warning, and `sops_rekey` migrates those files.
+- **`SOPS_MCP_REQUIRE_DOMAIN` now means what its name says.** It was
+  checked only after the file's recorded domain, so a call omitting
+  `domain` still succeeded whenever the client-supplied content named
+  one. The flag now requires the caller to name the domain.
+- **Key-file permission rules fit container secrets.** A file holding
+  private keys may be group-readable, with a warning, and may be owned by
+  root as well as by the server's user. World-readable and group-writable
+  remain fatal. The previous rules rejected the Docker secret path the
+  README documents.
+- **`sops_list_secrets` honours its `domain` argument.** It advertised one
+  and ignored it, reporting a mismatch against `default` for a file the
+  caller had asked about under another domain.
 - **Behaviour change.** A file whose recipients do not match the resolved
   domain is now refused rather than silently re-encrypted. This is the bug
   fix above; the only way to hit it is a configuration that was already
@@ -70,11 +86,23 @@ v1 environment variables become a domain called `default`.
 
 ### Security
 
-- **Files with a non-age master key are refused.** SOPS can encrypt to an
-  age recipient and a PGP or KMS key at once. This server encrypts with
-  age alone, so re-encrypting such a file would drop the other holder
-  silently — the same failure the recipient check exists to prevent.
-  Mutations refuse them and `sops_list_secrets` flags them.
+- **Files this server cannot faithfully re-encrypt are refused.** It
+  always re-encrypts to a flat age recipient list, so a file carrying
+  another master key (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`)
+  would come back with that holder dropped, and a Shamir file
+  (`key_groups` + `shamir_threshold`) would have its n-of-m threshold
+  flattened into a list any single holder could open. Both are silent
+  downgrades. Mutations refuse them and `sops_list_secrets` flags them.
+- **`sops_rekey` refuses to move a file between domains.** Two domains
+  sharing a private key would otherwise let a file be moved quietly,
+  dropping the recipients the target domain does not have — decryption
+  succeeds, so nothing else catches it.
+- **The domains file is integrity-checked even without inline keys.** It
+  decides which recipients everything is encrypted to, so a
+  group-writable one let a local attacker add their own recipient. The
+  server now refuses to start on a domains file writable by group or
+  other, or owned by a third party, regardless of whether it holds key
+  material.
 - **Private keys reach the sops subprocess only when decrypting.**
   Encryption takes its recipients from the command line, so an encrypt
   call no longer carries an identity in the child environment where

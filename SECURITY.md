@@ -27,18 +27,25 @@ don't intend to publish.
 ### Key material handling
 
 Private keys are supplied per operation rather than inherited from the
-process environment. Each `sops` invocation gets an environment carrying
-only the keys of the domain for that call, with every other age key
-variable stripped and `HOME` / `XDG_CONFIG_HOME` pointed at an empty
-directory so that `~/.config/sops/age/keys.txt` cannot widen a domain's
-reach. Key material is never logged, never included in an error message,
+process environment. A decrypt invocation gets an environment carrying
+only the keys of the domain for that call; an encrypt invocation carries
+none at all, since it takes its recipients from the command line. Every
+other age key variable is stripped, and `HOME` / `XDG_CONFIG_HOME` point
+at an empty directory so that `~/.config/sops/age/keys.txt` cannot widen
+a domain's reach. Key material is never logged, never included in an error message,
 and never returned across the MCP boundary — `sops_list_domains` reports
 public recipients and a count.
 
-A domains file, and any `key_file` it names, must be mode `0600` and owned
-by the server's user; the server refuses to start otherwise. On the Docker
-image, prefer a mounted secret over an environment variable: an env var is
-readable through `/proc/<pid>/environ` and `docker inspect`.
+The domains file is checked for integrity whether or not it holds key
+material, because it decides which recipients every secret is encrypted
+to: the server refuses to start if it is writable by group or other, or
+owned by anyone but the server's user or root. A file holding private
+keys — the domains file with inline `keys:`, or any `key_file` it names —
+must additionally not be world-readable; group-readable earns a warning
+rather than a refusal, because container secret mounts commonly arrive
+that way and refusing them pushes operators back to environment
+variables, which `/proc/<pid>/environ` and `docker inspect` both
+expose.
 
 ### Metadata authentication
 
@@ -49,8 +56,12 @@ tool, since all of them decrypt. It does *not* protect read-only paths:
 verification, so a tampered file can mislead a listing. Acting on it fails.
 Mutations additionally verify a file's real recipients against the named
 domain before trusting the recorded domain name, and refuse any file
-carrying a non-age master key (PGP, KMS, Vault) because this server
-encrypts with age alone and re-encryption would silently revoke it.
+whose access rules this server cannot reproduce. It re-encrypts to a flat
+age recipient list, so a file carrying another master key (`pgp`, `kms`,
+`gcp_kms`, `azure_kv`, `hc_vault`) would come back with that holder
+dropped, and a Shamir file (`key_groups`, `shamir_threshold`) would have
+its n-of-m threshold flattened into a list any single holder could open.
+Both are silent downgrades, so such files are refused outright.
 
 See the [Security section of the README](./README.md#security) for the
 full defence-in-depth list (no client filesystem access, public-key-only
@@ -60,9 +71,10 @@ input validation).
 ## Out of scope
 
 - Compromise of the host running the MCP server itself (e.g. root access,
-  process-memory inspection). The age private key is provided via the
-  `SOPS_AGE_KEY` environment variable on mutating operations; anyone with
-  read access to that env var can decrypt.
+  process-memory inspection). Private keys reach the server through
+  `SOPS_AGE_KEY` or a domains file, and are passed to `sops` in the child
+  environment when decrypting; anyone who can read that process's
+  environment or those files can decrypt.
 - `.sops.yaml` creation rules are not supported; the server has no view of
   the client filesystem. Multiple recipients and recipient rotation are
   handled by key domains and `sops_rekey` (see the README).
