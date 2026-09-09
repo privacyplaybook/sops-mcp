@@ -70,6 +70,15 @@ v1 environment variables become a domain called `default`.
 
 ### Security
 
+- **Files with a non-age master key are refused.** SOPS can encrypt to an
+  age recipient and a PGP or KMS key at once. This server encrypts with
+  age alone, so re-encrypting such a file would drop the other holder
+  silently — the same failure the recipient check exists to prevent.
+  Mutations refuse them and `sops_list_secrets` flags them.
+- **Private keys reach the sops subprocess only when decrypting.**
+  Encryption takes its recipients from the command line, so an encrypt
+  call no longer carries an identity in the child environment where
+  `/proc/<pid>/environ` would expose it.
 - Domains separate key sets, not callers. On the SSE transport one API
   token still reaches every domain the server holds; two mutually
   distrusting parties need separate processes. Documented in SECURITY.md.

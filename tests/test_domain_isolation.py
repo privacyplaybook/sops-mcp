@@ -10,9 +10,15 @@ import os
 import subprocess
 
 import pytest
+import yaml
 
 from sops_mcp.domains import Domain
-from sops_mcp.sops import SopsEncryptor, SopsError, recipients_of
+from sops_mcp.sops import (
+    SopsEncryptor,
+    SopsError,
+    non_age_key_groups,
+    recipients_of,
+)
 
 
 def _require(binary: str) -> None:
@@ -226,3 +232,46 @@ def test_unencrypted_metadata_is_covered_by_the_mac(encryptor, two_domains):
         assert tampered != blob
         with pytest.raises(SopsError, match="MAC mismatch"):
             encryptor.decrypt(tampered, alpha)
+
+
+def test_non_age_master_keys_are_reported(encryptor, two_domains):
+    """A file readable by a PGP or KMS key must be visible as such.
+
+    This server encrypts with --age alone, so re-encrypting such a file
+    would drop the other key holder silently — the same failure the
+    recipient check exists to prevent.
+    """
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+    assert non_age_key_groups(blob) == ()
+
+    parsed = yaml.safe_load(blob)
+    parsed["sops"]["pgp"] = [{"fp": "DEADBEEF", "enc": "..."}]
+    assert non_age_key_groups(yaml.dump(parsed)) == ("pgp",)
+
+    parsed["sops"]["kms"] = [{"arn": "arn:aws:kms:...", "enc": "..."}]
+    assert set(non_age_key_groups(yaml.dump(parsed))) == {"pgp", "kms"}
+
+
+def test_encrypt_subprocess_never_carries_a_private_key(encryptor, two_domains):
+    """Encryption needs recipients on the command line and nothing else.
+
+    Keeping identities out of that environment keeps them out of
+    /proc/<pid>/environ for the tools the README lists as needing no
+    private key.
+    """
+    alpha, _ = two_domains
+    assert "SOPS_AGE_KEY" not in encryptor._child_env(alpha, "/nonexistent", with_keys=False)
+    assert "SOPS_AGE_KEY" in encryptor._child_env(alpha, "/nonexistent", with_keys=True)
+
+
+def test_encrypt_only_advice_names_the_right_remedy(encryptor, two_domains):
+    """SOPS_AGE_KEY only ever feeds the implicit 'default' domain."""
+    alpha, _ = two_domains
+    blob = encryptor.encrypt(PAYLOAD, alpha)
+
+    with pytest.raises(SopsError, match="Set SOPS_AGE_KEY"):
+        encryptor.decrypt(blob, Domain("default", alpha.recipients))
+
+    with pytest.raises(SopsError, match="only configures the 'default' domain"):
+        encryptor.decrypt(blob, Domain("archive", alpha.recipients))

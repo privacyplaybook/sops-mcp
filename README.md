@@ -66,7 +66,7 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 | `sops_rename_secret` | Rename a key, preserving its value and metadata. Updates `from:` references in any derived secrets. |
 | `sops_delete_secrets` | Remove one or more keys. Rejects deleting a secret that another derived secret still references (unless the dependent is deleted in the same call). |
 | `sops_add_metadata` | Retrofit `_meta_unencrypted` onto a legacy SOPS file that lacks it. Supports `generated`, `external`, and `derived` entries. |
-| `sops_rekey` | Re-encrypt a file onto its domain's current recipient list. Run this after a domain's recipients change, or to clear a "recipients do not match" refusal. Requires an explicit `domain`. |
+| `sops_rekey` | Re-encrypt a file onto its domain's current recipient list. Run this after a domain's recipients change, or to clear a "recipients do not match" refusal. Requires an explicit `domain`. Leaves a legacy file without a metadata block untouched in that respect, so `sops_add_metadata` still works on it. |
 
 Every tool except `sops_list_domains` takes an optional `domain` argument. See [Key domains](#key-domains).
 
@@ -215,6 +215,10 @@ Adding or removing a recipient is a two-step operation:
 Until a file is rekeyed, mutations on it are refused with a message pointing here. `sops_list_secrets` reports the mismatch too, and needs no private key to do it.
 
 `sops_rekey` cannot move a file between domains. The only keys offered to `sops` are the target domain's own, so a file that domain cannot read is a file it cannot rekey. Moving secrets between domains is deliberately manual: decrypt with the `sops` CLI, then `sops_create_secrets` into the new domain.
+
+### Files with non-age master keys
+
+SOPS can encrypt one file to an age recipient *and* a PGP or KMS key. This server encrypts with age alone, so re-encrypting such a file would drop the other key holder without an error. Every mutation refuses these files, and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
 
 ### What domains are not
 

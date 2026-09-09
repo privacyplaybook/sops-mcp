@@ -7,7 +7,7 @@ import tempfile
 
 import yaml
 
-from .domains import Domain
+from .domains import DEFAULT_DOMAIN, Domain
 
 # Every environment variable sops consults for an age private key. They are
 # stripped from each child environment so that the only key material sops
@@ -49,17 +49,13 @@ def _make_secure_tempdir() -> str:
     return tmpdir
 
 
-def recipients_of(encrypted_content: str) -> tuple[str, ...]:
-    """Return the age recipients a SOPS file is encrypted to.
+# sops master-key groups other than age. This server encrypts with --age
+# only, so a file carrying any of these would lose them on re-encryption.
+_NON_AGE_KEY_GROUPS = ("pgp", "kms", "gcp_kms", "azure_kv", "hc_vault")
 
-    Reads the `sops` envelope only — no private key, no decryption. This is
-    what a mutation compares against its domain before re-encrypting, so
-    that re-encrypting can never quietly change who can read a file.
 
-    The envelope is not authenticated, but it cannot be forged upward: an
-    added recipient entry without a matching wrapped data key simply fails
-    to decrypt, and a removed one only revokes its own access.
-    """
+def _envelope_of(encrypted_content: str) -> dict:
+    """Return the `sops` metadata block, or raise if it isn't there."""
     try:
         parsed = yaml.safe_load(encrypted_content)
     except yaml.YAMLError as exc:
@@ -74,6 +70,37 @@ def recipients_of(encrypted_content: str) -> tuple[str, ...]:
     envelope = parsed["sops"]
     if not isinstance(envelope, dict):
         raise SopsError("the 'sops' metadata block is malformed.")
+    return envelope
+
+
+def non_age_key_groups(encrypted_content: str) -> tuple[str, ...]:
+    """Names of the non-age master-key groups a file actually carries.
+
+    A normal age file lists these groups empty. A non-empty one means the
+    file is also readable by a PGP or KMS key, which this server cannot
+    reproduce: it always encrypts with --age alone, so re-encrypting would
+    drop that key holder silently. Callers refuse rather than do that.
+    """
+    envelope = _envelope_of(encrypted_content)
+    return tuple(
+        group
+        for group in _NON_AGE_KEY_GROUPS
+        if isinstance(envelope.get(group), list) and envelope[group]
+    )
+
+
+def recipients_of(encrypted_content: str) -> tuple[str, ...]:
+    """Return the age recipients a SOPS file is encrypted to.
+
+    Reads the `sops` envelope only — no private key, no decryption. This is
+    what a mutation compares against its domain before re-encrypting, so
+    that re-encrypting can never quietly change who can read a file.
+
+    The envelope is not authenticated, but it cannot be forged upward: an
+    added recipient entry without a matching wrapped data key simply fails
+    to decrypt, and a removed one only revokes its own access.
+    """
+    envelope = _envelope_of(encrypted_content)
 
     entries = envelope.get("age") or []
     if not isinstance(entries, list):
@@ -98,10 +125,12 @@ class SopsEncryptor:
     def __init__(self, sops_binary: str = "sops"):
         self.sops_binary = sops_binary
 
-    def _child_env(self, domain: Domain, scratch_home: str) -> dict[str, str]:
+    def _child_env(
+        self, domain: Domain, scratch_home: str, *, with_keys: bool
+    ) -> dict[str, str]:
         """Build the environment for one sops invocation.
 
-        Two things happen here, both load-bearing for domain isolation:
+        Three things happen here, all load-bearing:
 
         1. Every age key environment variable is dropped, then reinstated
            with only this domain's keys.
@@ -109,6 +138,10 @@ class SopsEncryptor:
            sops falls back to ``~/.config/sops/age/keys.txt`` when no key
            env var is set, so without this a key on disk would silently be
            available to every domain.
+        3. Private keys are passed only when the operation needs them.
+           Encryption needs recipients on the command line and nothing
+           else, so an encrypt subprocess never carries an identity in its
+           environment where /proc would expose it.
         """
         env = dict(os.environ)
         for var in _AGE_KEY_ENV_VARS:
@@ -117,7 +150,7 @@ class SopsEncryptor:
         env["HOME"] = scratch_home
         env["XDG_CONFIG_HOME"] = scratch_home
 
-        if domain.keys:
+        if with_keys and domain.keys:
             env["SOPS_AGE_KEY"] = "\n".join(domain.keys)
         return env
 
@@ -158,7 +191,7 @@ class SopsEncryptor:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                env=self._child_env(domain, scratch_home),
+                env=self._child_env(domain, scratch_home, with_keys=False),
                 check=False,
             )
 
@@ -182,10 +215,18 @@ class SopsEncryptor:
             Dict of decrypted key-value pairs.
         """
         if domain.encrypt_only:
+            # SOPS_AGE_KEY only ever feeds the implicit 'default' domain,
+            # so pointing a named domain at it would be a dead end.
+            remedy = (
+                "Set SOPS_AGE_KEY."
+                if domain.name == DEFAULT_DOMAIN
+                else f"Give it a 'keys' or 'key_file' entry in the domains "
+                f"file; SOPS_AGE_KEY only configures the "
+                f"'{DEFAULT_DOMAIN}' domain."
+            )
             raise SopsError(
-                f"domain '{domain.name}' has no private key configured, so it "
-                "cannot decrypt. Set SOPS_AGE_KEY, or give the domain a "
-                "'keys' / 'key_file' entry in the domains file."
+                f"domain '{domain.name}' has no private key configured, so "
+                f"it cannot decrypt. {remedy}"
             )
 
         tmpdir = _make_secure_tempdir()
@@ -209,7 +250,7 @@ class SopsEncryptor:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                env=self._child_env(domain, scratch_home),
+                env=self._child_env(domain, scratch_home, with_keys=True),
                 check=False,
             )
 

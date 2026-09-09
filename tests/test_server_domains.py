@@ -347,3 +347,111 @@ async def test_v1_file_for_another_key_is_refused_not_silently_rekeyed(env):
         await env._rotate_generated(
             {"encrypted_content": legacy, "key_names": ["TOKEN"]}
         )
+
+
+# --- non-age master keys -------------------------------------------------
+
+
+def _with_pgp(blob):
+    """The same file, additionally listing a PGP master key.
+
+    Edited textually rather than through a YAML round-trip so the rest of
+    the file — including the sops timestamp and the MAC — stays byte for
+    byte what sops wrote.
+    """
+    assert "    pgp: []\n" in blob
+    return blob.replace(
+        "    pgp: []\n",
+        "    pgp:\n"
+        "        - fp: 0000000000000000000000000000000000000000\n"
+        "          enc: |\n"
+        "            -----BEGIN PGP MESSAGE-----\n"
+        "            -----END PGP MESSAGE-----\n",
+        1,
+    )
+
+
+async def test_mutations_refuse_a_file_with_a_pgp_master_key(env):
+    """Re-encrypting would drop the PGP holder silently."""
+    blob = await _create(env, "alpha")
+    withpgp = _with_pgp(blob)
+
+    calls = [
+        (env._rotate_generated, {"key_names": ["TOKEN"]}),
+        (env._delete_secrets, {"key_names": ["TOKEN"]}),
+        (env._rename_secret, {"old_name": "TOKEN", "new_name": "TOKEN2"}),
+    ]
+    for handler, extra in calls:
+        with pytest.raises(ValueError, match="pgp master key"):
+            await handler({"encrypted_content": withpgp, **extra})
+
+
+async def test_rekey_also_refuses_a_non_age_master_key(env):
+    """Rekey skips the recipient check but not this one."""
+    blob = await _create(env, "alpha")
+    with pytest.raises(ValueError, match="pgp master key"):
+        await env._rekey({"encrypted_content": _with_pgp(blob), "domain": "alpha"})
+
+
+async def test_listing_does_not_call_a_pgp_file_a_match(env):
+    blob = await _create(env, "alpha")
+    text = (await env._list_secrets({"encrypted_content": _with_pgp(blob)}))[0].text
+    assert "pgp master key" in text
+    assert "Recipients match the configured domain." not in text
+
+
+# --- rekey leaves legacy files retrofittable -----------------------------
+
+
+async def test_rekey_does_not_stamp_metadata_onto_a_legacy_file(env):
+    """Stamping an empty block would dead-end sops_add_metadata.
+
+    sops_add_metadata refuses a file that already has a block, and
+    sops_rotate_generated refuses a block with no secrets, so a legacy file
+    given an empty one has no way back.
+    """
+    legacy = env.encryptor.encrypt({"TOKEN": "v"}, env.domains["alpha"])
+    assert "_meta_unencrypted" not in yaml.safe_load(legacy)
+
+    result = await env._rekey({"encrypted_content": legacy, "domain": "shared"})
+    rekeyed = result[0].text
+    assert "_meta_unencrypted" not in yaml.safe_load(rekeyed)
+    assert len(yaml.safe_load(rekeyed)["sops"]["age"]) == 2
+    assert "no _meta_unencrypted block" in result[1].text
+
+    # The retrofit path is still open afterwards.
+    retrofitted = await env._add_metadata({
+        "encrypted_content": rekeyed,
+        "domain": "shared",
+        "secret_metadata": {"TOKEN": {"source": "external"}},
+    })
+    meta = yaml.safe_load(retrofitted[0].text)["_meta_unencrypted"]
+    assert meta["domain"] == "shared"
+    assert meta["secrets"]["TOKEN"]["source"] == "external"
+
+
+async def test_rekey_still_stamps_a_file_that_had_metadata(env):
+    blob = await _create(env, "alpha")
+    result = await env._rekey({"encrypted_content": blob, "domain": "shared"})
+    assert yaml.safe_load(result[0].text)["_meta_unencrypted"]["domain"] == "shared"
+
+
+async def test_rekey_domain_schema_does_not_contradict_itself(env):
+    """The injected 'optional' description must not land on a required arg."""
+    from mcp.types import ListToolsRequest
+
+    result = await env.server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+    rekey = next(t for t in result.root.tools if t.name == "sops_rekey")
+    description = rekey.inputSchema["properties"]["domain"]["description"]
+    assert "domain" in rekey.inputSchema["required"]
+    assert "Optional" not in description
+    assert description.startswith("Required")
+
+    others = [
+        t for t in result.root.tools
+        if t.name not in {"sops_rekey", "sops_list_domains"}
+    ]
+    for tool in others:
+        assert "Optional" in tool.inputSchema["properties"]["domain"]["description"]

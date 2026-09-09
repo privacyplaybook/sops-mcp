@@ -32,7 +32,12 @@ from .secrets_derive import (
     topological_order,
 )
 from .secrets_generator import CHARSETS, generate_secret
-from .sops import SopsEncryptor, SopsError, recipients_of
+from .sops import (
+    SopsEncryptor,
+    SopsError,
+    non_age_key_groups,
+    recipients_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -355,12 +360,31 @@ class SopsMcpServer:
             )
         return domain
 
+    @staticmethod
+    def _reject_non_age_keys(content: str) -> None:
+        """Refuse a file that other master-key types can also open.
+
+        This server encrypts with --age alone, so re-encrypting a file that
+        also carries a PGP or KMS key would drop that key holder with no
+        error — the same silent-revocation failure the recipient check
+        exists to prevent. Use the sops CLI for those files.
+        """
+        groups = non_age_key_groups(content)
+        if groups:
+            raise ValueError(
+                f"File also has {', '.join(groups)} master key(s). This "
+                "server encrypts to age recipients only, so re-encrypting "
+                "would drop them and silently revoke access. Manage this "
+                "file with the sops CLI instead."
+            )
+
     def _check_recipients(self, content: str, domain: Domain) -> None:
         """Refuse to re-encrypt a file onto a different recipient set.
 
         Counts rather than lists the recipients: a wrong domain name should
         not turn this into a way to enumerate another domain's keys.
         """
+        self._reject_non_age_keys(content)
         actual = set(recipients_of(content))
         expected = set(domain.recipients)
         if actual != expected:
@@ -700,6 +724,17 @@ class SopsMcpServer:
                                     "Contents of a secrets.enc.yaml file"
                                 ),
                             },
+                            "domain": {
+                                "type": "string",
+                                "description": (
+                                    "Required. The domain whose current "
+                                    "recipient list the file is re-encrypted "
+                                    "to. This changes who can read the file, "
+                                    "so it is never inferred from the file "
+                                    "or defaulted. Call sops_list_domains to "
+                                    "see the options."
+                                ),
+                            },
                         },
                         "required": ["encrypted_content", "domain"],
                     },
@@ -849,10 +884,17 @@ class SopsMcpServer:
 
         try:
             actual = recipients_of(content)
+            other_groups = non_age_key_groups(content)
         except SopsError:
             return ["", "Domain: (file has no readable sops metadata block)"]
 
         lines = ["", f"Recipients: {len(actual)}"]
+        if other_groups:
+            lines.append(
+                f"  WARNING: this file also has {', '.join(other_groups)} "
+                "master key(s). This server encrypts to age only and will "
+                "refuse to mutate it; use the sops CLI."
+            )
         if recorded is None:
             lines.append(
                 "Domain: not recorded (pre-domains file; treated as "
@@ -874,6 +916,13 @@ class SopsMcpServer:
                 f"  WARNING: the file's recipients do not match domain "
                 f"'{name}' ({len(domain.recipients)} configured). Mutations "
                 "will be refused; run sops_rekey to reconcile."
+            )
+        elif other_groups:
+            # Don't call this a match: the age recipients line up, but the
+            # file still cannot be mutated here.
+            lines.append(
+                "  Age recipients match the configured domain, but the "
+                "non-age master key(s) above block any mutation."
             )
         else:
             lines.append("  Recipients match the configured domain.")
@@ -921,8 +970,13 @@ class SopsMcpServer:
             raise ValueError("Content is not valid YAML")
 
         domain = self._resolve_domain(arguments)
+        # Rekey is exempt from the recipient check — changing the recipient
+        # set is its purpose — but not from this one: it cannot reproduce a
+        # non-age master key any more than the other tools can.
+        self._reject_non_age_keys(content)
         before = set(recipients_of(content))
 
+        had_meta = "_meta_unencrypted" in parsed
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
 
@@ -933,11 +987,18 @@ class SopsMcpServer:
             for key, value in decrypted.items()
             if not key.startswith("_")
         }
-        new_data["_meta_unencrypted"] = self._meta_block(
-            meta_secrets,
-            domain,
-            meta.get("version", 1) if isinstance(meta, dict) else 1,
-        )
+        # A legacy file has no metadata block, and stamping an empty one on
+        # would lock out sops_add_metadata (which refuses a file that
+        # already has a block) while sops_rotate_generated still refuses a
+        # block with no secrets. Leave it legacy so the retrofit path stays
+        # open; the recipient check, not the recorded name, is what guards
+        # the next mutation.
+        if had_meta:
+            new_data["_meta_unencrypted"] = self._meta_block(
+                meta_secrets,
+                domain,
+                meta.get("version", 1) if isinstance(meta, dict) else 1,
+            )
 
         encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
@@ -955,6 +1016,12 @@ class SopsMcpServer:
             summary.append(
                 f"{removed} recipient(s) can no longer read this file once "
                 "you write it back."
+            )
+        if not had_meta:
+            summary.append(
+                "This file has no _meta_unencrypted block, so the domain "
+                "was not recorded in it. Run sops_add_metadata to retrofit "
+                "one, or pass 'domain' explicitly on later calls."
             )
         return [
             TextContent(type="text", text=encrypted_yaml),

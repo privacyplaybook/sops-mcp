@@ -48,7 +48,9 @@ tool, since all of them decrypt. It does *not* protect read-only paths:
 `sops_list_secrets` reports metadata without a key and therefore without
 verification, so a tampered file can mislead a listing. Acting on it fails.
 Mutations additionally verify a file's real recipients against the named
-domain before trusting the recorded domain name.
+domain before trusting the recorded domain name, and refuse any file
+carrying a non-age master key (PGP, KMS, Vault) because this server
+encrypts with age alone and re-encryption would silently revoke it.
 
 See the [Security section of the README](./README.md#security) for the
 full defence-in-depth list (no client filesystem access, public-key-only
