@@ -220,6 +220,10 @@ Until a file is rekeyed, mutations on it are refused with a message pointing her
 
 SOPS can encrypt one file to an age recipient *and* a PGP or KMS key. This server encrypts with age alone, so re-encrypting such a file would drop the other key holder without an error. Every mutation refuses these files, and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
 
+### Running mixed versions
+
+A file this version writes stays readable and writable by sops-mcp 0.10.1 and earlier. The older version does not know about the `domain` field, so it drops it the next time it mutates the file, leaving a file with no recorded domain. That resolves to `default` here, and the recipient check still protects it either way. Re-record the domain by passing `domain` explicitly on any later call, or with `sops_rekey`.
+
 ### What domains are not
 
 Domains separate key sets, not callers. On the SSE transport a single API token reaches every domain the server holds. If you need two parties that must not read each other's secrets, run a server process each.
