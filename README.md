@@ -331,7 +331,15 @@ lib/compile_requirements.sh
 
 ### CI verification
 
-The `supply-chain.yml` workflow runs `lib/verify_requirements.py`, `lib/verify_base_images.py` and `lib/verify_version.py`. It runs on every pull request to `main`, and on pushes to `main` that touch the Dockerfile, a lockfile, `pyproject.toml`, `server.json` or `lib/`. It checks that lockfiles are well-formed, that every Dockerfile `FROM` line is digest-pinned, and that `server.json` matches the version in `pyproject.toml`.
+The `supply-chain.yml` workflow runs `lib/verify_requirements.py`, `lib/verify_base_images.py` and `lib/verify_version.py`, then audits the lockfile for known advisories. It runs on every pull request to `main`, and on pushes to `main` that touch the Dockerfile, a lockfile, `pyproject.toml`, `server.json` or `lib/`. It checks that lockfiles are well-formed, that every Dockerfile `FROM` line is digest-pinned, that `server.json` matches the version in `pyproject.toml`, and that no pinned dependency has a published vulnerability.
+
+The audit is the same gate the publish workflow runs, so a lockfile that would block a release now blocks the pull request instead. Because it queries live advisory data, an unrelated pull request can start failing when a new advisory lands against a pinned dependency. That is the intended trade-off; the fix is to refresh the lockfile.
+
+Note that `pip-compile` keeps existing pins unless told otherwise, so regenerating after an advisory needs the upgrade flag:
+
+```bash
+lib/compile_requirements.sh --upgrade
+```
 
 ## Verifying a published release
 

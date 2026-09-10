@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.11.0]
 
+### Fixed (post-merge)
+
+- **Lockfile moved off two versions with published advisories.**
+  `cryptography` 49.0.0 (PYSEC-2026-3552) and `mcp` 1.28.0
+  (PYSEC-2026-3483) are now 50.0.1 and 1.30.0. Both pins predate this
+  release; they surfaced when the publish workflow's audit ran on `main`.
+- **The dependency audit now runs on pull requests.** It lived only in the
+  publish workflow, which runs on pushes to `main` and on tags, so a
+  lockfile with a known advisory could merge unseen and fail only after
+  landing. `supply-chain.yml` runs the same gate on every pull request.
+- **`lib/compile_requirements.sh` takes `--upgrade`.** Without it
+  `pip-compile` keeps every pin it already finds, which is why
+  regenerating the lockfile never moved these two forward.
+
 Adds **key domains**: a named set of age recipients plus the private keys
 the server holds for them. One server process can now serve several
 independent recipient sets, and — the reason this is a minor rather than a
@@ -57,6 +71,15 @@ v1 environment variables become a domain called `default`.
 
 ### Changed
 
+- **Lint coverage widened.** ruff now runs bugbear, bandit, pylint,
+  pyupgrade, simplify, perf, logging and pytest rule families instead of
+  its small default set, with the deliberate patterns in this codebase
+  (`/dev/shm` temp files, fixed-argv subprocess calls, long linear tool
+  handlers) exempted with reasons in `pyproject.toml`. Internal only; no
+  behaviour change.
+- **Python 3.14 is supported and tested.** Added to the CI matrix and the
+  package classifiers. The published Docker image still runs 3.13; that is
+  tracked separately.
 - **An unmatched private key no longer stops the server booting.** A key
   whose public half is not in its domain's recipient list is the normal
   state mid recipient-rotation, and it still opens files encrypted before

@@ -145,11 +145,11 @@ def recipients_of(encrypted_content: str) -> tuple[str, ...]:
     if not isinstance(entries, list):
         raise SopsError("the 'sops.age' metadata block is malformed.")
 
-    recipients = []
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("recipient"):
-            recipients.append(str(entry["recipient"]).strip())
-    return tuple(recipients)
+    return tuple(
+        str(entry["recipient"]).strip()
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("recipient")
+    )
 
 
 class SopsEncryptor:

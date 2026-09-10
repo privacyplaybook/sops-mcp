@@ -234,9 +234,9 @@ def _process_batch(
     pending_derived: dict[str, str] = {}
     resolved: dict[str, str] = dict(existing_values)
 
-    for spec in specs:
-        if spec["source"] != "derived":
-            ordered.append(spec["key_name"])
+    ordered.extend(
+        spec["key_name"] for spec in specs if spec["source"] != "derived"
+    )
 
     for spec in specs:
         if spec["source"] == "derived":
@@ -767,28 +767,27 @@ class SopsMcpServer:
             try:
                 if name == "sops_create_secrets":
                     return await self._create_secrets(arguments)
-                elif name == "sops_list_secrets":
+                if name == "sops_list_secrets":
                     return await self._list_secrets(arguments)
-                elif name == "sops_rotate_generated":
+                if name == "sops_rotate_generated":
                     return await self._rotate_generated(arguments)
-                elif name == "sops_add_secrets":
+                if name == "sops_add_secrets":
                     return await self._add_secrets(arguments)
-                elif name == "sops_add_metadata":
+                if name == "sops_add_metadata":
                     return await self._add_metadata(arguments)
-                elif name == "sops_delete_secrets":
+                if name == "sops_delete_secrets":
                     return await self._delete_secrets(arguments)
-                elif name == "sops_rename_secret":
+                if name == "sops_rename_secret":
                     return await self._rename_secret(arguments)
-                elif name == "sops_update_external":
+                if name == "sops_update_external":
                     return await self._update_external(arguments)
-                elif name == "sops_create_oidc_secret":
+                if name == "sops_create_oidc_secret":
                     return await self._create_oidc_secret(arguments)
-                elif name == "sops_list_domains":
+                if name == "sops_list_domains":
                     return await self._list_domains(arguments)
-                elif name == "sops_rekey":
+                if name == "sops_rekey":
                     return await self._rekey(arguments)
-                else:
-                    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+                return [TextContent(type="text", text=f"Unknown tool: {name}")]
             except (ValueError, SopsError) as e:
                 return [TextContent(type="text", text=f"Error: {e}")]
             except Exception:
@@ -821,12 +820,12 @@ class SopsMcpServer:
             now=now,
         )
 
-        data: dict[str, Any] = {k: v for k, v in resolved.items()}
+        data: dict[str, Any] = dict(resolved.items())
         data["_meta_unencrypted"] = self._meta_block(meta_secrets, domain)
 
         encrypted_yaml = self.encryptor.encrypt(data, domain)
 
-        summary_lines = ["Created secrets:"] + summary
+        summary_lines = ["Created secrets:", *summary]
         responses = [
             TextContent(type="text", text=encrypted_yaml),
             TextContent(type="text", text="\n".join(summary_lines)),
@@ -972,8 +971,7 @@ class SopsMcpServer:
             lines.append(f"{summary['name']}  ({role})")
             lines.append(f"  private keys held: {summary['key_count']}")
             lines.append(f"  recipients ({summary['recipient_count']}):")
-            for recipient in summary["recipients"]:
-                lines.append(f"    - {recipient}")
+            lines.extend(f"    - {r}" for r in summary["recipients"])
         return [TextContent(type="text", text="\n".join(lines))]
 
     async def _rekey(
@@ -1283,7 +1281,7 @@ class SopsMcpServer:
             now=now,
         )
 
-        new_data: dict[str, Any] = {k: v for k, v in resolved.items()}
+        new_data: dict[str, Any] = dict(resolved.items())
         new_data["_meta_unencrypted"] = self._meta_block(
             merged_meta,
             domain,
@@ -1292,7 +1290,7 @@ class SopsMcpServer:
 
         encrypted_yaml = self.encryptor.encrypt(new_data, domain)
 
-        summary_lines = ["Secrets added:"] + summary
+        summary_lines = ["Secrets added:", *summary]
         if preserved:
             summary_lines.append(f"Preserved: {', '.join(preserved)}")
 
@@ -1754,8 +1752,12 @@ class SopsMcpServer:
         DNS-rebinding middleware inside SseServerTransport — can be exercised
         from tests without spinning up uvicorn.
         """
-        from mcp.server.sse import SseServerTransport
-        from mcp.server.transport_security import TransportSecuritySettings
+        # Imported lazily: the stdio transport must not pull in the HTTP
+        # server stack just to start.
+        from mcp.server.sse import SseServerTransport  # noqa: PLC0415
+        from mcp.server.transport_security import (  # noqa: PLC0415
+            TransportSecuritySettings,
+        )
 
         if allowed_hosts is None:
             allowed_hosts = [
@@ -1790,7 +1792,9 @@ class SopsMcpServer:
                 return PlainTextResponse("Unauthorized", status_code=401)
             try:
                 async with sse.connect_sse(
-                    request.scope, request.receive, request._send
+                    # request._send is how MCP's SSE transport expects to
+                    # be handed the raw ASGI send callable.
+                    request.scope, request.receive, request._send,  # noqa: SLF001
                 ) as (read_stream, write_stream):
                     await self.server.run(
                         read_stream,
@@ -1812,7 +1816,7 @@ class SopsMcpServer:
             scope: Any, receive: Any, send: Any
         ) -> None:
             if api_token:
-                from starlette.datastructures import Headers
+                from starlette.datastructures import Headers  # noqa: PLC0415
 
                 headers = Headers(scope=scope)
                 if headers.get("authorization") != f"Bearer {api_token}":
@@ -1847,7 +1851,8 @@ class SopsMcpServer:
         that validate the Host header against `allowed_hosts`. When
         `allowed_hosts` is None, the default is loopback only.
         """
-        import uvicorn
+        # Imported lazily so the stdio transport never pays for uvicorn.
+        import uvicorn  # noqa: PLC0415
 
         app = self._build_sse_app(allowed_hosts=allowed_hosts)
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
@@ -1901,7 +1906,7 @@ def main() -> None:
         host = os.environ.get("SOPS_MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("SOPS_MCP_PORT", "55090"))
         api_token = os.environ.get("SOPS_MCP_API_TOKEN")
-        if host == "0.0.0.0" and not api_token:
+        if host == "0.0.0.0" and not api_token:  # noqa: S104 - the refusal
             raise RuntimeError(
                 "Refusing to bind the SSE transport to 0.0.0.0 without "
                 "SOPS_MCP_API_TOKEN. Either set the token, bind to "

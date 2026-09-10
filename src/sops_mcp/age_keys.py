@@ -221,5 +221,5 @@ def _convertbits_encode(data: list[int], frombits: int, tobits: int) -> list[int
 
 def _create_checksum(hrp: str, data: list[int]) -> list[int]:
     values = _hrp_expand(hrp) + data
-    polymod = _polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    polymod = _polymod([*values, 0, 0, 0, 0, 0, 0]) ^ 1
     return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]

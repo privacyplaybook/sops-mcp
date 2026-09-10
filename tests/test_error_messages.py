@@ -62,7 +62,15 @@ async def test_validation_errors_still_surface_to_client():
     request = CallToolRequest(
         params=CallToolRequestParams(
             name="sops_create_secrets",
-            arguments={"secrets": [{"key_name": "bad-name", "source": "external", "value": "x"}]},
+            arguments={
+                "secrets": [
+                    {
+                        "key_name": "bad-name",
+                        "source": "external",
+                        "value": "x",
+                    }
+                ]
+            },
         ),
     )
 
