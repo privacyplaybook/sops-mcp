@@ -342,6 +342,20 @@ Every `sops` call this server makes is pinned to an empty `--config`, so a `.sop
 The `sops:` block above is abridged. A real file also carries `lastmodified`, a `mac`, a `version`, and empty lists for the master-key types this server does not use (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). The MAC covers unencrypted values too, so an edited `_meta_unencrypted` block fails to decrypt. If any of those other key lists is non-empty, this server refuses to mutate the file — it encrypts to age alone and would otherwise drop that key holder silently.
 
 
+### Do not reshape the output
+
+The encrypted content this server returns must be committed exactly as it comes back. SOPS binds each value's AES-GCM tag to that value's *path* in the document, so moving a value to a different key — nesting a root-level `DB_PASSWORD` under `stringData:` to build a Kubernetes Secret manifest, say — invalidates the tag even though the `ENC[...]` string itself is untouched:
+
+```
+$ sops decrypt secrets.enc.yaml
+Error decrypting tree: Error walking tree: Could not decrypt value: Could not decrypt with AES_GCM: cipher: message authentication failed
+```
+
+The value is unrecoverable at that point. Editing the plaintext parts by hand fails the same way, for a different reason: the MAC covers unencrypted values, so an edited `_meta_unencrypted` block gives `MAC mismatch`. Reindenting, reordering keys or reflowing the YAML is safe — SOPS parses the document, so only key paths and values matter.
+
+If you need secrets in some other document shape, build that shape from the flat file at deploy time (Kustomize's `secretGenerator`, `helm-secrets`, `sops-secrets-operator`) rather than reshaping the encrypted file.
+
+
 ## Why these tools and not others
 
 **Per-key read (decrypt-one-secret):** intentionally absent. Returning plaintext over the MCP boundary would give the model access to secret material during tool calls — an accidental exfiltration vector. If you need a plaintext value, run `sops decrypt` yourself with the age private key.
