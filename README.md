@@ -18,17 +18,12 @@ Two goals drive the design:
 
 The age private key lives in exactly one place: your CI/CD secrets store. Everywhere else — your laptop, your git remote, your container images — sees only ciphertext. See the [worked example](#example-integrating-with-a-cicd-deployment-pipeline) below.
 
-**2. Let an AI coding agent generate secrets it can never read.** Claude (or any MCP client) can create passwords, rotate them, derive hashes, rename and delete them — but plaintext values never cross the MCP boundary back to the model. The server holds the encryption key; the client only submits requests and receives metadata. There is deliberately no "decrypt this one secret" tool. If a prompt injection or a misbehaving agent tried to exfiltrate a secret via tool output, there is no tool output to exfiltrate.
+**2. Let an AI coding agent generate secrets it can never read.** Claude (or any MCP client) can create passwords, rotate them, derive hashes, rename and delete them — but plaintext values never cross the MCP boundary back to the model.
+The server holds the encryption key; the client only submits requests and receives metadata.
+There is deliberately no "decrypt this one secret" tool.
+This prevents a prompt injection or a misbehaving agent from exfiltrating a secret.
 
 The simplest setup uses a single age recipient (the one CI private key). If you need several — a CI key plus an operator's key, or separate key sets for separate parties — see [Key domains](#key-domains).
-
-## Design
-
-Three ideas shape the tool surface:
-
-1. **No plaintext crosses the MCP boundary.** Generated secret values are never returned to the client. There is deliberately no "decrypt this one key" tool. If you need plaintext, run `sops decrypt` yourself with the age private key.
-2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values by default, so a tampered block fails to decrypt. Files that switch that off with `mac_only_encrypted` are refused. Tools that read the block *without* a key still cannot check the MAC, which is why recipients are verified separately.
-3. **No in-place value update for generated or derived secrets.** Those change only via rotation — the mutation model is deliberate, not accidental. External secrets (e.g. an upstream API key the user controls) can be updated with `sops_update_external`.
 
 ## Secret sources
 
@@ -37,6 +32,15 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 - **`generated`** — Cryptographically random values (Python `secrets` / OS CSPRNG). You specify length and charset; the server stores both so it can regenerate on rotation.
 - **`external`** — User-provided values encrypted as-is (SMTP credentials, third-party API keys, etc.). Preserved across rotation. Updated via `sops_update_external`.
 - **`derived`** — Computed from another key in the same file via a named transform. When the source is rotated (or an external source is updated), the derived value is automatically recomputed in topological order. Useful for things like Authelia's PBKDF2 hashes of OIDC client secrets.
+
+## Design
+
+Three ideas shape the tool surface:
+
+1. **No plaintext crosses the MCP boundary.** Generated secret values are never returned to the client. There is deliberately no "decrypt this one key" tool. If you need plaintext, run `sops decrypt` yourself with the age private key.
+2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values by default, so a tampered block fails to decrypt. Files that switch that off with `mac_only_encrypted` are refused. Tools that read the block *without* a key still cannot check the MAC, which is why recipients are verified separately.
+3. **No in-place value update for `generated` or `derived` secrets.** Those change only via rotation, where neither the server nor the caller has access to the plaintext. `External` secrets (e.g. an upstream API key the user controls) can be updated with `sops_update_external`.
+
 
 ### Transforms (for `derived` secrets)
 
@@ -196,6 +200,25 @@ domains:
     # no keys: this domain can encrypt but never decrypt
 ```
 
+#### What `version:` means
+
+`version:` is the **schema version of this configuration document** — which
+fields a domain may carry and how they are laid out. It is not a version of
+the keys, the recipients, or anything you rotate. Rotating a domain's
+recipients does not change it. It stays `1` until a release changes the
+document format itself.
+
+It is optional; omit it and `1` is assumed. If present it must match exactly,
+so a `version: 2` document is refused by a server that only understands `1`
+rather than being half-read. That is the point of the field: a domain with an
+unrecognised field is rejected, so without a version check an older server
+would blame one field name when the real problem is that the whole document
+is newer than it is.
+
+Note that the `version` inside a secrets file's `_meta_unencrypted` block is
+a **different** number, versioning the metadata schema in that file. The two
+are unrelated and both happen to be `1`.
+
 The domains file must not be writable by group or other, and must be owned by the user the server runs as or by root. That check applies whether or not it holds key material, because the file decides which recipients everything is encrypted to.
 
 A file holding private keys — the domains file with inline `keys:`, or any `key_file` — must additionally not be world-readable. Group-readable is allowed with a warning, so a container secret mounted root-owned and readable by the runtime group works. In the published image the server runs as uid 65532, so a Docker or compose secret needs a `uid:`/`gid:`/`mode:` that lets that user read it; `mode: 0640` with a matching group is the usual answer.
@@ -221,6 +244,8 @@ SOPS_MCP_DOMAINS='{"version":1,"domains":{"archive":{"recipients":["age1archive.
 YAML works too; JSON is simply the form that survives environments where
 a multi-line value is inconvenient, and it parses because YAML is a
 superset of JSON.
+
+`version` here is the [document schema version](#what-version-means), not a key version — the same field as in the file form.
 
 A domain defined here **may not set `keys` or `key_file`** and the server
 refuses to start if one does. An environment variable is visible to
@@ -319,6 +344,21 @@ Secret values are AES-256-GCM encrypted. The `_meta_unencrypted` block is stored
 Every `sops` call this server makes is pinned to an empty `--config`, so a `.sops.yaml` in the directory the server was started from cannot change how files are encrypted. Recipients come from the domain, and nothing else.
 
 The `sops:` block above is abridged. A real file also carries `lastmodified`, a `mac`, a `version`, and empty lists for the master-key types this server does not use (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). The MAC covers unencrypted values too, so an edited `_meta_unencrypted` block fails to decrypt. If any of those other key lists is non-empty, this server refuses to mutate the file — it encrypts to age alone and would otherwise drop that key holder silently.
+
+
+### Do not reshape the output
+
+The encrypted content this server returns must be committed exactly as it comes back. SOPS binds each value's AES-GCM tag to that value's *path* in the document, so moving a value to a different key — nesting a root-level `DB_PASSWORD` under `stringData:` to build a Kubernetes Secret manifest, say — invalidates the tag even though the `ENC[...]` string itself is untouched:
+
+```
+$ sops decrypt secrets.enc.yaml
+Error decrypting tree: Error walking tree: Could not decrypt value: Could not decrypt with AES_GCM: cipher: message authentication failed
+```
+
+The value is unrecoverable at that point. Editing the plaintext parts by hand fails the same way, for a different reason: the MAC covers unencrypted values, so an edited `_meta_unencrypted` block gives `MAC mismatch`. Reindenting, reordering keys or reflowing the YAML is safe — SOPS parses the document, so only key paths and values matter.
+
+If you need secrets in some other document shape, build that shape from the flat file at deploy time (Kustomize's `secretGenerator`, `helm-secrets`, `sops-secrets-operator`) rather than reshaping the encrypted file.
+
 
 ## Why these tools and not others
 

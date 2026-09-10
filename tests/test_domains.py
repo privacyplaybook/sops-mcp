@@ -685,6 +685,24 @@ def test_inline_wrong_version_is_fatal(keypairs):
         })
 
 
+def test_version_error_says_it_is_not_a_key_version(keypairs):
+    """`version` reads like a key version to anyone copying an example.
+
+    Acting on that guess -- bumping it while rotating recipients -- stops
+    the server dead, so the refusal has to say what the field actually is.
+    """
+    _, pub_b = keypairs[1]
+    with pytest.raises(DomainConfigError) as exc:
+        load_domains({
+            "SOPS_MCP_DOMAINS": json.dumps(
+                {"version": 2, "domains": {"vigil": {"recipients": [pub_b]}}}
+            )
+        })
+    message = str(exc.value)
+    assert "not a version of the keys" in message
+    assert "rotating recipients does not change it" in message
+
+
 def test_blank_inline_is_ignored(keypairs):
     """An empty variable is 'unset', not a malformed document."""
     ident_a, pub_a = keypairs[0]

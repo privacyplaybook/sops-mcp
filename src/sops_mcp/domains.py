@@ -269,7 +269,10 @@ def _parse_domains_doc(text: str, source: str) -> dict:
     if version != _SCHEMA_VERSION:
         raise DomainConfigError(
             f"{source} has version {version!r}; this server understands "
-            f"version {_SCHEMA_VERSION}."
+            f"version {_SCHEMA_VERSION}. This is the schema version of the "
+            "domains document, not a version of the keys or recipients \u2014 "
+            "rotating recipients does not change it. Omit the field to "
+            f"default to {_SCHEMA_VERSION}."
         )
 
     domains = raw.get("domains")
