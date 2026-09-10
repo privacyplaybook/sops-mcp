@@ -43,6 +43,7 @@ DOMAIN_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _RECIPIENT_ENV = ("SOPS_MCP_AGE_PUBLIC_KEY", "SOPS_AGE_RECIPIENTS")
 _KEY_ENV = "SOPS_AGE_KEY"
 _DOMAINS_FILE_ENV = "SOPS_MCP_DOMAINS_FILE"
+_DOMAINS_ENV = "SOPS_MCP_DOMAINS"
 _REQUIRE_DOMAIN_ENV = "SOPS_MCP_REQUIRE_DOMAIN"
 
 _SCHEMA_VERSION = 1
@@ -248,46 +249,58 @@ def _validate_domain(
     return Domain(name=name, recipients=recipients, keys=keys)
 
 
-def _load_file(path: str) -> dict:
+def _parse_domains_doc(text: str, source: str) -> dict:
+    """Validate the top-level shape of a domains document.
+
+    Shared by the file and the inline environment variable so the two
+    cannot drift. YAML is a superset of JSON, so a compact single-line
+    JSON object parses here too -- which is what makes the inline form
+    practical in an environment variable.
+    """
     try:
-        with open(path, encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle)
-    except OSError as exc:
-        raise DomainConfigError(
-            f"cannot read {_DOMAINS_FILE_ENV} {path!r}: {exc.strerror}"
-        ) from exc
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise DomainConfigError(f"{path!r} is not valid YAML: {exc}") from exc
+        raise DomainConfigError(f"{source} is not valid YAML: {exc}") from exc
 
     if not isinstance(raw, dict):
-        raise DomainConfigError(f"{path!r} must contain a YAML mapping.")
+        raise DomainConfigError(f"{source} must contain a YAML mapping.")
 
     version = raw.get("version", _SCHEMA_VERSION)
     if version != _SCHEMA_VERSION:
         raise DomainConfigError(
-            f"{path!r} has version {version!r}; this server understands "
+            f"{source} has version {version!r}; this server understands "
             f"version {_SCHEMA_VERSION}."
         )
 
     domains = raw.get("domains")
     if not isinstance(domains, dict) or not domains:
         raise DomainConfigError(
-            f"{path!r} must define a non-empty 'domains' mapping."
+            f"{source} must define a non-empty 'domains' mapping."
         )
     return domains
 
 
-def _domains_from_file(path: str) -> dict[str, Domain]:
-    spec = _load_file(path)
-    file_has_inline_keys = any(
-        isinstance(body, dict) and body.get("keys") for body in spec.values()
-    )
-    if file_has_inline_keys:
-        _require_private_mode(path, "domains file")
-    else:
-        # No key material in it, but it still decides the recipients.
-        _require_trusted_writer(path, "domains file")
+def _load_file(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise DomainConfigError(
+            f"cannot read {_DOMAINS_FILE_ENV} {path!r}: {exc.strerror}"
+        ) from exc
+    return _parse_domains_doc(text, repr(path))
 
+
+def _build_domains(
+    spec: dict, *, allow_keys: bool, source: str
+) -> dict[str, Domain]:
+    """Turn a validated ``domains`` mapping into :class:`Domain` objects.
+
+    ``allow_keys`` is False for the inline environment variable. Private
+    key material must come from a file so that it keeps the permission
+    checks in :func:`_require_private_mode` and stays out of
+    ``docker inspect`` and ``/proc/<pid>/environ``.
+    """
     domains: dict[str, Domain] = {}
     for name, body in spec.items():
         if not isinstance(name, str):
@@ -295,13 +308,28 @@ def _domains_from_file(path: str) -> dict[str, Domain]:
         if not isinstance(body, dict):
             raise DomainConfigError(f"domain {name!r} must be a mapping.")
 
-        unknown = set(body) - {"recipients", "keys", "key_file"}
+        permitted = {"recipients", "keys", "key_file"}
+        unknown = set(body) - permitted
         if unknown:
             raise DomainConfigError(
                 f"domain {name!r} has unknown field(s): "
                 f"{', '.join(sorted(unknown))}. Expected: recipients, keys, "
                 "key_file."
             )
+
+        if not allow_keys:
+            offending = sorted(k for k in ("keys", "key_file") if body.get(k))
+            if offending:
+                raise DomainConfigError(
+                    f"domain {name!r} in {source} sets "
+                    f"{' and '.join(offending)}. Private key material cannot "
+                    f"be given inline in {_DOMAINS_ENV}: an environment "
+                    "variable is visible to `docker inspect` and "
+                    "/proc/<pid>/environ, and cannot carry the file "
+                    f"permission checks. Move this domain into a "
+                    f"{_DOMAINS_FILE_ENV} document; the two are merged, so "
+                    "public-recipient domains can stay here."
+                )
 
         recipients_raw = body.get("recipients") or []
         if isinstance(recipients_raw, str):
@@ -336,6 +364,32 @@ def _domains_from_file(path: str) -> dict[str, Domain]:
     return domains
 
 
+def _domains_from_file(path: str) -> dict[str, Domain]:
+    spec = _load_file(path)
+    file_has_inline_keys = any(
+        isinstance(body, dict) and body.get("keys") for body in spec.values()
+    )
+    if file_has_inline_keys:
+        _require_private_mode(path, "domains file")
+    else:
+        # No key material in it, but it still decides the recipients.
+        _require_trusted_writer(path, "domains file")
+
+    return _build_domains(spec, allow_keys=True, source=repr(path))
+
+
+def _domains_from_env_doc(text: str) -> dict[str, Domain]:
+    """Build domains from an inline ``SOPS_MCP_DOMAINS`` document.
+
+    Public recipient sets only -- see :func:`_build_domains`. There is no
+    permission check to apply here: the variable is set by whoever
+    controls the deployment, which is the same authority that would own
+    the file.
+    """
+    spec = _parse_domains_doc(text, _DOMAINS_ENV)
+    return _build_domains(spec, allow_keys=False, source=_DOMAINS_ENV)
+
+
 def _default_from_env(env) -> Domain | None:
     """Build the implicit ``default`` domain from the v1 environment."""
     recipients_blob = ""
@@ -354,31 +408,51 @@ def _default_from_env(env) -> Domain | None:
 def load_domains(env=None) -> dict[str, Domain]:
     """Build every configured domain, or raise :class:`DomainConfigError`.
 
-    The v1 environment variables become the ``default`` domain, so an
-    existing single-recipient deployment needs no configuration change.
+    Three sources are merged, and a name defined by more than one is
+    fatal rather than silently resolved:
+
+    * ``SOPS_MCP_DOMAINS_FILE`` -- a domains document on disk. The only
+      source that may carry private keys, because it is the only one that
+      can be permission-checked.
+    * ``SOPS_MCP_DOMAINS`` -- the same document inline, for public
+      recipient sets. YAML or compact JSON.
+    * The v1 environment variables, which become the ``default`` domain,
+      so an existing single-recipient deployment needs no config change.
     """
     env = os.environ if env is None else env
 
     domains: dict[str, Domain] = {}
+    origin: dict[str, str] = {}
+
+    def _merge(new: dict[str, Domain], source: str) -> None:
+        for name, domain in new.items():
+            if name in domains:
+                raise DomainConfigError(
+                    f"domain {name!r} is defined both in {origin[name]} and "
+                    f"{source}. Remove one \u2014 merging them would make the "
+                    "recipient set ambiguous."
+                )
+            domains[name] = domain
+            origin[name] = source
+
     path = (env.get(_DOMAINS_FILE_ENV) or "").strip()
     if path:
-        domains = _domains_from_file(path)
+        _merge(_domains_from_file(path), f"{_DOMAINS_FILE_ENV} ({path!r})")
+
+    inline = (env.get(_DOMAINS_ENV) or "").strip()
+    if inline:
+        _merge(_domains_from_env_doc(inline), _DOMAINS_ENV)
 
     env_default = _default_from_env(env)
     if env_default is not None:
-        if DEFAULT_DOMAIN in domains:
-            raise DomainConfigError(
-                f"domain {DEFAULT_DOMAIN!r} is defined both in {path!r} and "
-                f"by {' / '.join(_RECIPIENT_ENV)}. Remove one — merging them "
-                "would make the recipient set ambiguous."
-            )
-        domains[DEFAULT_DOMAIN] = env_default
+        _merge({DEFAULT_DOMAIN: env_default}, " / ".join(_RECIPIENT_ENV))
 
     if not domains:
         raise DomainConfigError(
             "No age recipients configured. Set SOPS_MCP_AGE_PUBLIC_KEY (or "
-            "SOPS_AGE_RECIPIENTS) for a single-domain setup, or point "
-            f"{_DOMAINS_FILE_ENV} at a domains file."
+            "SOPS_AGE_RECIPIENTS) for a single-domain setup, define domains "
+            f"inline in {_DOMAINS_ENV}, or point {_DOMAINS_FILE_ENV} at a "
+            "domains file."
         )
     return domains
 
