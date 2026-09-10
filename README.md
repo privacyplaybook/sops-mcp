@@ -137,13 +137,14 @@ Add to your project's `.mcp.json`:
 | `SOPS_MCP_LOG_LEVEL` | No | Log level (default: `WARNING`) |
 | `SOPS_AGE_KEY` | Sometimes | Age private key for the `default` domain — required to mutate a file belonging to it. Named domains take their keys from the domains file instead. |
 | `SOPS_MCP_DOMAINS_FILE` | No | Path to a YAML file defining named [key domains](#key-domains). Use when one server needs more than one recipient set. |
+| `SOPS_MCP_DOMAINS` | No | The same domains document [inline](#defining-domains-without-a-file), as YAML or compact JSON. Public recipient sets only — a domain here may not carry `keys` or `key_file`. Merged with `SOPS_MCP_DOMAINS_FILE`. |
 | `SOPS_MCP_REQUIRE_DOMAIN` | No | Set to `1` to require every tool call to name its domain. The file's recorded domain and the `default` fallback are both disabled. |
 | `SOPS_MCP_TRANSPORT` | No | `stdio` (default) or `sse` |
 | `SOPS_MCP_HOST` / `SOPS_MCP_PORT` | No | Bind host/port for SSE transport (default: `127.0.0.1:55090`). Binding to `0.0.0.0` requires `SOPS_MCP_API_TOKEN` — the server refuses to start otherwise. |
 | `SOPS_MCP_ALLOWED_HOSTS` | No | Comma-separated allowlist for the SSE `Host` header (DNS rebinding protection). Default: `127.0.0.1,127.0.0.1:*,localhost,localhost:*`. Set explicitly when binding to a non-loopback address — e.g. `mcp.example.com,mcp.example.com:*`. |
 | `SOPS_MCP_API_TOKEN` | Sometimes | Required when SSE transport binds to `0.0.0.0`; otherwise optional. When set, SSE requires `Authorization: Bearer <token>`. |
 
-\* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set, unless `SOPS_MCP_DOMAINS_FILE` supplies at least one domain. The server refuses to start with no domains at all.
+\* One of `SOPS_MCP_AGE_PUBLIC_KEY` or `SOPS_AGE_RECIPIENTS` must be set, unless `SOPS_MCP_DOMAINS_FILE` or `SOPS_MCP_DOMAINS` supplies at least one domain. The server refuses to start with no domains at all.
 
 Both recipient variables accept a comma-separated list, and `SOPS_AGE_KEY` accepts several newline-separated keys. Together they form the `default` domain.
 
@@ -200,6 +201,38 @@ The domains file must not be writable by group or other, and must be owned by th
 A file holding private keys — the domains file with inline `keys:`, or any `key_file` — must additionally not be world-readable. Group-readable is allowed with a warning, so a container secret mounted root-owned and readable by the runtime group works. In the published image the server runs as uid 65532, so a Docker or compose secret needs a `uid:`/`gid:`/`mode:` that lets that user read it; `mode: 0640` with a matching group is the usual answer.
 
 Startup checks that every private key parses, and warns about any whose public half is not in its domain's recipient list. That is a warning rather than an error because it is the normal state mid recipient-rotation: the old key still opens files encrypted before the change, and `sops_rekey` is how those get migrated.
+
+### Defining domains without a file
+
+A domains file is the only place private keys may live, because it is the
+only one that can be permission-checked. That is a poor fit for a domain
+that has no private key at all — a recipient set you encrypt *to*, where
+someone else holds the key. Deployments where writing a file is awkward
+(a distroless image with no shell, an orchestrator with no inline-file
+primitive) then have to mount a volume to deliver two lines of public
+key material.
+
+`SOPS_MCP_DOMAINS` takes the same document inline:
+
+```bash
+SOPS_MCP_DOMAINS='{"version":1,"domains":{"archive":{"recipients":["age1archive..."]}}}'
+```
+
+YAML works too; JSON is simply the form that survives environments where
+a multi-line value is inconvenient, and it parses because YAML is a
+superset of JSON.
+
+A domain defined here **may not set `keys` or `key_file`** and the server
+refuses to start if one does. An environment variable is visible to
+`docker inspect` and `/proc/<pid>/environ`, and carries none of the
+ownership and mode checks a file gets, so it is the wrong place for a
+private key.
+
+The two sources are **merged**, so a deployment can keep its
+key-holding domains in a file and its public ones inline. A domain name
+defined by more than one source is fatal rather than silently resolved —
+the same rule that already applies when a file defines `default`
+alongside the v1 environment variables.
 
 ### Which domain does a tool use?
 

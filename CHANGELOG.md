@@ -46,6 +46,20 @@ v1 environment variables become a domain called `default`.
 
 ### Added
 
+- `SOPS_MCP_DOMAINS` — the same domains document inline, as YAML or
+  compact JSON, for domains that hold no private key. A domains file is
+  the only place key material may live, because it is the only source
+  that can be permission-checked; that is a poor fit for a public
+  recipient set, and deployments that cannot easily write a file (a
+  distroless image with no shell, an orchestrator with no inline-file
+  primitive) had to mount a volume to deliver two lines of public key
+  material. A domain defined here may not set `keys` or `key_file` and
+  the server refuses to start if one does — an environment variable is
+  visible to `docker inspect` and `/proc/<pid>/environ` and carries none
+  of a file's ownership and mode checks. The two sources are merged, so
+  key-holding domains can stay in a file while public ones live inline;
+  a name defined by more than one source is fatal rather than silently
+  resolved.
 - `SOPS_MCP_DOMAINS_FILE` — YAML defining named domains, each with
   `recipients` and optional `keys` / `key_file`. A domain with no keys can
   encrypt but never decrypt. Files holding key material must be mode 0600

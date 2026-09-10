@@ -1,5 +1,6 @@
 """Tests for age key parsing and domain configuration loading."""
 
+import json
 import os
 import textwrap
 
@@ -539,6 +540,160 @@ def test_software_key_still_warned_when_domain_has_plugin_recipient(
     with caplog.at_level("WARNING"):
         load_domains({"SOPS_MCP_DOMAINS_FILE": path})
     assert "matches none of its" in caplog.text
+
+
+# --- inline SOPS_MCP_DOMAINS -------------------------------------------
+
+
+def _inline(**domains) -> str:
+    """A compact JSON domains document, as it would be set in env."""
+    return json.dumps({"version": 1, "domains": domains})
+
+
+def test_inline_env_yaml(keypairs):
+    _, pub_b = keypairs[1]
+    domains = load_domains({
+        "SOPS_MCP_DOMAINS": textwrap.dedent(f"""
+            version: 1
+            domains:
+              vigil:
+                recipients: [{pub_b}]
+        """)
+    })
+    assert set(domains) == {"vigil"}
+    assert domains["vigil"].recipients == (pub_b,)
+    assert domains["vigil"].encrypt_only is True
+
+
+def test_inline_env_compact_json_is_equivalent(keypairs):
+    """JSON is a YAML subset, which is what makes this practical in env."""
+    _, pub_b = keypairs[1]
+    as_json = load_domains({
+        "SOPS_MCP_DOMAINS": _inline(vigil={"recipients": [pub_b]})
+    })
+    as_yaml = load_domains({
+        "SOPS_MCP_DOMAINS": (
+            f"version: 1\ndomains:\n  vigil:\n    recipients: [{pub_b}]\n"
+        )
+    })
+    assert as_json == as_yaml
+
+
+def test_inline_merges_with_v1_env_default(keypairs):
+    (ident_a, pub_a), (_, pub_b) = keypairs
+    domains = load_domains({
+        "SOPS_MCP_AGE_PUBLIC_KEY": pub_a,
+        "SOPS_AGE_KEY": ident_a,
+        "SOPS_MCP_DOMAINS": _inline(vigil={"recipients": [pub_b]}),
+    })
+    assert set(domains) == {DEFAULT_DOMAIN, "vigil"}
+    assert domains[DEFAULT_DOMAIN].encrypt_only is False
+    assert domains["vigil"].encrypt_only is True
+
+
+def test_inline_merges_with_domains_file(keypairs, tmp_path):
+    (ident_a, pub_a), (_, pub_b) = keypairs
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        domains:
+          homelab:
+            recipients: [{pub_a}]
+            keys: [{ident_a}]
+        """,
+    )
+    domains = load_domains({
+        "SOPS_MCP_DOMAINS_FILE": path,
+        "SOPS_MCP_DOMAINS": _inline(vigil={"recipients": [pub_b]}),
+    })
+    assert set(domains) == {"homelab", "vigil"}
+    # The file keeps its private key; the inline domain is encrypt-only.
+    assert domains["homelab"].keys == (ident_a,)
+    assert domains["vigil"].encrypt_only is True
+
+
+def test_inline_duplicate_of_file_domain_is_fatal(keypairs, tmp_path):
+    (_, pub_a), (_, pub_b) = keypairs
+    path = _write(
+        tmp_path,
+        f"""
+        version: 1
+        domains:
+          vigil:
+            recipients: [{pub_a}]
+        """,
+    )
+    with pytest.raises(DomainConfigError, match="defined both in"):
+        load_domains({
+            "SOPS_MCP_DOMAINS_FILE": path,
+            "SOPS_MCP_DOMAINS": _inline(vigil={"recipients": [pub_b]}),
+        })
+
+
+def test_inline_redefining_default_is_fatal(keypairs):
+    (ident_a, pub_a), (_, pub_b) = keypairs
+    with pytest.raises(DomainConfigError, match="defined both in"):
+        load_domains({
+            "SOPS_MCP_AGE_PUBLIC_KEY": pub_a,
+            "SOPS_AGE_KEY": ident_a,
+            "SOPS_MCP_DOMAINS": _inline(default={"recipients": [pub_b]}),
+        })
+
+
+def test_inline_private_keys_refused(keypairs):
+    """Key material must go in a file so it keeps its permission checks."""
+    (ident_a, _), (_, pub_b) = keypairs
+    with pytest.raises(DomainConfigError) as exc:
+        load_domains({
+            "SOPS_MCP_DOMAINS": _inline(
+                vigil={"recipients": [pub_b], "keys": [ident_a]}
+            )
+        })
+    assert "SOPS_MCP_DOMAINS_FILE" in str(exc.value)
+    # The refusal must not echo the identity it refused.
+    assert ident_a not in str(exc.value)
+
+
+def test_inline_key_file_refused(keypairs):
+    _, pub_b = keypairs[1]
+    with pytest.raises(DomainConfigError, match="key_file"):
+        load_domains({
+            "SOPS_MCP_DOMAINS": _inline(
+                vigil={"recipients": [pub_b], "key_file": "/nonexistent"}
+            )
+        })
+
+
+def test_inline_malformed_is_fatal():
+    with pytest.raises(DomainConfigError, match="not valid YAML"):
+        load_domains({"SOPS_MCP_DOMAINS": "not: [a, mapping"})
+
+
+def test_inline_empty_domains_is_fatal():
+    with pytest.raises(DomainConfigError, match="non-empty"):
+        load_domains({"SOPS_MCP_DOMAINS": json.dumps({"version": 1, "domains": {}})})
+
+
+def test_inline_wrong_version_is_fatal(keypairs):
+    _, pub_b = keypairs[1]
+    with pytest.raises(DomainConfigError, match="version"):
+        load_domains({
+            "SOPS_MCP_DOMAINS": json.dumps(
+                {"version": 2, "domains": {"vigil": {"recipients": [pub_b]}}}
+            )
+        })
+
+
+def test_blank_inline_is_ignored(keypairs):
+    """An empty variable is 'unset', not a malformed document."""
+    ident_a, pub_a = keypairs[0]
+    domains = load_domains({
+        "SOPS_MCP_AGE_PUBLIC_KEY": pub_a,
+        "SOPS_AGE_KEY": ident_a,
+        "SOPS_MCP_DOMAINS": "   ",
+    })
+    assert set(domains) == {DEFAULT_DOMAIN}
 
 
 # --- require_explicit_domain ---------------------------------------------
