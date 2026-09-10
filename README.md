@@ -196,6 +196,25 @@ domains:
     # no keys: this domain can encrypt but never decrypt
 ```
 
+#### What `version:` means
+
+`version:` is the **schema version of this configuration document** — which
+fields a domain may carry and how they are laid out. It is not a version of
+the keys, the recipients, or anything you rotate. Rotating a domain's
+recipients does not change it. It stays `1` until a release changes the
+document format itself.
+
+It is optional; omit it and `1` is assumed. If present it must match exactly,
+so a `version: 2` document is refused by a server that only understands `1`
+rather than being half-read. That is the point of the field: a domain with an
+unrecognised field is rejected, so without a version check an older server
+would blame one field name when the real problem is that the whole document
+is newer than it is.
+
+Note that the `version` inside a secrets file's `_meta_unencrypted` block is
+a **different** number, versioning the metadata schema in that file. The two
+are unrelated and both happen to be `1`.
+
 The domains file must not be writable by group or other, and must be owned by the user the server runs as or by root. That check applies whether or not it holds key material, because the file decides which recipients everything is encrypted to.
 
 A file holding private keys — the domains file with inline `keys:`, or any `key_file` — must additionally not be world-readable. Group-readable is allowed with a warning, so a container secret mounted root-owned and readable by the runtime group works. In the published image the server runs as uid 65532, so a Docker or compose secret needs a `uid:`/`gid:`/`mode:` that lets that user read it; `mode: 0640` with a matching group is the usual answer.
@@ -221,6 +240,8 @@ SOPS_MCP_DOMAINS='{"version":1,"domains":{"archive":{"recipients":["age1archive.
 YAML works too; JSON is simply the form that survives environments where
 a multi-line value is inconvenient, and it parses because YAML is a
 superset of JSON.
+
+`version` here is the [document schema version](#what-version-means), not a key version — the same field as in the file form.
 
 A domain defined here **may not set `keys` or `key_file`** and the server
 refuses to start if one does. An environment variable is visible to
@@ -319,6 +340,7 @@ Secret values are AES-256-GCM encrypted. The `_meta_unencrypted` block is stored
 Every `sops` call this server makes is pinned to an empty `--config`, so a `.sops.yaml` in the directory the server was started from cannot change how files are encrypted. Recipients come from the domain, and nothing else.
 
 The `sops:` block above is abridged. A real file also carries `lastmodified`, a `mac`, a `version`, and empty lists for the master-key types this server does not use (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). The MAC covers unencrypted values too, so an edited `_meta_unencrypted` block fails to decrypt. If any of those other key lists is non-empty, this server refuses to mutate the file — it encrypts to age alone and would otherwise drop that key holder silently.
+
 
 ## Why these tools and not others
 

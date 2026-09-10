@@ -44,6 +44,20 @@ v1 environment variables become a domain called `default`.
   key variable stripped and `HOME` / `XDG_CONFIG_HOME` pointed at an empty
   directory.
 
+### Documentation
+
+- **Explained what `version:` means in a domains document.** It appeared
+  only as a bare `version: 1` line in the examples, with nothing saying
+  what it versioned. In a block named `domains` that holds recipients and
+  keys, and alongside a `sops_rekey` tool, the natural reading is "version
+  of this key set" -- and acting on that guess by bumping it during a
+  recipient rotation stops the server dead, because a domain config error
+  is fatal at startup. The README now states that it is the schema version
+  of the configuration document, that rotating recipients does not change
+  it, that it is optional, and that the `version` in a file's
+  `_meta_unencrypted` block is an unrelated number. The startup error says
+  the same thing, since that is where anyone who guessed wrong ends up.
+
 ### Added
 
 - `SOPS_MCP_DOMAINS` — the same domains document inline, as YAML or
