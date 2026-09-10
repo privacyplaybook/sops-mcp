@@ -18,17 +18,12 @@ Two goals drive the design:
 
 The age private key lives in exactly one place: your CI/CD secrets store. Everywhere else — your laptop, your git remote, your container images — sees only ciphertext. See the [worked example](#example-integrating-with-a-cicd-deployment-pipeline) below.
 
-**2. Let an AI coding agent generate secrets it can never read.** Claude (or any MCP client) can create passwords, rotate them, derive hashes, rename and delete them — but plaintext values never cross the MCP boundary back to the model. The server holds the encryption key; the client only submits requests and receives metadata. There is deliberately no "decrypt this one secret" tool. If a prompt injection or a misbehaving agent tried to exfiltrate a secret via tool output, there is no tool output to exfiltrate.
+**2. Let an AI coding agent generate secrets it can never read.** Claude (or any MCP client) can create passwords, rotate them, derive hashes, rename and delete them — but plaintext values never cross the MCP boundary back to the model. 
+The server holds the encryption key; the client only submits requests and receives metadata. 
+There is deliberately no "decrypt this one secret" tool. 
+This prevents a prompt injection or a misbehaving agent from exfiltrating a secret.
 
 The simplest setup uses a single age recipient (the one CI private key). If you need several — a CI key plus an operator's key, or separate key sets for separate parties — see [Key domains](#key-domains).
-
-## Design
-
-Three ideas shape the tool surface:
-
-1. **No plaintext crosses the MCP boundary.** Generated secret values are never returned to the client. There is deliberately no "decrypt this one key" tool. If you need plaintext, run `sops decrypt` yourself with the age private key.
-2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values by default, so a tampered block fails to decrypt. Files that switch that off with `mac_only_encrypted` are refused. Tools that read the block *without* a key still cannot check the MAC, which is why recipients are verified separately.
-3. **No in-place value update for generated or derived secrets.** Those change only via rotation — the mutation model is deliberate, not accidental. External secrets (e.g. an upstream API key the user controls) can be updated with `sops_update_external`.
 
 ## Secret sources
 
@@ -37,6 +32,15 @@ Every secret is one of three sources, recorded in `_meta_unencrypted`:
 - **`generated`** — Cryptographically random values (Python `secrets` / OS CSPRNG). You specify length and charset; the server stores both so it can regenerate on rotation.
 - **`external`** — User-provided values encrypted as-is (SMTP credentials, third-party API keys, etc.). Preserved across rotation. Updated via `sops_update_external`.
 - **`derived`** — Computed from another key in the same file via a named transform. When the source is rotated (or an external source is updated), the derived value is automatically recomputed in topological order. Useful for things like Authelia's PBKDF2 hashes of OIDC client secrets.
+
+## Design
+
+Three ideas shape the tool surface:
+
+1. **No plaintext crosses the MCP boundary.** Generated secret values are never returned to the client. There is deliberately no "decrypt this one key" tool. If you need plaintext, run `sops decrypt` yourself with the age private key.
+2. **Metadata in plaintext.** A `_meta_unencrypted` block sits alongside the encrypted values (using SOPS's `unencrypted_suffix` feature) and records each secret's source, how it was generated, when it was last rotated, and which [key domain](#key-domains) it belongs to. This lets the server list and rotate secrets without decrypting. SOPS's MAC covers these values by default, so a tampered block fails to decrypt. Files that switch that off with `mac_only_encrypted` are refused. Tools that read the block *without* a key still cannot check the MAC, which is why recipients are verified separately.
+3. **No in-place value update for `generated` or `derived` secrets.** Those change only via rotation where neither the server nor the caller having access to the plaintext. `External` secrets (e.g. an upstream API key the user controls) can be updated with `sops_update_external`.
+
 
 ### Transforms (for `derived` secrets)
 
