@@ -51,6 +51,15 @@ Changelog = "https://github.com/privacyplaybook/sops-mcp/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    # Pinned exactly, matching how this file already pins ruff. A ceiling
+    # alone still floats: `mypy<2.4` resolves to whatever is newest below it,
+    # and a mypy minor tightens inference, so CI could go red on a commit
+    # that changed nothing — in a job that now gates merges. Bump on purpose
+    # and read the release notes.
+    "mypy==2.3.1",
+    # Without these, mypy reports "library stubs not installed for yaml" and
+    # silently treats every yaml call as Any.
+    "types-PyYAML",
     "ruff==0.16.6",
 ]
 
@@ -142,3 +151,23 @@ ignore = [
     "PLR2004",  # magic values are fine in assertions
     "PLC0415",  # local imports keep some tests self-contained
 ]
+
+[tool.mypy]
+python_version = "3.11"
+show_error_codes = true
+warn_unused_ignores = true
+
+# NOT `strict = true`, and that is a deliberate first step rather than the
+# destination. This package had never been type-checked; strict reports 24
+# errors against 9 files, 17 of them bare `dict` generics and 2 from the mcp
+# package shipping untyped decorators. Default mode reports zero once the
+# yaml stubs are installed, so it can gate merges TODAY.
+#
+# python_version is pinned at the floor, so every leg of the CI matrix
+# (3.11-3.14) analyses 3.11 semantics — a 3.12-only branch is invisible to
+# all four. What still differs per leg is dependency and stub resolution.
+# Raise this when the floor rises.
+#
+# Getting to strict is worth doing and is its own change — mostly
+# parameterising `dict` and annotating three helpers. The sibling repo
+# docker-ro-mcp runs strict and is the shape to copy.
