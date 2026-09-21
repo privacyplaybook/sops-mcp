@@ -49,5 +49,15 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/
 
+      # This package had never been type-checked. Adding the step found one
+      # real defect — a derived-secret entry with no `from` reached
+      # new_data[None] — which nothing else would have caught: ruff cannot
+      # see it and no test exercises a malformed derivation.
+      #
+      # Config and the reason it is not `strict = true` yet: [tool.mypy] in
+      # pyproject.toml.
+      - name: Type check
+        run: mypy src/
+
       - name: Test
         run: pytest tests/ -v

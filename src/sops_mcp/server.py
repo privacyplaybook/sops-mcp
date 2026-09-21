@@ -1688,6 +1688,15 @@ class SopsMcpServer:
                 continue
             derivation = entry.get("derivation") or {}
             src = derivation.get("from")
+            # `src` is None when a derived entry has no `from`. The old guard
+            # was `if src in changed`, which happened to exclude None only
+            # because `changed` holds secret names and never contains it —
+            # an accident, not a statement. A malformed entry would otherwise
+            # reach new_data[None] and raise KeyError from inside the rotate.
+            if not isinstance(src, str):
+                raise ValueError(
+                    f"Derived secret {k!r} has no 'from' in its derivation"
+                )
             if src in changed:
                 transform = derivation.get("transform")
                 if not transform:
