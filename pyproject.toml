@@ -51,9 +51,12 @@ Changelog = "https://github.com/privacyplaybook/sops-mcp/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
-    # Ceiling is deliberate: a mypy minor tightens inference and can fail a
-    # commit that changed nothing. Raise it on purpose.
-    "mypy<2.4",
+    # Pinned exactly, matching how this file already pins ruff. A ceiling
+    # alone still floats: `mypy<2.4` resolves to whatever is newest below it,
+    # and a mypy minor tightens inference, so CI could go red on a commit
+    # that changed nothing — in a job that now gates merges. Bump on purpose
+    # and read the release notes.
+    "mypy==2.3.1",
     # Without these, mypy reports "library stubs not installed for yaml" and
     # silently treats every yaml call as Any.
     "types-PyYAML",
