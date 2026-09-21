@@ -49,12 +49,14 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/
 
-      # This package had never been type-checked. Adding the step found one
-      # real defect — a derived-secret entry with no `from` reached
-      # new_data[None] — which nothing else would have caught: ruff cannot
-      # see it and no test exercises a malformed derivation.
+      # This package had never been type-checked — no [tool.mypy], no mypy in
+      # the dev extra, no step. That is the whole reason for this job: it
+      # gates what gets written from here on, in a repo that handles secrets.
       #
-      # Config and the reason it is not `strict = true` yet: [tool.mypy] in
+      # It found no live defect when it was switched on. The one type error it
+      # reported was already defended upstream by topological_order().
+      #
+      # Config, and why it is not `strict = true` yet: [tool.mypy] in
       # pyproject.toml.
       - name: Type check
         run: mypy src/

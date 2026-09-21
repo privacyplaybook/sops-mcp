@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from mcp.server import Server
@@ -1687,16 +1687,12 @@ class SopsMcpServer:
             if not isinstance(entry, dict) or entry.get("source") != "derived":
                 continue
             derivation = entry.get("derivation") or {}
-            src = derivation.get("from")
-            # `src` is None when a derived entry has no `from`. The old guard
-            # was `if src in changed`, which happened to exclude None only
-            # because `changed` holds secret names and never contains it —
-            # an accident, not a statement. A malformed entry would otherwise
-            # reach new_data[None] and raise KeyError from inside the rotate.
-            if not isinstance(src, str):
-                raise ValueError(
-                    f"Derived secret {k!r} has no 'from' in its derivation"
-                )
+            # topological_order() above has already raised for any derived
+            # entry whose `from` is missing, None or empty, so by here it is
+            # a str. Stated with a cast rather than re-checked: a second
+            # runtime guard would be unreachable, and would read as live
+            # error-handling to the next person.
+            src = cast(str, derivation.get("from"))
             if src in changed:
                 transform = derivation.get("transform")
                 if not transform:
