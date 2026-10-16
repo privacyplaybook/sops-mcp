@@ -1,10 +1,11 @@
 """MCP server for SOPS-encrypted secrets management."""
 
 import asyncio
+import json
 import logging
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -33,8 +34,10 @@ from .secrets_derive import (
 )
 from .secrets_generator import CHARSETS, generate_secret
 from .sops import (
+    K8S_ENCRYPTED_REGEX,
     SopsEncryptor,
     SopsError,
+    encryption_mode_features,
     recipients_of,
     unsupported_key_features,
 )
@@ -53,6 +56,151 @@ def _validate_key_name(name: str) -> None:
             f"Invalid key name {name!r}. "
             "Must match ^[A-Z][A-Z0-9_]*$ (e.g. DB_PASSWORD)"
         )
+
+
+# --- Kubernetes Secret manifests -----------------------------------------
+
+# The annotation that carries what a flat file keeps in _meta_unencrypted.
+# It cannot go at the root: kubectl's default --validate=strict rejects an
+# unknown root field once the manifest is decrypted. It holds the domain
+# and per-secret source/generation/derivation, never a value.
+K8S_META_ANNOTATION = "sops-mcp.privacyplaybook.com/meta"
+
+# Kubernetes' own rules (apimachinery validation), so a manifest this
+# server returns is one the API server accepts.
+_K8S_SECRET_KEY = re.compile(r"^[-._a-zA-Z0-9]+$")
+_DNS_SUBDOMAIN_MAX = 253
+_DNS_LABEL_MAX = 63
+_DNS_LABEL = r"[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+_DNS_SUBDOMAIN = re.compile(rf"^{_DNS_LABEL}(\.{_DNS_LABEL})*$")
+_DNS_LABEL_RE = re.compile(rf"^{_DNS_LABEL}$")
+_QUALIFIED_NAME_PART = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
+_SECRET_TYPE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_./]*[A-Za-z0-9])?$")
+
+# Keys K8S_ENCRYPTED_REGEX matches. sops applies the regex at every depth,
+# so a label or annotation with one of these keys would be encrypted, and
+# the manifest's metadata would no longer be readable before decryption.
+_K8S_ENCRYPTED_KEYS = re.compile(K8S_ENCRYPTED_REGEX)
+
+
+def _validate_k8s_key_name(name: str) -> None:
+    """A Secret data key: what Kubernetes accepts, not the env-var rule.
+
+    Typed Secrets need keys like ``tls.crt`` or ``.dockerconfigjson``, which
+    ``^[A-Z][A-Z0-9_]*$`` would refuse.
+    """
+    if (
+        not isinstance(name, str)
+        or len(name) > _DNS_SUBDOMAIN_MAX
+        or not _K8S_SECRET_KEY.match(name)
+        or name in {".", ".."}
+        or name.startswith("..")
+    ):
+        raise ValueError(
+            f"Invalid Secret key {name!r}. Kubernetes requires at most 253 "
+            "characters from [-._a-zA-Z0-9], not '.' or '..', and not "
+            "starting with '..' (e.g. DB_PASSWORD, tls.crt)."
+        )
+
+
+def _validate_dns_subdomain(value: Any, what: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > _DNS_SUBDOMAIN_MAX
+        or not _DNS_SUBDOMAIN.match(value)
+    ):
+        raise ValueError(
+            f"Invalid {what} {value!r}: must be a lowercase RFC 1123 DNS "
+            "subdomain (letters, digits, '-' and '.', at most 253 "
+            "characters, starting and ending with a letter or digit)."
+        )
+    return value
+
+
+def _validate_qualified_name(key: Any, what: str) -> str:
+    """A label or annotation key: an optional DNS-subdomain prefix and '/'."""
+    if not isinstance(key, str) or not key:
+        raise ValueError(f"Invalid {what} key {key!r}: must be a non-empty string.")
+    prefix, _, name = key.rpartition("/")
+    if "/" in key and not prefix:
+        raise ValueError(f"Invalid {what} key {key!r}: empty prefix before '/'.")
+    if prefix:
+        _validate_dns_subdomain(prefix, f"{what} key prefix")
+    if len(name) > _DNS_LABEL_MAX or not _QUALIFIED_NAME_PART.match(name):
+        raise ValueError(
+            f"Invalid {what} key {key!r}: the name part must be at most 63 "
+            "characters from [-A-Za-z0-9_.], starting and ending with a "
+            "letter or digit."
+        )
+    if _K8S_ENCRYPTED_KEYS.match(key):
+        raise ValueError(
+            f"{what.capitalize()} key {key!r} is not allowed: sops would "
+            "encrypt it along with the secret values, so the manifest's "
+            "metadata would no longer be readable without decrypting it."
+        )
+    return key
+
+
+def _validate_string_map(value: Any, what: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"'{what}s' must be an object of string values.")
+    for key, item in value.items():
+        _validate_qualified_name(key, what)
+        if not isinstance(item, str):
+            raise ValueError(
+                f"{what.capitalize()} {key!r} must have a string value."
+            )
+    return dict(value)
+
+
+def _validate_labels(value: Any) -> dict[str, str]:
+    labels = _validate_string_map(value, "label")
+    for key, item in labels.items():
+        too_long = len(item) > _DNS_LABEL_MAX
+        if item and (too_long or not _QUALIFIED_NAME_PART.match(item)):
+            raise ValueError(
+                f"Invalid value for label {key!r}: at most 63 characters "
+                "from [-A-Za-z0-9_.], starting and ending with a letter or "
+                "digit, or empty."
+            )
+    return labels
+
+
+def _is_k8s_secret_manifest(parsed: Any) -> bool:
+    """A manifest sops_create_k8s_secret wrote, judged without decrypting."""
+    if not isinstance(parsed, dict):
+        return False
+    envelope = parsed.get("sops")
+    return (
+        isinstance(envelope, dict)
+        and envelope.get("encrypted_regex") == K8S_ENCRYPTED_REGEX
+        and parsed.get("apiVersion") == "v1"
+        and parsed.get("kind") == "Secret"
+    )
+
+
+def _k8s_meta(parsed: dict) -> dict:
+    """The metadata block a manifest carries in its annotation, or {}.
+
+    Like _meta_unencrypted it is a hint, never an authority: a malformed
+    annotation reads as no metadata rather than as an error.
+    """
+    metadata = parsed.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    annotations = metadata.get("annotations")
+    if not isinstance(annotations, dict):
+        return {}
+    raw = annotations.get(K8S_META_ANNOTATION)
+    if not isinstance(raw, str):
+        return {}
+    try:
+        meta = json.loads(raw)
+    except ValueError:
+        return {}
+    return meta if isinstance(meta, dict) else {}
 
 
 SECRET_ITEM_SCHEMA: dict[str, Any] = {
@@ -120,13 +268,32 @@ SECRET_ITEM_SCHEMA: dict[str, Any] = {
 }
 
 
-def _validate_secret_spec(spec: dict, known_keys: set[str]) -> None:
+K8S_SECRET_ITEM_SCHEMA: dict[str, Any] = {
+    **SECRET_ITEM_SCHEMA,
+    "properties": {
+        **SECRET_ITEM_SCHEMA["properties"],
+        "key_name": {
+            "type": "string",
+            "description": (
+                "Key under stringData (e.g. DB_PASSWORD, tls.crt). "
+                "Kubernetes' rule: [-._a-zA-Z0-9]+, at most 253 characters."
+            ),
+        },
+    },
+}
+
+
+def _validate_secret_spec(
+    spec: dict,
+    known_keys: set[str],
+    validate_key: Callable[[str], None] = _validate_key_name,
+) -> None:
     """Validate a single secret spec. `known_keys` must include all keys that
     will exist in the final file (existing + newly added in this batch), so
     derived `from` references can be resolved."""
     key_name = spec["key_name"]
     source = spec["source"]
-    _validate_key_name(key_name)
+    validate_key(key_name)
     if source not in VALID_SOURCES:
         raise ValueError(
             f"Invalid source {source!r} for {key_name}. "
@@ -210,6 +377,7 @@ def _process_batch(
     existing_values: dict[str, str],
     existing_meta: dict[str, dict],
     now: str,
+    validate_key: Callable[[str], None] = _validate_key_name,
 ) -> tuple[dict[str, str], dict[str, dict], list[str], list[str]]:
     """Process a batch of new secret specs.
 
@@ -224,7 +392,7 @@ def _process_batch(
     known_keys = set(existing_values.keys()) | new_keys
 
     for spec in specs:
-        _validate_secret_spec(spec, known_keys)
+        _validate_secret_spec(spec, known_keys, validate_key)
 
     spec_by_key = {s["key_name"]: s for s in specs}
 
@@ -376,6 +544,25 @@ class SopsMcpServer:
         downgrades — the same failure the recipient check exists to
         prevent. Use the sops CLI for those files.
         """
+        modes = encryption_mode_features(content)
+        if modes:
+            if _is_k8s_secret_manifest(yaml.safe_load(content)):
+                raise ValueError(
+                    "This is a Kubernetes Secret manifest made by "
+                    "sops_create_k8s_secret. Those files are create-only: "
+                    "no tool changes them in place, because re-encrypting "
+                    "would encrypt the manifest's apiVersion, kind and "
+                    "metadata. To change or rotate anything, create the "
+                    "whole manifest again with sops_create_k8s_secret, "
+                    "supplying any external values again."
+                )
+            raise ValueError(
+                f"File chooses which values sops encrypts "
+                f"({', '.join(modes)}). This server re-encrypts with "
+                "--unencrypted-suffix _unencrypted, which would change "
+                "which values are left in the clear. Manage it with the "
+                "sops CLI instead."
+            )
         features = unsupported_key_features(content)
         if features:
             raise ValueError(
@@ -385,6 +572,19 @@ class SopsMcpServer:
                 "collapse a Shamir threshold, silently weakening the file. "
                 "Manage it with the sops CLI instead."
             )
+
+    def _reject_early(self, content: str, parsed: dict) -> None:
+        """Run the envelope refusals before any tool-specific check.
+
+        _check_recipients runs them again before re-encrypting; this copy
+        exists so that a file no mutation may touch gets that answer,
+        rather than a misleading one about its keys (a Kubernetes manifest
+        has no root-level secrets, so "key not found" would come first).
+        Content with no sops block is left to the later checks, which
+        already report it.
+        """
+        if isinstance(parsed.get("sops"), dict):
+            self._reject_unsupported_key_features(content)
 
     def _check_recipients(self, content: str, domain: Domain) -> None:
         """Refuse to re-encrypt a file onto a different recipient set.
@@ -701,6 +901,72 @@ class SopsMcpServer:
                     },
                 ),
                 Tool(
+                    name="sops_create_k8s_secret",
+                    description=(
+                        "Create a Kubernetes Secret manifest (apiVersion v1, "
+                        "kind Secret) with its values under stringData, "
+                        "SOPS-encrypted so that only data/stringData is "
+                        "ciphertext and apiVersion, kind, metadata and type "
+                        "stay readable. The result decrypts with sops -d, "
+                        "ksops or Flux straight into an applyable manifest; "
+                        "commit it exactly as returned. Secrets take the "
+                        "same sources as sops_create_secrets. The file is "
+                        "create-only: every other mutation tool refuses it, "
+                        "so to change or rotate anything, call this tool "
+                        "again with the full set. Metadata (domain, sources, "
+                        "generation parameters, never a value) goes in the "
+                        f"{K8S_META_ANNOTATION} annotation."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": (
+                                    "metadata.name: a lowercase RFC 1123 "
+                                    "DNS subdomain"
+                                ),
+                            },
+                            "namespace": {
+                                "type": "string",
+                                "description": (
+                                    "metadata.namespace (optional): a "
+                                    "lowercase RFC 1123 DNS label"
+                                ),
+                            },
+                            "labels": {
+                                "type": "object",
+                                "additionalProperties": {"type": "string"},
+                                "description": "metadata.labels (optional)",
+                            },
+                            "annotations": {
+                                "type": "object",
+                                "additionalProperties": {"type": "string"},
+                                "description": (
+                                    "metadata.annotations (optional). "
+                                    f"{K8S_META_ANNOTATION} is reserved."
+                                ),
+                            },
+                            "type": {
+                                "type": "string",
+                                "default": "Opaque",
+                                "description": (
+                                    "Secret type, e.g. Opaque or "
+                                    "kubernetes.io/tls"
+                                ),
+                            },
+                            "secrets": {
+                                "type": "array",
+                                "description": (
+                                    "Secrets to place under stringData"
+                                ),
+                                "items": K8S_SECRET_ITEM_SCHEMA,
+                            },
+                        },
+                        "required": ["name", "secrets"],
+                    },
+                ),
+                Tool(
                     name="sops_list_domains",
                     description=(
                         "List the key domains this server is configured "
@@ -783,6 +1049,8 @@ class SopsMcpServer:
                     return await self._update_external(arguments)
                 if name == "sops_create_oidc_secret":
                     return await self._create_oidc_secret(arguments)
+                if name == "sops_create_k8s_secret":
+                    return await self._create_k8s_secret(arguments)
                 if name == "sops_list_domains":
                     return await self._list_domains(arguments)
                 if name == "sops_rekey":
@@ -843,6 +1111,116 @@ class SopsMcpServer:
             )
         return responses
 
+    async def _create_k8s_secret(
+        self, arguments: dict[str, Any]
+    ) -> Sequence[TextContent]:
+        """Create a Kubernetes Secret manifest, encrypted under stringData.
+
+        Everything the manifest carries in the clear is an argument,
+        because the MAC covers plaintext too: nothing can be edited after
+        the fact without breaking decryption.
+        """
+        name = _validate_dns_subdomain(arguments.get("name"), "Secret name")
+        namespace = arguments.get("namespace")
+        if namespace not in (None, "") and (
+            not isinstance(namespace, str)
+            or len(namespace) > _DNS_LABEL_MAX
+            or not _DNS_LABEL_RE.match(namespace)
+        ):
+            raise ValueError(
+                f"Invalid namespace {namespace!r}: must be a lowercase "
+                "RFC 1123 DNS label (letters, digits and '-', at most 63 "
+                "characters)."
+            )
+        labels = _validate_labels(arguments.get("labels"))
+        annotations = _validate_string_map(
+            arguments.get("annotations"), "annotation"
+        )
+        if K8S_META_ANNOTATION in annotations:
+            raise ValueError(
+                f"Annotation {K8S_META_ANNOTATION!r} is reserved: this tool "
+                "writes the file's metadata there."
+            )
+        secret_type = arguments.get("type") or "Opaque"
+        if (
+            not isinstance(secret_type, str)
+            or len(secret_type) > _DNS_SUBDOMAIN_MAX
+            or not _SECRET_TYPE.match(secret_type)
+        ):
+            raise ValueError(f"Invalid Secret type {secret_type!r}.")
+
+        secrets_list = arguments.get("secrets", [])
+        if not secrets_list:
+            raise ValueError("No secrets provided")
+        key_names = [spec["key_name"] for spec in secrets_list]
+        duplicates = sorted({k for k in key_names if key_names.count(k) > 1})
+        if duplicates:
+            raise ValueError(
+                f"Duplicate key names: {', '.join(map(str, duplicates))}"
+            )
+
+        domain = self._resolve_domain(arguments)
+
+        now = datetime.now(UTC).isoformat()
+        resolved, meta_secrets, summary, derived_plaintexts = _process_batch(
+            secrets_list,
+            existing_values={},
+            existing_meta={},
+            now=now,
+            validate_key=_validate_k8s_key_name,
+        )
+
+        metadata: dict[str, Any] = {"name": name}
+        if namespace:
+            metadata["namespace"] = namespace
+        if labels:
+            metadata["labels"] = labels
+        metadata["annotations"] = {
+            **annotations,
+            K8S_META_ANNOTATION: json.dumps(
+                self._meta_block(meta_secrets, domain),
+                separators=(",", ":"),
+            ),
+        }
+        manifest: dict[str, Any] = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": metadata,
+            "type": secret_type,
+            "stringData": {key: resolved[key] for key in key_names},
+        }
+
+        encrypted_yaml = self.encryptor.encrypt(
+            manifest, domain, encrypted_regex=K8S_ENCRYPTED_REGEX
+        )
+
+        where = f"{namespace}/{name}" if namespace else name
+        summary_lines = [
+            f"Created Kubernetes Secret {where} (type: {secret_type}):",
+            *summary,
+            (
+                "Commit it exactly as returned. It is create-only: to change "
+                "anything, call sops_create_k8s_secret again with every "
+                "secret."
+            ),
+        ]
+        responses = [
+            TextContent(type="text", text=encrypted_yaml),
+            TextContent(type="text", text="\n".join(summary_lines)),
+        ]
+        if derived_plaintexts:
+            responses.append(
+                TextContent(
+                    type="text",
+                    text=(
+                        "Derived plaintexts (copy these into your "
+                        "application config if needed):\n"
+                        + "\n".join(derived_plaintexts)
+                    ),
+                )
+            )
+        return responses
+
     async def _list_secrets(
         self, arguments: dict[str, Any]
     ) -> Sequence[TextContent]:
@@ -854,20 +1232,50 @@ class SopsMcpServer:
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
 
-        meta = parsed.get("_meta_unencrypted", {})
+        k8s = _is_k8s_secret_manifest(parsed)
+        lines: list[str] = []
+        if k8s:
+            meta: Any = _k8s_meta(parsed)
+            secret_keys = [
+                str(k)
+                for field in ("stringData", "data")
+                if isinstance(parsed.get(field), dict)
+                for k in parsed[field]
+            ]
+            metadata = parsed.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            where = (
+                f"{metadata['namespace']}/" if metadata.get("namespace") else ""
+            ) + str(metadata.get("name", "?"))
+            lines.extend([
+                (
+                    f"Kubernetes Secret {where} "
+                    f"(type: {parsed.get('type', 'Opaque')})"
+                ),
+                (
+                    "Create-only: to change or rotate anything, create it "
+                    "again with sops_create_k8s_secret."
+                ),
+                "",
+            ])
+        else:
+            meta = parsed.get("_meta_unencrypted", {})
+            secret_keys = [
+                k for k in parsed
+                if k != "sops" and not k.startswith("_")
+            ]
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
+        if not isinstance(meta_secrets, dict):
+            meta_secrets = {}
 
-        secret_keys = [
-            k for k in parsed
-            if k != "sops" and not k.startswith("_")
-        ]
-
-        lines = ["Secrets in file:"]
+        lines.append("Secrets in file:")
         lines.append(f"{'Key':<30} {'Source':<12} {'Description'}")
         lines.append("-" * 70)
 
         for key in secret_keys:
             info = meta_secrets.get(key, {})
+            if not isinstance(info, dict):
+                info = {}
             source = info.get("source", "unknown")
             desc = info.get("description", "")
             lines.append(f"{key:<30} {source:<12} {desc}")
@@ -880,12 +1288,19 @@ class SopsMcpServer:
             # Validate it so an unknown name is an error rather than a
             # confusing report about some other domain.
             self._resolve_domain(arguments)
-        lines.extend(self._domain_report(content, meta, requested or None))
+        lines.extend(
+            self._domain_report(content, meta, requested or None, k8s=k8s)
+        )
 
         return [TextContent(type="text", text="\n".join(lines))]
 
     def _domain_report(
-        self, content: str, meta: Any, requested: str | None = None
+        self,
+        content: str,
+        meta: Any,
+        requested: str | None = None,
+        *,
+        k8s: bool = False,
     ) -> list[str]:
         """Describe a file's domain binding for sops_list_secrets.
 
@@ -908,6 +1323,12 @@ class SopsMcpServer:
             return ["", "Domain: (file has no readable sops metadata block)"]
 
         lines = ["", f"Recipients: {len(actual)}"]
+        if k8s and set(unsupported) == {"encrypted_regex"}:
+            # Ours, and refused by every mutation on purpose (create-only),
+            # not because of an access rule the server cannot reproduce.
+            # The recipient comparison below still tells the reader whether
+            # the domain has moved on since the manifest was made.
+            unsupported = ()
         if unsupported:
             lines.append(
                 f"  WARNING: this file uses {', '.join(unsupported)}, which "
@@ -943,6 +1364,13 @@ class SopsMcpServer:
             lines.append(
                 f"  WARNING: domain '{name}' is not configured on this "
                 f"server. Configured: {self._domain_names()}."
+            )
+        elif set(domain.recipients) != set(actual) and k8s:
+            lines.append(
+                f"  WARNING: the file's recipients do not match domain "
+                f"'{name}' ({len(domain.recipients)} configured). Create the "
+                "manifest again with sops_create_k8s_secret to move it onto "
+                "the current list."
             )
         elif set(domain.recipients) != set(actual):
             lines.append(
@@ -998,6 +1426,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         domain = self._resolve_domain(arguments)
         # Rekey is exempt from the recipient check — changing the recipient
@@ -1125,6 +1554,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
@@ -1246,6 +1676,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
@@ -1325,6 +1756,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         if "_meta_unencrypted" in parsed:
             raise ValueError(
@@ -1488,6 +1920,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         existing_keys = {
             k for k in parsed if k != "sops" and not k.startswith("_")
@@ -1561,6 +1994,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         existing_keys = {
             k for k in parsed if k != "sops" and not k.startswith("_")
@@ -1642,6 +2076,7 @@ class SopsMcpServer:
         parsed = yaml.safe_load(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
+        self._reject_early(content, parsed)
 
         existing_keys = {
             k for k in parsed if k != "sops" and not k.startswith("_")

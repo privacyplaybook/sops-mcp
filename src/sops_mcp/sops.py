@@ -85,6 +85,31 @@ _NON_AGE_KEY_GROUPS = ("pgp", "kms", "gcp_kms", "azure_kv", "hc_vault")
 # decides whether a value may be overwritten in place.
 _UNSUPPORTED_FLAGS = ("key_groups", "shamir_threshold", "mac_only_encrypted")
 
+# The suffix every flat file this server writes is encrypted with: keys
+# ending in it (the `_meta_unencrypted` block) stay plaintext, and every
+# other value is encrypted.
+UNENCRYPTED_SUFFIX = "_unencrypted"
+
+# What `sops_create_k8s_secret` encrypts with: only the `data` and
+# `stringData` subtrees, so `apiVersion`, `kind`, `metadata` and `type`
+# stay readable to kubectl and to a reviewer.
+K8S_ENCRYPTED_REGEX = "^(data|stringData)$"
+
+# Envelope keys that choose *which* values sops encrypts. The flat-file
+# mutation path always re-encrypts with `--unencrypted-suffix _unencrypted`,
+# so a file written under any of these would come back with a different set
+# of values in the clear: a Kubernetes manifest would get `kind:` and
+# `metadata:` encrypted, and a file that kept some value plaintext on
+# purpose would lose that. sops records each of them in the envelope, which
+# is what lets a file be recognised without decrypting it.
+_ENCRYPTION_MODE_KEYS = (
+    "encrypted_regex",
+    "unencrypted_regex",
+    "encrypted_suffix",
+    "encrypted_comment_regex",
+    "unencrypted_comment_regex",
+)
+
 
 def _envelope_of(encrypted_content: str) -> dict:
     """Return the `sops` metadata block, or raise if it isn't there."""
@@ -105,6 +130,26 @@ def _envelope_of(encrypted_content: str) -> dict:
     return envelope
 
 
+def encryption_mode_features(encrypted_content: str) -> tuple[str, ...]:
+    """Envelope settings that encrypt a different set of values than ours.
+
+    Returns the names of every encryption-mode key the envelope sets,
+    plus ``unencrypted_suffix`` when it is set to anything but
+    ``_unencrypted``. A file this server wrote in flat form returns an
+    empty tuple; one from ``sops_create_k8s_secret`` returns
+    ``("encrypted_regex",)``.
+    """
+    return _encryption_mode_features(_envelope_of(encrypted_content))
+
+
+def _encryption_mode_features(envelope: dict) -> tuple[str, ...]:
+    found = [key for key in _ENCRYPTION_MODE_KEYS if envelope.get(key)]
+    suffix = envelope.get("unencrypted_suffix")
+    if suffix and suffix != UNENCRYPTED_SUFFIX:
+        found.append("unencrypted_suffix")
+    return tuple(found)
+
+
 def unsupported_key_features(encrypted_content: str) -> tuple[str, ...]:
     """Envelope features this server cannot reproduce when re-encrypting.
 
@@ -114,7 +159,9 @@ def unsupported_key_features(encrypted_content: str) -> tuple[str, ...]:
     Shamir threshold flattened into a list any single holder can open. It
     also refuses files whose metadata is unauthenticated, since the
     recorded domain and each secret's source are only trustworthy while
-    the MAC covers them.
+    the MAC covers them, and files encrypted under a different encryption
+    mode (:func:`encryption_mode_features`), since re-encrypting would
+    change which values are in the clear.
 
     A normal age file lists the other master-key groups empty and carries
     none of these flags, so this returns an empty tuple for it.
@@ -125,6 +172,7 @@ def unsupported_key_features(encrypted_content: str) -> tuple[str, ...]:
     # present rather than waved through on a type check.
     found = [group for group in _NON_AGE_KEY_GROUPS if envelope.get(group)]
     found.extend(flag for flag in _UNSUPPORTED_FLAGS if envelope.get(flag))
+    found.extend(_encryption_mode_features(envelope))
     return tuple(found)
 
 
@@ -193,20 +241,36 @@ class SopsEncryptor:
             env["SOPS_AGE_KEY"] = "\n".join(domain.keys)
         return env
 
-    def encrypt(self, data: dict, domain: Domain) -> str:
+    def encrypt(
+        self,
+        data: dict,
+        domain: Domain,
+        *,
+        encrypted_regex: str | None = None,
+    ) -> str:
         """Encrypt a dict as SOPS YAML, returning the encrypted content.
 
-        Keys ending with '_unencrypted' are left in plaintext by sops.
+        By default keys ending with '_unencrypted' are left in plaintext by
+        sops and every other value is encrypted.
 
         Args:
             data: Dict of key-value pairs to encrypt. May include a
                   '_meta_unencrypted' key that will be stored in plaintext.
             domain: The domain whose recipients the content is encrypted to.
+            encrypted_regex: Encrypt only the subtrees under keys matching
+                  this regex, and leave everything else plaintext, instead
+                  of the suffix rule. sops records it in the envelope.
 
         Returns:
             SOPS-encrypted YAML string.
         """
         plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
+        # sops refuses more than one encryption-mode flag, so exactly one.
+        mode = (
+            ["--encrypted-regex", encrypted_regex]
+            if encrypted_regex is not None
+            else ["--unencrypted-suffix", UNENCRYPTED_SUFFIX]
+        )
         tmpdir = _make_secure_tempdir()
         tmpfile = os.path.join(tmpdir, "secrets.yaml")
         scratch_home = os.path.join(tmpdir, "home")
@@ -224,7 +288,7 @@ class SopsEncryptor:
                     "--config", empty_config,
                     "encrypt",
                     "--age", domain.age_argument,
-                    "--unencrypted-suffix", "_unencrypted",
+                    *mode,
                     "--input-type", "yaml",
                     "--output-type", "yaml",
                     tmpfile,
