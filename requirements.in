@@ -1,4 +1,5 @@
 cryptography>=42.0
 mcp>=1.23.0,<2.0.0
 python-multipart>=0.0.26
+pyjwt>=2.15.0  # GHSA-42vr-xj54-vc7v and the 2.14.0 advisories (#31); transitive via mcp
 pyyaml>=6.0
