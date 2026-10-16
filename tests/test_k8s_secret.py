@@ -453,8 +453,44 @@ async def test_hand_made_flux_secret_lists_with_the_sops_cli_warning():
         make_server(), "sops_list_secrets",
         {"encrypted_content": _fake_manifest(annotated=False)},
     )
-    assert "WARNING: this file uses encrypted_regex" in texts[0]
-    assert "sops_create_k8s_secret" not in texts[0]
+    out = texts[0]
+    assert "WARNING: this file uses encrypted_regex" in out
+    assert "Not made by sops_create_k8s_secret" in out
+    assert "Create-only" not in out
+    # Its secrets are still the keys under stringData, not the manifest's
+    # own fields.
+    listed = out.split("Secrets in file:")[1].split("Recipients:")[0]
+    assert "DB_ACCESS_KEY" in listed
+    for field in ("apiVersion", "kind", "metadata", "stringData", "type"):
+        assert field not in listed, field
+
+
+async def test_malformed_yaml_is_a_clean_error_for_mutations():
+    texts = await _call(make_server(), "sops_add_secrets", {
+        "encrypted_content": "a: [1",
+        "secrets": [{"key_name": "K", "source": "generated"}],
+    })
+    assert texts[0] == "Error: Content is not valid YAML"
+
+
+async def test_duplicates_are_reported_before_decrypting():
+    """The dummy server holds no private key, so a check that ran only
+    after decryption would answer with a decrypt error instead."""
+    flat = yaml.safe_dump({
+        "A": "ENC[AES256_GCM,data:x]",
+        "sops": {
+            "age": [{"recipient": DUMMY_RECIPIENT, "enc": "x"}],
+            "unencrypted_suffix": "_unencrypted",
+        },
+    })
+    texts = await _call(make_server(), "sops_add_secrets", {
+        "encrypted_content": flat,
+        "secrets": [
+            {"key_name": "K", "source": "generated"},
+            {"key_name": "K", "source": "generated"},
+        ],
+    })
+    assert texts[0] == "Error: Duplicate key names in one call: K"
 
 
 async def test_our_manifest_with_another_flag_reports_only_that_flag():

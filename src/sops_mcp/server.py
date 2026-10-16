@@ -5,9 +5,10 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import yaml
 from mcp.server import Server
@@ -136,7 +137,10 @@ def _validate_qualified_name(key: Any, what: str) -> str:
             "characters from [-A-Za-z0-9_.], starting and ending with a "
             "letter or digit."
         )
-    if _K8S_ENCRYPTED_KEYS.fullmatch(key):
+    # search, not fullmatch: sops applies the regex with Go's MatchString,
+    # which searches, so this agrees with sops even if the regex is ever
+    # loosened. (Newlines never reach here: the name check refuses them.)
+    if _K8S_ENCRYPTED_KEYS.search(key):
         raise ValueError(
             f"{what.capitalize()} key {key!r} is not allowed: sops would "
             "encrypt it along with the secret values, so the manifest's "
@@ -172,29 +176,38 @@ def _validate_labels(value: Any) -> dict[str, str]:
     return labels
 
 
-def _is_k8s_secret_manifest(parsed: Any) -> bool:
-    """A manifest sops_create_k8s_secret wrote, judged without decrypting.
+def _is_k8s_secret_layout(parsed: Any) -> bool:
+    """A v1 Secret encrypted under data/stringData, judged without decrypting.
 
-    The regex alone is not enough: it is the one Flux's docs recommend, so
-    a Secret someone encrypted by hand carries it too, and telling them to
-    re-create it with this tool would be wrong. Ours also carry the meta
-    annotation. This only picks the wording; both kinds are refused.
+    That is how this server's manifests are laid out, and also how Flux's
+    docs tell people to encrypt Secrets by hand. Either way the secrets are
+    the keys under data/stringData, which is what sops_list_secrets needs.
     """
     if not isinstance(parsed, dict):
         return False
     envelope = parsed.get("sops")
-    metadata = parsed.get("metadata")
-    annotations = (
-        metadata.get("annotations") if isinstance(metadata, dict) else None
-    )
     return (
         isinstance(envelope, dict)
         and envelope.get("encrypted_regex") == K8S_ENCRYPTED_REGEX
         and parsed.get("apiVersion") == "v1"
         and parsed.get("kind") == "Secret"
-        and isinstance(annotations, dict)
-        and K8S_META_ANNOTATION in annotations
     )
+
+
+def _is_k8s_secret_manifest(parsed: Any) -> bool:
+    """A manifest sops_create_k8s_secret wrote: the layout plus our annotation.
+
+    The layout alone is not enough to tell someone to re-create the file
+    with this tool, since a hand-made Flux Secret has it too. This picks
+    wording only; both kinds are refused by every mutation.
+    """
+    if not _is_k8s_secret_layout(parsed):
+        return False
+    metadata = parsed.get("metadata")
+    annotations = (
+        metadata.get("annotations") if isinstance(metadata, dict) else None
+    )
+    return isinstance(annotations, dict) and K8S_META_ANNOTATION in annotations
 
 
 def _k8s_meta(parsed: dict) -> dict:
@@ -388,6 +401,23 @@ def _compute_value(spec: dict, resolved: dict[str, str]) -> str:
     raise ValueError(f"Unknown source {source!r}")
 
 
+def _reject_duplicate_names(names: list[Any]) -> None:
+    """Refuse a batch naming one key twice.
+
+    Without this the later spec silently wins (spec_by_key in
+    _process_batch), and the caller is told nothing about the value it
+    lost. Callers that decrypt run it before decrypting too, so the answer
+    does not depend on holding a key.
+    """
+    duplicates = sorted(
+        str(name) for name, count in Counter(names).items() if count > 1
+    )
+    if duplicates:
+        raise ValueError(
+            f"Duplicate key names in one call: {', '.join(duplicates)}"
+        )
+
+
 def _process_batch(
     specs: list[dict],
     existing_values: dict[str, str],
@@ -405,13 +435,7 @@ def _process_batch(
     secret in this batch, so callers can surface them to the user.
     """
     names = [s["key_name"] for s in specs]
-    # Without this the later spec silently wins (spec_by_key below), and
-    # the caller is told nothing about the value it lost.
-    duplicates = sorted({k for k in names if names.count(k) > 1})
-    if duplicates:
-        raise ValueError(
-            f"Duplicate key names in one call: {', '.join(map(str, duplicates))}"
-        )
+    _reject_duplicate_names(names)
     new_keys = set(names)
     known_keys = set(existing_values.keys()) | new_keys
 
@@ -500,13 +524,15 @@ def _mutation_response(
     encrypted_yaml: str,
     summary_lines: list[str],
     derived_plaintexts: list[str],
-    kind: str,
+    kind: Literal["new", "changed"],
 ) -> list[TextContent]:
-    """The response every tool that returns a file sends back.
+    """The response of every tool that can produce derived values.
 
     Derived values are the one plaintext allowed across the MCP boundary,
     so they are surfaced from this one place: ``kind`` is "new" for a
-    created or added secret and "changed" for a recomputed one.
+    created or added secret and "changed" for a recomputed one. Tools that
+    never derive a value (rekey, delete, rename, add_metadata) return the
+    file and a summary without it.
     """
     responses = [
         TextContent(type="text", text=encrypted_yaml),
@@ -596,7 +622,7 @@ class SopsMcpServer:
         return domain
 
     @classmethod
-    def _reject_unsupported_key_features(cls, content: str) -> None:
+    def _reject_unsupported_content(cls, content: str) -> None:
         """:meth:`_reject_unsupported_envelope`, from the raw content."""
         try:
             parsed = yaml.safe_load(content)
@@ -657,7 +683,12 @@ class SopsMcpServer:
         before re-encrypting. Content with no sops block is left to the
         later checks, which already report it.
         """
-        parsed = yaml.safe_load(content)
+        try:
+            parsed = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            # Not echoed: a parser error quotes the offending line, and
+            # this content may be a decrypted file pasted by mistake.
+            raise ValueError("Content is not valid YAML") from exc
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
         if isinstance(parsed.get("sops"), dict):
@@ -670,7 +701,7 @@ class SopsMcpServer:
         Counts rather than lists the recipients: a wrong domain name should
         not turn this into a way to enumerate another domain's keys.
         """
-        self._reject_unsupported_key_features(content)
+        self._reject_unsupported_content(content)
         actual = set(recipients_of(content))
         expected = set(domain.recipients)
         if actual != expected:
@@ -1173,7 +1204,7 @@ class SopsMcpServer:
 
         summary_lines = ["Created secrets:", *summary]
         return _mutation_response(
-            encrypted_yaml, summary_lines, derived_plaintexts, 'new'
+            encrypted_yaml, summary_lines, derived_plaintexts, "new"
         )
 
     async def _create_k8s_secret(
@@ -1218,6 +1249,7 @@ class SopsMcpServer:
         if not secrets_list:
             raise ValueError("No secrets provided")
         key_names = [spec["key_name"] for spec in secrets_list]
+        _reject_duplicate_names(key_names)
 
         domain = self._resolve_domain(arguments)
 
@@ -1265,7 +1297,7 @@ class SopsMcpServer:
             ),
         ]
         return _mutation_response(
-            encrypted_yaml, summary_lines, derived_plaintexts, 'new'
+            encrypted_yaml, summary_lines, derived_plaintexts, "new"
         )
 
     async def _list_secrets(
@@ -1281,7 +1313,7 @@ class SopsMcpServer:
 
         k8s = _is_k8s_secret_manifest(parsed)
         lines: list[str] = []
-        if k8s:
+        if _is_k8s_secret_layout(parsed):
             meta: Any = _k8s_meta(parsed)
             secret_keys = [
                 str(k)
@@ -1294,17 +1326,18 @@ class SopsMcpServer:
             where = (
                 f"{metadata['namespace']}/" if metadata.get("namespace") else ""
             ) + str(metadata.get("name", "?"))
-            lines.extend([
-                (
-                    f"Kubernetes Secret {where} "
-                    f"(type: {parsed.get('type', 'Opaque')})"
-                ),
-                (
-                    "Create-only: to change or rotate anything, create it "
-                    "again with sops_create_k8s_secret."
-                ),
-                "",
-            ])
+            lines.append(
+                f"Kubernetes Secret {where} "
+                f"(type: {parsed.get('type', 'Opaque')})"
+            )
+            lines.append(
+                "Create-only: to change or rotate anything, create it again "
+                "with sops_create_k8s_secret."
+                if k8s
+                else "Not made by sops_create_k8s_secret: manage it with the "
+                "sops CLI."
+            )
+            lines.append("")
         else:
             meta = parsed.get("_meta_unencrypted", {})
             secret_keys = [
@@ -1692,7 +1725,7 @@ class SopsMcpServer:
             summary_lines.append(f"  Preserved: {', '.join(preserved)}")
 
         return _mutation_response(
-            encrypted_yaml, summary_lines, derived_plaintexts, 'changed'
+            encrypted_yaml, summary_lines, derived_plaintexts, "changed"
         )
 
     async def _add_secrets(
@@ -1716,6 +1749,7 @@ class SopsMcpServer:
         }
 
         new_key_names = [s["key_name"] for s in secrets_list]
+        _reject_duplicate_names(new_key_names)
         collisions = set(new_key_names) & existing_keys
         if collisions:
             raise ValueError(
@@ -1756,7 +1790,7 @@ class SopsMcpServer:
             summary_lines.append(f"Preserved: {', '.join(preserved)}")
 
         return _mutation_response(
-            encrypted_yaml, summary_lines, derived_plaintexts, 'new'
+            encrypted_yaml, summary_lines, derived_plaintexts, "new"
         )
 
     async def _add_metadata(
@@ -2162,7 +2196,7 @@ class SopsMcpServer:
             )
 
         return _mutation_response(
-            encrypted_yaml, summary_lines, derived_plaintexts, 'changed'
+            encrypted_yaml, summary_lines, derived_plaintexts, "changed"
         )
 
     async def run(self) -> None:
