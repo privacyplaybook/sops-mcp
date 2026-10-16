@@ -117,7 +117,11 @@ def _envelope_of(encrypted_content: str) -> dict:
         parsed = yaml.safe_load(encrypted_content)
     except yaml.YAMLError as exc:
         raise SopsError(f"content is not valid YAML: {exc}") from exc
+    return envelope_from(parsed)
 
+
+def envelope_from(parsed: object) -> dict:
+    """The `sops` block of an already-parsed document, or raise."""
     if not isinstance(parsed, dict) or "sops" not in parsed:
         raise SopsError(
             "content has no 'sops' metadata block — it does not look like a "
@@ -139,10 +143,11 @@ def encryption_mode_features(encrypted_content: str) -> tuple[str, ...]:
     empty tuple; one from ``sops_create_k8s_secret`` returns
     ``("encrypted_regex",)``.
     """
-    return _encryption_mode_features(_envelope_of(encrypted_content))
+    return encryption_mode_features_of(_envelope_of(encrypted_content))
 
 
-def _encryption_mode_features(envelope: dict) -> tuple[str, ...]:
+def encryption_mode_features_of(envelope: dict) -> tuple[str, ...]:
+    """:func:`encryption_mode_features`, for an envelope already in hand."""
     found = [key for key in _ENCRYPTION_MODE_KEYS if envelope.get(key)]
     suffix = envelope.get("unencrypted_suffix")
     if suffix and suffix != UNENCRYPTED_SUFFIX:
@@ -167,12 +172,16 @@ def unsupported_key_features(encrypted_content: str) -> tuple[str, ...]:
     none of these flags, so this returns an empty tuple for it.
     """
     envelope = _envelope_of(encrypted_content)
+    return key_features_of(envelope) + encryption_mode_features_of(envelope)
+
+
+def key_features_of(envelope: dict) -> tuple[str, ...]:
+    """The access-rule features (master keys, Shamir, MAC scope) alone."""
     # Truthiness throughout: sops writes lists for the master-key groups,
     # but a truthy value of any other shape should still be treated as
     # present rather than waved through on a type check.
     found = [group for group in _NON_AGE_KEY_GROUPS if envelope.get(group)]
     found.extend(flag for flag in _UNSUPPORTED_FLAGS if envelope.get(flag))
-    found.extend(_encryption_mode_features(envelope))
     return tuple(found)
 
 

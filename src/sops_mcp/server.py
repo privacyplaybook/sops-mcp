@@ -37,7 +37,9 @@ from .sops import (
     K8S_ENCRYPTED_REGEX,
     SopsEncryptor,
     SopsError,
-    encryption_mode_features,
+    encryption_mode_features_of,
+    envelope_from,
+    key_features_of,
     recipients_of,
     unsupported_key_features,
 )
@@ -67,7 +69,9 @@ def _validate_key_name(name: str) -> None:
 K8S_META_ANNOTATION = "sops-mcp.privacyplaybook.com/meta"
 
 # Kubernetes' own rules (apimachinery validation), so a manifest this
-# server returns is one the API server accepts.
+# server returns is one the API server accepts. Always applied with
+# fullmatch: Python's `$` also matches before a trailing newline, so
+# .match() would let 'web\n' through.
 _K8S_SECRET_KEY = re.compile(r"^[-._a-zA-Z0-9]+$")
 _DNS_SUBDOMAIN_MAX = 253
 _DNS_LABEL_MAX = 63
@@ -92,7 +96,7 @@ def _validate_k8s_key_name(name: str) -> None:
     if (
         not isinstance(name, str)
         or len(name) > _DNS_SUBDOMAIN_MAX
-        or not _K8S_SECRET_KEY.match(name)
+        or not _K8S_SECRET_KEY.fullmatch(name)
         or name in {".", ".."}
         or name.startswith("..")
     ):
@@ -107,7 +111,7 @@ def _validate_dns_subdomain(value: Any, what: str) -> str:
     if (
         not isinstance(value, str)
         or len(value) > _DNS_SUBDOMAIN_MAX
-        or not _DNS_SUBDOMAIN.match(value)
+        or not _DNS_SUBDOMAIN.fullmatch(value)
     ):
         raise ValueError(
             f"Invalid {what} {value!r}: must be a lowercase RFC 1123 DNS "
@@ -126,13 +130,13 @@ def _validate_qualified_name(key: Any, what: str) -> str:
         raise ValueError(f"Invalid {what} key {key!r}: empty prefix before '/'.")
     if prefix:
         _validate_dns_subdomain(prefix, f"{what} key prefix")
-    if len(name) > _DNS_LABEL_MAX or not _QUALIFIED_NAME_PART.match(name):
+    if len(name) > _DNS_LABEL_MAX or not _QUALIFIED_NAME_PART.fullmatch(name):
         raise ValueError(
             f"Invalid {what} key {key!r}: the name part must be at most 63 "
             "characters from [-A-Za-z0-9_.], starting and ending with a "
             "letter or digit."
         )
-    if _K8S_ENCRYPTED_KEYS.match(key):
+    if _K8S_ENCRYPTED_KEYS.fullmatch(key):
         raise ValueError(
             f"{what.capitalize()} key {key!r} is not allowed: sops would "
             "encrypt it along with the secret values, so the manifest's "
@@ -159,7 +163,7 @@ def _validate_labels(value: Any) -> dict[str, str]:
     labels = _validate_string_map(value, "label")
     for key, item in labels.items():
         too_long = len(item) > _DNS_LABEL_MAX
-        if item and (too_long or not _QUALIFIED_NAME_PART.match(item)):
+        if item and (too_long or not _QUALIFIED_NAME_PART.fullmatch(item)):
             raise ValueError(
                 f"Invalid value for label {key!r}: at most 63 characters "
                 "from [-A-Za-z0-9_.], starting and ending with a letter or "
@@ -169,15 +173,27 @@ def _validate_labels(value: Any) -> dict[str, str]:
 
 
 def _is_k8s_secret_manifest(parsed: Any) -> bool:
-    """A manifest sops_create_k8s_secret wrote, judged without decrypting."""
+    """A manifest sops_create_k8s_secret wrote, judged without decrypting.
+
+    The regex alone is not enough: it is the one Flux's docs recommend, so
+    a Secret someone encrypted by hand carries it too, and telling them to
+    re-create it with this tool would be wrong. Ours also carry the meta
+    annotation. This only picks the wording; both kinds are refused.
+    """
     if not isinstance(parsed, dict):
         return False
     envelope = parsed.get("sops")
+    metadata = parsed.get("metadata")
+    annotations = (
+        metadata.get("annotations") if isinstance(metadata, dict) else None
+    )
     return (
         isinstance(envelope, dict)
         and envelope.get("encrypted_regex") == K8S_ENCRYPTED_REGEX
         and parsed.get("apiVersion") == "v1"
         and parsed.get("kind") == "Secret"
+        and isinstance(annotations, dict)
+        and K8S_META_ANNOTATION in annotations
     )
 
 
@@ -388,7 +404,15 @@ def _process_batch(
     `derived_plaintexts` is a list of "KEY = value" lines for each derived
     secret in this batch, so callers can surface them to the user.
     """
-    new_keys = {s["key_name"] for s in specs}
+    names = [s["key_name"] for s in specs]
+    # Without this the later spec silently wins (spec_by_key below), and
+    # the caller is told nothing about the value it lost.
+    duplicates = sorted({k for k in names if names.count(k) > 1})
+    if duplicates:
+        raise ValueError(
+            f"Duplicate key names in one call: {', '.join(map(str, duplicates))}"
+        )
+    new_keys = set(names)
     known_keys = set(existing_values.keys()) | new_keys
 
     for spec in specs:
@@ -459,6 +483,43 @@ def _process_batch(
             summary.append(f"  {key}: external{desc_str}")
 
     return resolved, merged_meta, summary, derived_plaintexts
+
+
+_DERIVED_HEADINGS = {
+    "new": (
+        "Derived plaintexts (copy these into your application config if "
+        "needed):"
+    ),
+    "changed": (
+        "Derived plaintexts (update any config files that reference these):"
+    ),
+}
+
+
+def _mutation_response(
+    encrypted_yaml: str,
+    summary_lines: list[str],
+    derived_plaintexts: list[str],
+    kind: str,
+) -> list[TextContent]:
+    """The response every tool that returns a file sends back.
+
+    Derived values are the one plaintext allowed across the MCP boundary,
+    so they are surfaced from this one place: ``kind`` is "new" for a
+    created or added secret and "changed" for a recomputed one.
+    """
+    responses = [
+        TextContent(type="text", text=encrypted_yaml),
+        TextContent(type="text", text="\n".join(summary_lines)),
+    ]
+    if derived_plaintexts:
+        responses.append(
+            TextContent(
+                type="text",
+                text="\n".join([_DERIVED_HEADINGS[kind], *derived_plaintexts]),
+            )
+        )
+    return responses
 
 
 DOMAIN_SCHEMA_PROPERTY = {
@@ -534,19 +595,31 @@ class SopsMcpServer:
             )
         return domain
 
+    @classmethod
+    def _reject_unsupported_key_features(cls, content: str) -> None:
+        """:meth:`_reject_unsupported_envelope`, from the raw content."""
+        try:
+            parsed = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            raise SopsError(f"content is not valid YAML: {exc}") from exc
+        cls._reject_unsupported_envelope(parsed)
+
     @staticmethod
-    def _reject_unsupported_key_features(content: str) -> None:
-        """Refuse a file whose access rules this server cannot reproduce.
+    def _reject_unsupported_envelope(parsed: Any) -> None:
+        """Refuse a file this server cannot re-encrypt faithfully.
 
         It re-encrypts with a flat age recipient list, so a PGP or KMS
         holder would be dropped and an n-of-m Shamir threshold would be
         flattened into a list any single holder could open. Both are silent
         downgrades — the same failure the recipient check exists to
-        prevent. Use the sops CLI for those files.
+        prevent. And it re-encrypts with the `_unencrypted` suffix rule, so
+        a file under another encryption mode would come back with different
+        values in the clear. Use the sops CLI for those files.
         """
-        modes = encryption_mode_features(content)
+        envelope = envelope_from(parsed)
+        modes = encryption_mode_features_of(envelope)
         if modes:
-            if _is_k8s_secret_manifest(yaml.safe_load(content)):
+            if _is_k8s_secret_manifest(parsed):
                 raise ValueError(
                     "This is a Kubernetes Secret manifest made by "
                     "sops_create_k8s_secret. Those files are create-only: "
@@ -563,7 +636,7 @@ class SopsMcpServer:
                 "which values are left in the clear. Manage it with the "
                 "sops CLI instead."
             )
-        features = unsupported_key_features(content)
+        features = key_features_of(envelope)
         if features:
             raise ValueError(
                 f"File uses sops features this server cannot reproduce: "
@@ -573,18 +646,23 @@ class SopsMcpServer:
                 "Manage it with the sops CLI instead."
             )
 
-    def _reject_early(self, content: str, parsed: dict) -> None:
-        """Run the envelope refusals before any tool-specific check.
+    def _parse_for_mutation(self, content: str) -> dict:
+        """Parse a file a mutation tool was handed, refusing it if it must be.
 
-        _check_recipients runs them again before re-encrypting; this copy
-        exists so that a file no mutation may touch gets that answer,
-        rather than a misleading one about its keys (a Kubernetes manifest
-        has no root-level secrets, so "key not found" would come first).
-        Content with no sops block is left to the later checks, which
-        already report it.
+        Every mutation tool parses its input through here, so the envelope
+        refusals run before any tool-specific check: a file no mutation
+        may touch gets that answer, rather than a misleading one about its
+        keys (a Kubernetes manifest has no root-level secrets, so "key not
+        found" would come first). _check_recipients runs them again right
+        before re-encrypting. Content with no sops block is left to the
+        later checks, which already report it.
         """
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("Content is not valid YAML")
         if isinstance(parsed.get("sops"), dict):
-            self._reject_unsupported_key_features(content)
+            self._reject_unsupported_envelope(parsed)
+        return parsed
 
     def _check_recipients(self, content: str, domain: Domain) -> None:
         """Refuse to re-encrypt a file onto a different recipient set.
@@ -1094,22 +1172,9 @@ class SopsMcpServer:
         encrypted_yaml = self.encryptor.encrypt(data, domain)
 
         summary_lines = ["Created secrets:", *summary]
-        responses = [
-            TextContent(type="text", text=encrypted_yaml),
-            TextContent(type="text", text="\n".join(summary_lines)),
-        ]
-        if derived_plaintexts:
-            responses.append(
-                TextContent(
-                    type="text",
-                    text=(
-                        "Derived plaintexts (copy these into your "
-                        "application config if needed):\n"
-                        + "\n".join(derived_plaintexts)
-                    ),
-                )
-            )
-        return responses
+        return _mutation_response(
+            encrypted_yaml, summary_lines, derived_plaintexts, 'new'
+        )
 
     async def _create_k8s_secret(
         self, arguments: dict[str, Any]
@@ -1125,7 +1190,7 @@ class SopsMcpServer:
         if namespace not in (None, "") and (
             not isinstance(namespace, str)
             or len(namespace) > _DNS_LABEL_MAX
-            or not _DNS_LABEL_RE.match(namespace)
+            or not _DNS_LABEL_RE.fullmatch(namespace)
         ):
             raise ValueError(
                 f"Invalid namespace {namespace!r}: must be a lowercase "
@@ -1145,7 +1210,7 @@ class SopsMcpServer:
         if (
             not isinstance(secret_type, str)
             or len(secret_type) > _DNS_SUBDOMAIN_MAX
-            or not _SECRET_TYPE.match(secret_type)
+            or not _SECRET_TYPE.fullmatch(secret_type)
         ):
             raise ValueError(f"Invalid Secret type {secret_type!r}.")
 
@@ -1153,11 +1218,6 @@ class SopsMcpServer:
         if not secrets_list:
             raise ValueError("No secrets provided")
         key_names = [spec["key_name"] for spec in secrets_list]
-        duplicates = sorted({k for k in key_names if key_names.count(k) > 1})
-        if duplicates:
-            raise ValueError(
-                f"Duplicate key names: {', '.join(map(str, duplicates))}"
-            )
 
         domain = self._resolve_domain(arguments)
 
@@ -1204,22 +1264,9 @@ class SopsMcpServer:
                 "secret."
             ),
         ]
-        responses = [
-            TextContent(type="text", text=encrypted_yaml),
-            TextContent(type="text", text="\n".join(summary_lines)),
-        ]
-        if derived_plaintexts:
-            responses.append(
-                TextContent(
-                    type="text",
-                    text=(
-                        "Derived plaintexts (copy these into your "
-                        "application config if needed):\n"
-                        + "\n".join(derived_plaintexts)
-                    ),
-                )
-            )
-        return responses
+        return _mutation_response(
+            encrypted_yaml, summary_lines, derived_plaintexts, 'new'
+        )
 
     async def _list_secrets(
         self, arguments: dict[str, Any]
@@ -1276,8 +1323,14 @@ class SopsMcpServer:
             info = meta_secrets.get(key, {})
             if not isinstance(info, dict):
                 info = {}
-            source = info.get("source", "unknown")
-            desc = info.get("description", "")
+            # Read without decrypting, so the MAC has not vouched for any
+            # of this: a field of the wrong type reads as absent.
+            source = info.get("source")
+            if not isinstance(source, str):
+                source = "unknown"
+            desc = info.get("description")
+            if not isinstance(desc, str):
+                desc = ""
             lines.append(f"{key:<30} {source:<12} {desc}")
 
         if not secret_keys:
@@ -1323,12 +1376,13 @@ class SopsMcpServer:
             return ["", "Domain: (file has no readable sops metadata block)"]
 
         lines = ["", f"Recipients: {len(actual)}"]
-        if k8s and set(unsupported) == {"encrypted_regex"}:
+        if k8s:
             # Ours, and refused by every mutation on purpose (create-only),
-            # not because of an access rule the server cannot reproduce.
-            # The recipient comparison below still tells the reader whether
-            # the domain has moved on since the manifest was made.
-            unsupported = ()
+            # not because of a feature the server cannot reproduce, so the
+            # regex is not reported as one. Anything else still is. The
+            # recipient comparison below tells the reader whether the
+            # domain has moved on since the manifest was made.
+            unsupported = tuple(f for f in unsupported if f != "encrypted_regex")
         if unsupported:
             lines.append(
                 f"  WARNING: this file uses {', '.join(unsupported)}, which "
@@ -1365,18 +1419,16 @@ class SopsMcpServer:
                 f"  WARNING: domain '{name}' is not configured on this "
                 f"server. Configured: {self._domain_names()}."
             )
-        elif set(domain.recipients) != set(actual) and k8s:
-            lines.append(
-                f"  WARNING: the file's recipients do not match domain "
-                f"'{name}' ({len(domain.recipients)} configured). Create the "
-                "manifest again with sops_create_k8s_secret to move it onto "
-                "the current list."
-            )
         elif set(domain.recipients) != set(actual):
+            remedy = (
+                "Create the manifest again with sops_create_k8s_secret to "
+                "move it onto the current list."
+                if k8s
+                else "Mutations will be refused; run sops_rekey to reconcile."
+            )
             lines.append(
                 f"  WARNING: the file's recipients do not match domain "
-                f"'{name}' ({len(domain.recipients)} configured). Mutations "
-                "will be refused; run sops_rekey to reconcile."
+                f"'{name}' ({len(domain.recipients)} configured). {remedy}"
             )
         else:
             lines.append("  Recipients match the configured domain.")
@@ -1423,17 +1475,14 @@ class SopsMcpServer:
                 f"inferred. Configured domains: {self._domain_names()}."
             )
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
-        domain = self._resolve_domain(arguments)
         # Rekey is exempt from the recipient check — changing the recipient
-        # set is its purpose — but not from this one: it cannot reproduce a
-        # non-age master key or a Shamir threshold any more than the other
-        # tools can.
-        self._reject_unsupported_key_features(content)
+        # set is its purpose — but not from the envelope refusals, which
+        # _parse_for_mutation above has run: it cannot reproduce a non-age
+        # master key, a Shamir threshold or another encryption mode any
+        # more than the other tools can.
+        domain = self._resolve_domain(arguments)
 
         had_meta = "_meta_unencrypted" in parsed
         meta_block = parsed.get("_meta_unencrypted")
@@ -1551,10 +1600,7 @@ class SopsMcpServer:
         if not content:
             raise ValueError("No encrypted content provided")
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
@@ -1645,22 +1691,9 @@ class SopsMcpServer:
         if preserved:
             summary_lines.append(f"  Preserved: {', '.join(preserved)}")
 
-        responses = [
-            TextContent(type="text", text=encrypted_yaml),
-            TextContent(type="text", text="\n".join(summary_lines)),
-        ]
-        if derived_plaintexts:
-            responses.append(
-                TextContent(
-                    type="text",
-                    text=(
-                        "Derived plaintexts (update any config files "
-                        "that reference these):\n"
-                        + "\n".join(derived_plaintexts)
-                    ),
-                )
-            )
-        return responses
+        return _mutation_response(
+            encrypted_yaml, summary_lines, derived_plaintexts, 'changed'
+        )
 
     async def _add_secrets(
         self, arguments: dict[str, Any]
@@ -1673,10 +1706,7 @@ class SopsMcpServer:
         if not secrets_list:
             raise ValueError("No secrets provided")
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
         meta = parsed.get("_meta_unencrypted", {})
         meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
@@ -1725,22 +1755,9 @@ class SopsMcpServer:
         if preserved:
             summary_lines.append(f"Preserved: {', '.join(preserved)}")
 
-        responses = [
-            TextContent(type="text", text=encrypted_yaml),
-            TextContent(type="text", text="\n".join(summary_lines)),
-        ]
-        if derived_plaintexts:
-            responses.append(
-                TextContent(
-                    type="text",
-                    text=(
-                        "Derived plaintexts (copy these into your "
-                        "application config if needed):\n"
-                        + "\n".join(derived_plaintexts)
-                    ),
-                )
-            )
-        return responses
+        return _mutation_response(
+            encrypted_yaml, summary_lines, derived_plaintexts, 'new'
+        )
 
     async def _add_metadata(
         self, arguments: dict[str, Any]
@@ -1753,10 +1770,7 @@ class SopsMcpServer:
         if not secret_metadata:
             raise ValueError("No secret_metadata provided")
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
         if "_meta_unencrypted" in parsed:
             raise ValueError(
@@ -1917,10 +1931,7 @@ class SopsMcpServer:
         if not key_names:
             raise ValueError("No key_names provided")
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
         existing_keys = {
             k for k in parsed if k != "sops" and not k.startswith("_")
@@ -1991,10 +2002,7 @@ class SopsMcpServer:
         if old_name == new_name:
             raise ValueError("old_name and new_name are identical")
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
         existing_keys = {
             k for k in parsed if k != "sops" and not k.startswith("_")
@@ -2073,10 +2081,7 @@ class SopsMcpServer:
         if new_value is None or new_value == "":
             raise ValueError("value is required")
 
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Content is not valid YAML")
-        self._reject_early(content, parsed)
+        parsed = self._parse_for_mutation(content)
 
         existing_keys = {
             k for k in parsed if k != "sops" and not k.startswith("_")
@@ -2156,22 +2161,9 @@ class SopsMcpServer:
                 "Recomputed (derived): " + ", ".join(recomputed)
             )
 
-        responses = [
-            TextContent(type="text", text=encrypted_yaml),
-            TextContent(type="text", text="\n".join(summary_lines)),
-        ]
-        if derived_plaintexts:
-            responses.append(
-                TextContent(
-                    type="text",
-                    text=(
-                        "Derived plaintexts (update any config files "
-                        "that reference these):\n"
-                        + "\n".join(derived_plaintexts)
-                    ),
-                )
-            )
-        return responses
+        return _mutation_response(
+            encrypted_yaml, summary_lines, derived_plaintexts, 'changed'
+        )
 
     async def run(self) -> None:
         """Run the server with stdio transport."""

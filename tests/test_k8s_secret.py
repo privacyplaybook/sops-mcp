@@ -32,17 +32,17 @@ from tests.helpers import DUMMY_RECIPIENT, make_server
 EXTERNAL_VALUE = "s3cr3t-external-value"
 
 # Every tool that re-encrypts a file, with arguments that would otherwise
-# be valid for a flat file holding DB_PASSWORD.
+# be valid for a flat file holding DB_ACCESS_KEY.
 MUTATIONS = {
     "sops_rotate_generated": {},
     "sops_add_secrets": {
         "secrets": [{"key_name": "NEW_KEY", "source": "generated"}],
     },
     "sops_add_metadata": {
-        "secret_metadata": {"DB_PASSWORD": {"source": "generated"}},
+        "secret_metadata": {"DB_ACCESS_KEY": {"source": "generated"}},
     },
-    "sops_delete_secrets": {"key_names": ["DB_PASSWORD"]},
-    "sops_rename_secret": {"old_name": "DB_PASSWORD", "new_name": "DB_PASS"},
+    "sops_delete_secrets": {"key_names": ["DB_ACCESS_KEY"]},
+    "sops_rename_secret": {"old_name": "DB_ACCESS_KEY", "new_name": "DB_KEY"},
     "sops_update_external": {"key_name": "API_TOKEN", "value": "changed"},
     "sops_rekey": {"domain": "default"},
 }
@@ -127,10 +127,10 @@ async def manifest(server):
             "annotations": {"example.com/owner": "team-a"},
             "secrets": [
                 {
-                    "key_name": "DB_PASSWORD",
+                    "key_name": "DB_ACCESS_KEY",
                     "source": "generated",
                     "length": 24,
-                    "description": "database password",
+                    "description": "database access key",
                 },
                 {
                     "key_name": "API_TOKEN",
@@ -138,10 +138,10 @@ async def manifest(server):
                     "value": EXTERNAL_VALUE,
                 },
                 {
-                    "key_name": "DB_PASSWORD_HASH",
+                    "key_name": "DB_ACCESS_KEY_HASH",
                     "source": "derived",
                     "transform": "sha256_hex",
-                    "from": "DB_PASSWORD",
+                    "from": "DB_ACCESS_KEY",
                 },
             ],
         })
@@ -167,11 +167,11 @@ async def test_sops_decrypt_yields_an_applyable_secret(
     assert plain["metadata"]["labels"] == {"app.kubernetes.io/name": "web"}
 
     data = plain["stringData"]
-    assert list(data) == ["DB_PASSWORD", "API_TOKEN", "DB_PASSWORD_HASH"]
-    assert len(data["DB_PASSWORD"]) == 24
+    assert list(data) == ["DB_ACCESS_KEY", "API_TOKEN", "DB_ACCESS_KEY_HASH"]
+    assert len(data["DB_ACCESS_KEY"]) == 24
     assert data["API_TOKEN"] == EXTERNAL_VALUE
-    assert data["DB_PASSWORD_HASH"] == hashlib.sha256(
-        data["DB_PASSWORD"].encode()
+    assert data["DB_ACCESS_KEY_HASH"] == hashlib.sha256(
+        data["DB_ACCESS_KEY"].encode()
     ).hexdigest()
 
 
@@ -197,11 +197,11 @@ async def test_metadata_annotation_holds_no_value(server, keys, manifest, tmp_pa
     meta = json.loads(raw)
 
     assert meta["domain"] == "default"
-    assert meta["secrets"]["DB_PASSWORD"]["source"] == "generated"
-    assert meta["secrets"]["DB_PASSWORD"]["generation"]["length"] == 24
+    assert meta["secrets"]["DB_ACCESS_KEY"]["source"] == "generated"
+    assert meta["secrets"]["DB_ACCESS_KEY"]["generation"]["length"] == 24
     assert meta["secrets"]["API_TOKEN"] == {"source": "external"}
-    assert meta["secrets"]["DB_PASSWORD_HASH"]["derivation"] == {
-        "transform": "sha256_hex", "from": "DB_PASSWORD",
+    assert meta["secrets"]["DB_ACCESS_KEY_HASH"]["derivation"] == {
+        "transform": "sha256_hex", "from": "DB_ACCESS_KEY",
     }
     for value in plain["stringData"].values():
         assert value not in raw
@@ -212,9 +212,9 @@ async def test_no_plaintext_crosses_the_boundary(server, keys, manifest, tmp_pat
     returned = "\n".join(manifest)
 
     assert EXTERNAL_VALUE not in returned
-    assert plain["stringData"]["DB_PASSWORD"] not in returned
+    assert plain["stringData"]["DB_ACCESS_KEY"] not in returned
     # Derived values are the documented exception, as for flat files.
-    assert plain["stringData"]["DB_PASSWORD_HASH"] in manifest[-1]
+    assert plain["stringData"]["DB_ACCESS_KEY_HASH"] in manifest[-1]
 
 
 async def test_mac_covers_the_plaintext_metadata(server, keys, manifest, tmp_path):
@@ -241,9 +241,9 @@ async def test_list_secrets_reads_the_manifest(server, manifest):
     out = texts[0]
     assert "Kubernetes Secret prod/web-app (type: Opaque)" in out
     assert "Create-only" in out
-    assert "DB_PASSWORD " in out
+    assert "DB_ACCESS_KEY " in out
     assert "generated" in out
-    assert "database password" in out
+    assert "database access key" in out
     assert "API_TOKEN" in out
     assert "derived" in out
     assert "Domain: default" in out
@@ -289,8 +289,12 @@ async def test_typed_secret_with_kubernetes_key_names(server, keys, tmp_path):
 # --- unit: no sops binary needed --------------------------------------------
 
 
-def _fake_manifest(**envelope_extra) -> str:
-    """A manifest whose envelope looks like sops wrote it in regex mode."""
+def _fake_manifest(*, annotated: bool = True, **envelope_extra) -> str:
+    """A manifest whose envelope looks like sops wrote it in regex mode.
+
+    ``annotated=False`` gives what a Flux user encrypts by hand: the same
+    regex, but no sops-mcp metadata annotation.
+    """
     envelope = {
         "age": [{"recipient": DUMMY_RECIPIENT, "enc": "x"}],
         "pgp": [],
@@ -303,9 +307,13 @@ def _fake_manifest(**envelope_extra) -> str:
     return yaml.safe_dump({
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {"name": "x"},
+        "metadata": (
+            {"name": "x", "annotations": {K8S_META_ANNOTATION: "{}"}}
+            if annotated
+            else {"name": "x"}
+        ),
         "type": "Opaque",
-        "stringData": {"DB_PASSWORD": "ENC[AES256_GCM,data:x]"},
+        "stringData": {"DB_ACCESS_KEY": "ENC[AES256_GCM,data:x]"},
         "sops": envelope,
     })
 
@@ -393,7 +401,84 @@ async def test_duplicate_keys_are_refused():
             {"key_name": "K", "source": "external", "value": "v"},
         ],
     })
-    assert texts[0] == "Error: Duplicate key names: K"
+    assert texts[0] == "Error: Duplicate key names in one call: K"
+
+
+async def test_duplicate_keys_are_refused_for_flat_files_too():
+    """Checked in the shared engine, so sops_create_secrets no longer keeps
+    the last of two specs and drops the other without a word."""
+    texts = await _call(make_server(), "sops_create_secrets", {
+        "secrets": [
+            {"key_name": "K", "source": "external", "value": "one"},
+            {"key_name": "K", "source": "generated"},
+        ],
+    })
+    assert texts[0] == "Error: Duplicate key names in one call: K"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"name": "web\n"},
+        {"name": "ok", "namespace": "prod\n"},
+        {"name": "ok", "labels": {"app\n": "x"}},
+        {"name": "ok", "labels": {"app": "x\n"}},
+        {"name": "ok", "annotations": {"example.com/a\n": "x"}},
+        {"name": "ok", "type": "Opaque\n"},
+        {"name": "ok", "key": "tls.crt\n"},
+    ],
+)
+async def test_trailing_newline_is_refused(arguments):
+    """Python's `$` matches before a final newline; the validators must not
+    let one through into a create-only manifest kubectl would reject."""
+    key = arguments.pop("key", "K")
+    arguments["secrets"] = [{"key_name": key, "source": "generated"}]
+    with pytest.raises(ValueError, match="Invalid"):
+        await make_server()._create_k8s_secret(arguments)
+
+
+@pytest.mark.parametrize("tool", sorted(MUTATIONS))
+async def test_hand_made_flux_secret_gets_the_generic_refusal(tool):
+    """Same regex, no annotation: not ours, so don't send the user to
+    re-create with this tool a Secret whose values it never had."""
+    texts = await _call(
+        make_server(), tool,
+        {"encrypted_content": _fake_manifest(annotated=False), **MUTATIONS[tool]},
+    )
+    assert texts[0].startswith("Error: File chooses which values sops encrypts")
+
+
+async def test_hand_made_flux_secret_lists_with_the_sops_cli_warning():
+    texts = await _call(
+        make_server(), "sops_list_secrets",
+        {"encrypted_content": _fake_manifest(annotated=False)},
+    )
+    assert "WARNING: this file uses encrypted_regex" in texts[0]
+    assert "sops_create_k8s_secret" not in texts[0]
+
+
+async def test_our_manifest_with_another_flag_reports_only_that_flag():
+    texts = await _call(
+        make_server(), "sops_list_secrets",
+        {"encrypted_content": _fake_manifest(mac_only_encrypted=True)},
+    )
+    assert "WARNING: this file uses mac_only_encrypted," in texts[0]
+    assert "encrypted_regex" not in texts[0]
+
+
+@pytest.mark.parametrize("entry", [{"source": None}, {"source": {}},
+                                   {"description": ["x"]}])
+async def test_annotation_fields_of_the_wrong_type_list_as_absent(entry):
+    parsed = yaml.safe_load(_fake_manifest())
+    parsed["metadata"]["annotations"][K8S_META_ANNOTATION] = json.dumps(
+        {"secrets": {"DB_ACCESS_KEY": entry}}
+    )
+    texts = await _call(
+        make_server(), "sops_list_secrets",
+        {"encrypted_content": yaml.safe_dump(parsed)},
+    )
+    assert "Internal error" not in texts[0]
+    assert "DB_ACCESS_KEY" in texts[0]
 
 
 async def test_malformed_annotation_lists_as_unknown():
@@ -404,5 +489,5 @@ async def test_malformed_annotation_lists_as_unknown():
         make_server(), "sops_list_secrets",
         {"encrypted_content": yaml.safe_dump(parsed)},
     )
-    assert "DB_PASSWORD" in texts[0]
+    assert "DB_ACCESS_KEY" in texts[0]
     assert "unknown" in texts[0]
