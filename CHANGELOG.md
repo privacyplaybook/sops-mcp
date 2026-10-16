@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`sops_create_k8s_secret`** (#22): creates a Kubernetes Secret manifest
+  with each value under `stringData`, encrypted with
+  `--encrypted-regex '^(data|stringData)$'` so `apiVersion`, `kind`,
+  `metadata` and `type` stay plaintext. `sops decrypt`, ksops or Flux give
+  an applyable manifest with no reshaping. Name, namespace, labels,
+  annotations and type are arguments, since the MAC covers them. The
+  metadata `_meta_unencrypted` holds for flat files goes in a
+  `sops-mcp.privacyplaybook.com/meta` annotation as JSON, never holding a
+  value. Secret keys follow Kubernetes' rule, so `tls.crt` works.
+- `sops_list_secrets` reads these manifests: keys under `stringData`, their
+  sources from the annotation, and the domain.
+
+### Changed
+
+- **Every mutation tool refuses a file whose envelope sets another
+  encryption mode**: `encrypted_regex`, `unencrypted_regex`,
+  `encrypted_suffix`, either comment regex, or an `unencrypted_suffix`
+  other than `_unencrypted`. Re-encrypting such a file with this server's
+  suffix rule would change which values are in the clear. This covers the
+  new manifests, which are create-only, and also any older file made with
+  an `encrypted_regex` `.sops.yaml` rule, which mutations used to
+  re-encrypt in suffix mode.
+
+### Upgrade note
+
+- **Kubernetes manifests need this version or later on every server that
+  touches them.** 0.11.0 and earlier have no guard: a mutation there
+  rewrites the manifest as a flat file (encrypting `kind:` and `metadata:`).
+  The values still decrypt, but the manifest is no longer applyable.
+
 ## [0.11.0]
 
 ### Fixed (post-merge)

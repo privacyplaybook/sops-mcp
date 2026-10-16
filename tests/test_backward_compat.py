@@ -41,6 +41,9 @@ EXPECTED_REQUIRED = {
     # Added in this version, so no v1 client can be broken by it.
     "sops_list_domains": set(),
     "sops_rekey": {"encrypted_content", "domain"},
+    # Added after v1 as well. 'domain' stays optional, as on every
+    # creation tool.
+    "sops_create_k8s_secret": {"name", "secrets"},
 }
 
 
@@ -250,5 +253,7 @@ async def test_domain_is_optional_on_every_pre_existing_tool(server):
 async def test_no_tool_was_removed(server):
     """Every v1 tool still exists under the same name."""
     schemas = await _tool_schemas(server)
-    v1_tools = set(EXPECTED_REQUIRED) - {"sops_list_domains", "sops_rekey"}
+    v1_tools = set(EXPECTED_REQUIRED) - {
+        "sops_list_domains", "sops_rekey", "sops_create_k8s_secret",
+    }
     assert v1_tools <= set(schemas)

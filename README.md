@@ -58,6 +58,7 @@ Three ideas shape the tool surface:
 | `sops_create_secrets` | Create a new encrypted file with one or more secrets (any mix of sources). |
 | `sops_list_secrets` | List keys, sources, and descriptions from a file **without decrypting**. |
 | `sops_create_oidc_secret` | Convenience: create an Authelia OIDC client secret as a `generated` + `derived` (`pbkdf2_sha512_authelia`) pair in one call. The hash is returned in the response for pasting into `configuration.yml`. |
+| `sops_create_k8s_secret` | Create a Kubernetes Secret manifest with the values under `stringData`, encrypted so that only `stringData` is ciphertext. Create-only: every mutation tool refuses the result. See [Kubernetes Secret manifests](#kubernetes-secret-manifests). |
 | `sops_list_domains` | List the configured key domains, their age recipients, and whether each can decrypt or only encrypt. Never returns private key material. |
 
 ### Mutation (require a private key for the target domain)
@@ -283,8 +284,9 @@ SOPS can protect a file in ways this server cannot reproduce, because it always 
 - **Another master key alongside age** (`pgp`, `kms`, `gcp_kms`, `azure_kv`, `hc_vault`). Re-encrypting would drop that holder.
 - **Shamir key groups** (`key_groups` with a `shamir_threshold`). Re-encrypting would flatten an n-of-m threshold into a list any single holder could open.
 - **`mac_only_encrypted`**. It leaves the plaintext metadata block unauthenticated, so a file's recorded domain and each secret's `source` could be rewritten by anyone who can edit the file.
+- **Another encryption mode**: `encrypted_regex`, `unencrypted_regex`, `encrypted_suffix`, the comment regexes, or an `unencrypted_suffix` other than `_unencrypted`. This server re-encrypts with `--unencrypted-suffix _unencrypted`, so it would change which values are left in the clear. That includes the manifests `sops_create_k8s_secret` writes, which are refused with a message of their own.
 
-Both are silent downgrades, so every mutation refuses these files and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
+Each is a silent downgrade or reshape, so every mutation refuses these files and `sops_list_secrets` flags them. Manage them with the `sops` CLI.
 
 ### Running mixed versions
 
@@ -357,7 +359,36 @@ Error decrypting tree: Error walking tree: Could not decrypt value: Could not de
 
 The value is unrecoverable at that point. Editing the plaintext parts by hand fails the same way, for a different reason: the MAC covers unencrypted values, so an edited `_meta_unencrypted` block gives `MAC mismatch`. Reindenting, reordering keys or reflowing the YAML is safe — SOPS parses the document, so only key paths and values matter.
 
-If you need secrets in some other document shape, build that shape from the flat file at deploy time (Kustomize's `secretGenerator`, `helm-secrets`, `sops-secrets-operator`) rather than reshaping the encrypted file.
+If you need a Kubernetes Secret, create it in that shape with `sops_create_k8s_secret` (below). For any other document shape, build it from the flat file at deploy time (Kustomize's `secretGenerator`, `helm-secrets`, `sops-secrets-operator`) rather than reshaping the encrypted file.
+
+### Kubernetes Secret manifests
+
+`sops_create_k8s_secret` writes a whole Secret manifest, with each value already at its path under `stringData`, so nothing has to be moved afterwards:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+    name: web-app
+    namespace: prod
+    labels:
+        app.kubernetes.io/name: web
+    annotations:
+        sops-mcp.privacyplaybook.com/meta: '{"version":1,"domain":"default","secrets":{"DB_PASSWORD":{"source":"generated","generation":{"length":32,"charset":"alphanumeric"},"last_rotated":"..."}}}'
+type: Opaque
+stringData:
+    DB_PASSWORD: ENC[AES256_GCM,data:...,tag:...,type:str]
+sops:
+    ...
+    encrypted_regex: ^(data|stringData)$
+```
+
+- **Only `stringData` is encrypted** (`--encrypted-regex '^(data|stringData)$'`). `apiVersion`, `kind`, `metadata` and `type` stay readable, and `sops decrypt`, ksops or Flux turn the file into a manifest `kubectl apply` accepts as it is.
+- **Everything in the clear is an argument**: `name`, `namespace`, `labels`, `annotations` and `type`. The MAC covers plaintext too, so none of it can be edited afterwards. Label and annotation keys `data` and `stringData` are refused, because sops would encrypt them too.
+- **Key names follow Kubernetes' rule** (`[-._a-zA-Z0-9]+`), not the environment-variable one, so typed Secrets can use keys such as `tls.crt` or `.dockerconfigjson`. Values go in `stringData` as strings; the tool never writes base64 `data:`.
+- **Metadata lives in the `sops-mcp.privacyplaybook.com/meta` annotation**, as JSON with the same fields as `_meta_unencrypted`: the domain, and per secret its source, description, generation and derivation. It never holds a value. It cannot sit at the root, because kubectl's strict validation rejects an unknown root field. It does reach the cluster object, so don't put anything in a description you would not put in an annotation.
+- **The file is create-only.** Every mutation tool (`sops_rotate_generated`, `sops_add_secrets`, `sops_update_external`, `sops_rename_secret`, `sops_delete_secrets`, `sops_add_metadata`, `sops_rekey`) recognises it from its `sops` envelope, without decrypting, and refuses it. To change or rotate anything, call `sops_create_k8s_secret` again with the full set, supplying external values again. `sops_list_secrets` reads it: the key names under `stringData`, their sources from the annotation, and the domain.
+- **Minimum version.** The refusal exists only in the release that adds this tool and later ones. sops-mcp 0.11.0 and earlier have no such guard: `sops_add_secrets`, `sops_rekey` or any other mutation there would rewrite the manifest as a flat file, encrypting `kind:` and `metadata:` and adding root-level keys. The values still decrypt, so nothing is lost, but the manifest is no longer applyable. Don't point an older server at these files.
 
 
 ## Why these tools and not others
