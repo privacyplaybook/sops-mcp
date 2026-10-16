@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0]
+
 ### Added
 
 - **`sops_create_k8s_secret`** (#22): creates a Kubernetes Secret manifest
@@ -31,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new manifests, which are create-only, and also any older file made with
   an `encrypted_regex` `.sops.yaml` rule, which mutations used to
   re-encrypt in suffix mode.
+- **`sops_create_secrets` and `sops_add_secrets` refuse a batch that names
+  the same key twice.** Previously the last occurrence silently won.
+
+### Security
+
+- **PyJWT 2.13.0 → 2.15.1** (#31), clearing all 13 open Dependabot alerts
+  against it (one critical). PyJWT arrives through `mcp`; `requirements.in`
+  now sets a `pyjwt>=2.15.0` floor. sops-mcp itself never imports `jwt`.
 
 ### Upgrade note
 
