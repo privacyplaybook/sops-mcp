@@ -11,6 +11,13 @@ USER root
 # transitively by the digest of the build base image.
 RUN apk add --no-cache sops age
 
+# Upgrade the CA bundle past the pinned base's. The runtime stage copies it,
+# since that stage has no apk. 20260413-r0 in the pinned bases still trusts
+# emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2); 20260909-r3 and later don't.
+# The upstream rebuilds that dropped it moved to Python 3.15, so the digests
+# stay put and the bundle is upgraded here instead.
+RUN apk add --no-cache -u 'ca-certificates-bundle>=20260909-r3'
+
 WORKDIR /app
 
 # Build a self-contained venv at /opt/venv. Copying the venv (instead of
@@ -24,6 +31,11 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock.txt
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
 RUN pip install --no-cache-dir --no-deps .
+
+# pip is not needed at runtime, and it vendors its own certifi bundle
+# (pip/_vendor/certifi/cacert.pem), which would ship in /opt/venv with
+# whatever roots that pip release trusted.
+RUN python -m pip uninstall --yes pip
 
 # ---- runtime stage ----
 # Distroless Wolfi Python. No shell, no apk, no package manager. Runs as
@@ -39,6 +51,15 @@ COPY --from=build /usr/bin/sops /usr/bin/sops
 COPY --from=build /usr/bin/age /usr/bin/age
 COPY --from=build /usr/bin/age-keygen /usr/bin/age-keygen
 COPY --from=build /opt/venv /opt/venv
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Fail the build if any trust store in this image (the OS bundle, its
+# /etc/ssl symlinks, certifi in the venv, or any other bundle or CApath
+# entry under /usr/lib and /usr/share) still holds a distrusted root, or
+# can't be read. The script is bind-mounted, so it doesn't ship in the
+# image. Exec form: this stage has no shell.
+RUN --mount=type=bind,source=lib/check_trust_store.py,target=/tmp/check_trust_store.py \
+    ["/usr/bin/python3", "-I", "/tmp/check_trust_store.py", "/etc/ssl", "/opt/venv", "/usr/lib", "/usr/share"]
 
 ENV PATH=/opt/venv/bin:$PATH
 ENV SOPS_MCP_TRANSPORT=sse

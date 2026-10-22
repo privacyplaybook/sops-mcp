@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **PyJWT 2.13.0 → 2.15.1** (#31), clearing all 13 open Dependabot alerts
   against it (one critical). PyJWT arrives through `mcp`; `requirements.in`
   now sets a `pyjwt>=2.15.0` floor. sops-mcp itself never imports `jwt`.
+- **The image no longer trusts emSign ECC Root CA - G3** (#40,
+  [GHSA-6q48-6c7w-9gw2](https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2)):
+  eight intermediates under it had their private keys recovered. certifi
+  2026.7.22 → 2026.10.19; the Wolfi `ca-certificates-bundle` is upgraded
+  in the build stage and copied into the runtime image; pip, which vendors
+  its own certifi bundle, is removed from the runtime venv; and the build
+  now fails if any trust store in the image still holds the root.
 
 ### Upgrade note
 
