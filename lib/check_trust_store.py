@@ -9,8 +9,9 @@ fingerprint of the DER encoding, not by file or subject name.
 
     python3 lib/check_trust_store.py /etc/ssl /opt/venv
 
-Exits non-zero naming every file that still holds a distrusted root, or if
-the arguments yield no certificate at all (a moved path must not pass).
+Exits non-zero naming every file that still holds a distrusted root or
+can't be read, or if the arguments yield no certificate at all (a moved
+path must not pass). OpenSSL CApath entries (`<hash>.0`) are scanned too.
 Standard library only: the runtime image is distroless.
 """
 
@@ -32,16 +33,20 @@ DISTRUSTED = {
 
 PEM = re.compile(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.DOTALL)
 BUNDLE_SUFFIXES = (".crt", ".pem")
+# OpenSSL CApath entries: <subject hash>.0, .1, ...
+CAPATH_ENTRY = re.compile(r"^[0-9a-f]{8}\.\d+$")
 
 
 def bundle_files(path: str) -> list[str]:
     """Return `path` itself, or the CA bundle files found under it."""
     if not os.path.isdir(path):
-        return [path]  # a missing file raises when it is opened
+        return [path]  # a missing file is reported when it is opened
     found = []
     for root, _dirs, files in os.walk(path):
         found.extend(
-            os.path.join(root, name) for name in files if name.endswith(BUNDLE_SUFFIXES)
+            os.path.join(root, name)
+            for name in files
+            if name.endswith(BUNDLE_SUFFIXES) or CAPATH_ENTRY.match(name)
         )
     return sorted(found)
 
@@ -51,8 +56,14 @@ def main(paths: list[str]) -> int:
     bad = []
     for path in paths:
         for bundle in bundle_files(path):
-            with open(bundle, encoding="ascii", errors="replace") as f:
-                certs = PEM.findall(f.read())
+            try:
+                with open(bundle, encoding="ascii", errors="replace") as f:
+                    certs = PEM.findall(f.read())
+            except OSError as exc:
+                # Missing, unreadable or a dangling symlink: a failure, but
+                # keep scanning so the report names every problem at once.
+                bad.append(f"{bundle}: unreadable ({exc.strerror})")
+                continue
             scanned += len(certs)
             for cert in certs:
                 try:
@@ -66,7 +77,9 @@ def main(paths: list[str]) -> int:
                 if fp in DISTRUSTED:
                     bad.append(f"{bundle}: {DISTRUSTED[fp]}")
     if bad:
-        print("Distrusted root CA still trusted:", *bad, sep="\n  ")
+        print(
+            "Distrusted root CA still trusted, or bundle unreadable:", *bad, sep="\n  "
+        )
         return 1
     if scanned == 0:
         print(f"No certificates found under {paths}: nothing was checked")

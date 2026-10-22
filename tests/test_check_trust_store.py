@@ -4,8 +4,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "trust_store"
 G3 = (FIXTURES / "emsign-ecc-g3.pem").read_text()  # distrusted
@@ -56,9 +54,19 @@ def test_no_certificates_fails(tmp_path: Path) -> None:
     assert guard.main([str(tmp_path)]) == 1
 
 
-def test_missing_file_fails(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        guard.main([str(tmp_path / "absent.crt")])
+def test_missing_file_fails_and_scanning_continues(tmp_path: Path, capsys) -> None:
+    bundle = tmp_path / "ca-certificates.crt"
+    bundle.write_text(G3)
+    assert guard.main([str(tmp_path / "absent.crt"), str(bundle)]) == 1
+    out = capsys.readouterr().out
+    assert "absent.crt: unreadable" in out
+    assert "emSign ECC Root CA - G3" in out
+
+
+def test_capath_hash_entry_is_scanned(tmp_path: Path) -> None:
+    (tmp_path / "ca-certificates.crt").write_text(G1)
+    (tmp_path / "f2ab3c4d.0").write_text(G3)
+    assert guard.main([str(tmp_path)]) == 1
 
 
 def test_undecodable_block_is_skipped(tmp_path: Path) -> None:

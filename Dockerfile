@@ -16,7 +16,7 @@ RUN apk add --no-cache sops age
 # emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2); 20260909-r3 and later don't.
 # The upstream rebuilds that dropped it moved to Python 3.15, so the digests
 # stay put and the bundle is upgraded here instead.
-RUN apk add --no-cache -u ca-certificates-bundle
+RUN apk add --no-cache -u 'ca-certificates-bundle>=20260909-r3'
 
 WORKDIR /app
 
@@ -54,11 +54,12 @@ COPY --from=build /opt/venv /opt/venv
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Fail the build if any trust store in this image (the OS bundle, its
-# /etc/ssl symlinks, certifi in the venv, or any other bundle under the
-# Python trees) still holds a distrusted root. The script is bind-mounted,
-# so it doesn't ship in the image. Exec form: this stage has no shell.
+# /etc/ssl symlinks, certifi in the venv, or any other bundle or CApath
+# entry under /usr/lib and /usr/share) still holds a distrusted root, or
+# can't be read. The script is bind-mounted, so it doesn't ship in the
+# image. Exec form: this stage has no shell.
 RUN --mount=type=bind,source=lib/check_trust_store.py,target=/tmp/check_trust_store.py \
-    ["/usr/bin/python3", "-I", "/tmp/check_trust_store.py", "/etc/ssl", "/opt/venv", "/usr/lib"]
+    ["/usr/bin/python3", "-I", "/tmp/check_trust_store.py", "/etc/ssl", "/opt/venv", "/usr/lib", "/usr/share"]
 
 ENV PATH=/opt/venv/bin:$PATH
 ENV SOPS_MCP_TRANSPORT=sse
