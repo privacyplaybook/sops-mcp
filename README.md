@@ -27,11 +27,12 @@ The simplest setup uses a single age recipient (the one CI private key). If you 
 
 ## Secret sources
 
-Every secret is one of three sources, recorded in `_meta_unencrypted`:
+Every secret is one of four sources, recorded in `_meta_unencrypted`:
 
 - **`generated`** — Cryptographically random values (Python `secrets` / OS CSPRNG). You specify length and charset; the server stores both so it can regenerate on rotation.
 - **`external`** — User-provided values encrypted as-is (SMTP credentials, third-party API keys, etc.). Preserved across rotation. Updated via `sops_update_external`.
 - **`derived`** — Computed from another key in the same file via a named transform. When the source is rotated (or an external source is updated), the derived value is automatically recomputed in topological order. Useful for things like Authelia's PBKDF2 hashes of OIDC client secrets.
+- **`copied`** — Copied from a key in another file by `sops_copy_secret`, for a value two deployments must share (a token one service issues and another presents). Only that tool makes one. See [Copying a secret between files](#copying-a-secret-between-files).
 
 ## Design
 
@@ -65,9 +66,10 @@ Three ideas shape the tool surface:
 
 | Tool | What it does |
 |------|--------------|
-| `sops_rotate_generated` | Regenerate all `generated` secrets. Derived secrets whose source was rotated are recomputed; others are preserved. External secrets are preserved. |
-| `sops_add_secrets` | Add new secrets to an existing file. Supports all three sources. Rejects collisions with existing keys. |
-| `sops_update_external` | Replace the value of an `external` secret. Cascades to any derived secrets that reference it. Rejects attempts to update `generated` or `derived`. |
+| `sops_rotate_generated` | Regenerate all `generated` secrets. Derived secrets whose source was rotated are recomputed; others are preserved. External and copied secrets are preserved. |
+| `sops_add_secrets` | Add new secrets to an existing file. Supports `generated`, `external` and `derived`. Rejects collisions with existing keys. |
+| `sops_copy_secret` | Copy one key's value from a source file into a destination file on the server, returning only the destination's new ciphertext. Both files must be in the same domain and encrypted to its recipients. Rejects a key that already exists in the destination. See [Copying a secret between files](#copying-a-secret-between-files). |
+| `sops_update_external` | Replace the value of an `external` secret. Cascades to any derived secrets that reference it. Rejects attempts to update `generated`, `derived` or `copied`. |
 | `sops_rename_secret` | Rename a key, preserving its value and metadata. Updates `from:` references in any derived secrets. |
 | `sops_delete_secrets` | Remove one or more keys. Rejects deleting a secret that another derived secret still references (unless the dependent is deleted in the same call). |
 | `sops_add_metadata` | Retrofit `_meta_unencrypted` onto a legacy SOPS file that lacks it. Supports `generated`, `external`, and `derived` entries. |
@@ -387,9 +389,32 @@ sops:
 - **Everything in the clear is an argument**: `name`, `namespace`, `labels`, `annotations` and `type`. The MAC covers plaintext too, so none of it can be edited afterwards. Label and annotation keys `data` and `stringData` are refused, because sops would encrypt them too.
 - **Key names follow Kubernetes' rule** (`[-._a-zA-Z0-9]+`), not the environment-variable one, so typed Secrets can use keys such as `tls.crt` or `.dockerconfigjson`. Values go in `stringData` as strings; the tool never writes base64 `data:`.
 - **Metadata lives in the `sops-mcp.privacyplaybook.com/meta` annotation**, as JSON with the same fields as `_meta_unencrypted`: the domain, and per secret its source, description, generation and derivation. It never holds a value. It cannot sit at the root, because kubectl's strict validation rejects an unknown root field. It does reach the cluster object, so don't put anything in a description you would not put in an annotation.
-- **The file is create-only.** Every mutation tool (`sops_rotate_generated`, `sops_add_secrets`, `sops_update_external`, `sops_rename_secret`, `sops_delete_secrets`, `sops_add_metadata`, `sops_rekey`) recognises it from its `sops` envelope, without decrypting, and refuses it. To change or rotate anything, call `sops_create_k8s_secret` again with the full set, supplying external values again. `sops_list_secrets` reads it: the key names under `stringData`, their sources from the annotation, and the domain.
+- **The file is create-only.** Every mutation tool (`sops_rotate_generated`, `sops_add_secrets`, `sops_copy_secret`, `sops_update_external`, `sops_rename_secret`, `sops_delete_secrets`, `sops_add_metadata`, `sops_rekey`) recognises it from its `sops` envelope, without decrypting, and refuses it. To change or rotate anything, call `sops_create_k8s_secret` again with the full set, supplying external values again. `sops_list_secrets` reads it: the key names under `stringData`, their sources from the annotation, and the domain.
 - **Minimum version.** The refusal exists only in the release that adds this tool and later ones. sops-mcp 0.11.0 and earlier have no such guard: `sops_add_secrets`, `sops_rekey` or any other mutation there would rewrite the manifest as a flat file, encrypting `kind:` and `metadata:` and adding root-level keys. The values still decrypt, so nothing is lost, but the manifest is no longer applyable. Don't point an older server at these files.
 
+
+### Copying a secret between files
+
+`sops_copy_secret` takes two encrypted files: `source_content`, with the key `source_key` to copy, and `encrypted_content`, the destination. It decrypts the source, adds the value to the destination under `key_name` (default: `source_key`), re-encrypts the destination and returns it with a summary. The value is never returned, logged or put in an error message, and the source file is not returned at all.
+
+- **Same domain only.** Both files must resolve to the same domain (from `domain`, or each file's recorded domain) and both must be encrypted to exactly its recipients. So the copy can be read by exactly the parties who could already read the original. Moving a value between domains is refused, as `sops_rekey` refuses moving a file: do that deliberately with the sops CLI.
+- **No overwrite.** A `key_name` already in the destination is refused, as in `sops_add_secrets`, and the key name must match `^[A-Z][A-Z0-9_]*$`. Every check that needs no key runs before anything is decrypted.
+- **Where it came from.** The destination's metadata records the copy, with the origin repo and path if you pass `source_repo` and `source_file`. Those are written in plaintext, so they must not be secret:
+
+  ```yaml
+  OLLAMA_TOKEN_PRIVATE_FEED:
+      source: copied
+      description: Ollama bearer token for private_feed
+      copied_from:
+          key: OLLAMA_TOKEN_PRIVATE_FEED
+          repo: owen/capsyshome
+          file: portainer/ollama/secrets.enc.yaml
+      last_rotated: "2026-11-05T12:00:00+00:00"
+  ```
+
+  `description` defaults to the source key's.
+
+**Rotation does not follow a copy.** The server sees one file at a time and cannot know where a value was copied to, so `sops_rotate_generated` on the source changes the original only, and every copy keeps the old value until it is copied again. A copy whose source key has a later `last_rotated` than its own is stale. To refresh one: rotate (or `sops_update_external`) the source, `sops_delete_secrets` the copy, then `sops_copy_secret` again. In the destination file, `sops_rotate_generated` preserves a copy and names it in its summary, and `sops_update_external` refuses it, since a copy changes only at its origin. Before rotating a key that has been copied, find its copies, for example by searching your repositories for `copied_from` entries naming it.
 
 ## Why these tools and not others
 
@@ -401,7 +426,7 @@ sops:
 
 **Tenant isolation on the SSE transport:** not yet. Domains separate key *sets*, not *callers*. A single `SOPS_MCP_API_TOKEN` grants every domain the server holds, so do not put two mutually distrusting parties behind one SSE server. Run one process each.
 
-**Other source types (imported, templated):** out of scope. Those are orchestration concerns — fetch values from Vault or compose URLs in your deployment templating layer, then pass the result here as an `external` secret.
+**Other source types (imported, templated):** out of scope. Those are orchestration concerns — fetch values from Vault or compose URLs in your deployment templating layer, then pass the result here as an `external` secret. `copied` is the exception, because both ends are files this server already manages under one domain: copying through the client would mean decrypting the value outside the server, which is what this server exists to avoid.
 
 ## Supply chain integrity
 

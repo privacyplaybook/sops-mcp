@@ -44,6 +44,7 @@ EXPECTED_REQUIRED = {
     # Added after v1 as well. 'domain' stays optional, as on every
     # creation tool.
     "sops_create_k8s_secret": {"name", "secrets"},
+    "sops_copy_secret": {"encrypted_content", "source_content", "source_key"},
 }
 
 
@@ -255,5 +256,6 @@ async def test_no_tool_was_removed(server):
     schemas = await _tool_schemas(server)
     v1_tools = set(EXPECTED_REQUIRED) - {
         "sops_list_domains", "sops_rekey", "sops_create_k8s_secret",
+        "sops_copy_secret",
     }
     assert v1_tools <= set(schemas)

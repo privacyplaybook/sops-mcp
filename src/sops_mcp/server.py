@@ -61,6 +61,38 @@ def _validate_key_name(name: str) -> None:
         )
 
 
+# The source recorded for a value sops_copy_secret copied in from another
+# file. Not in VALID_SOURCES: those are what a caller may ask
+# sops_add_secrets or sops_add_metadata for, and a copy is only ever made by
+# the copy tool, which is the one place that can vouch for where it came
+# from.
+COPIED_SOURCE = "copied"
+
+_ORIGIN_MAX = 256
+
+
+def _validate_origin(value: Any, what: str) -> str | None:
+    """An optional free-text origin (repo or path) for sops_copy_secret.
+
+    It is written to _meta_unencrypted, which is plaintext, so it is held
+    to one short printable line: no control characters to break the YAML
+    or a terminal, and a bound so it cannot carry a pasted file.
+    """
+    if value is None or value == "":
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) > _ORIGIN_MAX
+        or not value.isprintable()
+        or value != value.strip()
+    ):
+        raise ValueError(
+            f"Invalid {what}: must be one line of printable text with no "
+            f"leading or trailing spaces, at most {_ORIGIN_MAX} characters."
+        )
+    return value
+
+
 # --- Kubernetes Secret manifests -----------------------------------------
 
 # The annotation that carries what a flat file keeps in _meta_unencrypted.
@@ -820,6 +852,83 @@ class SopsMcpServer:
                     },
                 ),
                 Tool(
+                    name="sops_copy_secret",
+                    description=(
+                        "Copy one secret's value from one SOPS file into "
+                        "another, entirely on the server: the source key is "
+                        "decrypted and added to the destination file, which "
+                        "is re-encrypted and returned. The value is never "
+                        "returned. Both files must belong to the same domain "
+                        "and be encrypted to its recipients, so a copy never "
+                        "changes who can read the value. Rejects a key name "
+                        "that already exists in the destination. The copy "
+                        "is recorded as source 'copied'; it does not follow "
+                        "later rotations of the original, so re-copy (delete "
+                        "it, then copy again) after rotating the source. "
+                        "Requires a private key for the domain."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "encrypted_content": {
+                                "type": "string",
+                                "description": (
+                                    "Contents of the destination "
+                                    "secrets.enc.yaml file, which is "
+                                    "returned with the key added"
+                                ),
+                            },
+                            "source_content": {
+                                "type": "string",
+                                "description": (
+                                    "Contents of the source "
+                                    "secrets.enc.yaml file to copy from. "
+                                    "It is only read, never returned."
+                                ),
+                            },
+                            "source_key": {
+                                "type": "string",
+                                "description": "Key to copy from the source",
+                            },
+                            "key_name": {
+                                "type": "string",
+                                "description": (
+                                    "Key name in the destination (must match "
+                                    "^[A-Z][A-Z0-9_]*$ and not exist there). "
+                                    "Defaults to source_key."
+                                ),
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": (
+                                    "Description for the destination's "
+                                    "metadata. Defaults to the source "
+                                    "key's description, if it has one."
+                                ),
+                            },
+                            "source_repo": {
+                                "type": "string",
+                                "description": (
+                                    "Optional: the repository the source "
+                                    "file lives in (e.g. owner/repo), "
+                                    "recorded in plaintext metadata."
+                                ),
+                            },
+                            "source_file": {
+                                "type": "string",
+                                "description": (
+                                    "Optional: the source file's path in "
+                                    "that repository, recorded in "
+                                    "plaintext metadata."
+                                ),
+                            },
+                        },
+                        "required": [
+                            "encrypted_content", "source_content", "source_key",
+                        ],
+                    },
+                ),
+                Tool(
                     name="sops_add_metadata",
                     description=(
                         "Add _meta_unencrypted metadata to an existing "
@@ -1148,6 +1257,8 @@ class SopsMcpServer:
                     return await self._rotate_generated(arguments)
                 if name == "sops_add_secrets":
                     return await self._add_secrets(arguments)
+                if name == "sops_copy_secret":
+                    return await self._copy_secret(arguments)
                 if name == "sops_add_metadata":
                     return await self._add_metadata(arguments)
                 if name == "sops_delete_secrets":
@@ -1655,6 +1766,7 @@ class SopsMcpServer:
         recomputed: list[str] = []
         preserved: list[str] = []
         derived_plaintexts: list[str] = []
+        copied: list[str] = []
 
         order = topological_order(meta_secrets)
         changed: set[str] = set()
@@ -1709,6 +1821,8 @@ class SopsMcpServer:
                     )
                 new_data[key] = decrypted[key]
                 preserved.append(key)
+                if info.get("source") == COPIED_SOURCE:
+                    copied.append(key)
 
         new_data["_meta_unencrypted"] = self._meta_block(
             meta_secrets, domain, meta.get("version", 1)
@@ -1723,6 +1837,15 @@ class SopsMcpServer:
             summary_lines.append(f"  Recomputed (derived): {', '.join(recomputed)}")
         if preserved:
             summary_lines.append(f"  Preserved: {', '.join(preserved)}")
+        if copied:
+            # Rotation never reaches a copy, in either direction: this file
+            # cannot see the files its keys were copied to, and a copy here
+            # changes only at its origin.
+            summary_lines.append(
+                f"  Not rotated (copied from another file): "
+                f"{', '.join(copied)}. Rotate them at their origin, then "
+                "copy them again."
+            )
 
         return _mutation_response(
             encrypted_yaml, summary_lines, derived_plaintexts, "changed"
@@ -1792,6 +1915,173 @@ class SopsMcpServer:
         return _mutation_response(
             encrypted_yaml, summary_lines, derived_plaintexts, "new"
         )
+
+    async def _copy_secret(
+        self, arguments: dict[str, Any]
+    ) -> Sequence[TextContent]:
+        """Copy one key's value from a source file into a destination file.
+
+        The value goes from one sops decrypt to one sops encrypt inside
+        this process and is never returned, logged or put in an error.
+        Both files must resolve to the same domain and match its
+        recipients: the copy is then readable by exactly the parties who
+        could already read the original, so it never widens access. Moving
+        a value between domains reads with one key set and writes to
+        another, which this design deliberately leaves to the sops CLI
+        (see sops_rekey).
+
+        Every check that needs no key runs before the first decrypt, so a
+        refused call never decrypts anything.
+        """
+        content = arguments.get("encrypted_content", "")
+        if not content:
+            raise ValueError("No destination encrypted_content provided")
+        source_content = arguments.get("source_content", "")
+        if not source_content:
+            raise ValueError("No source_content provided")
+
+        source_key = arguments.get("source_key", "")
+        if not source_key or not isinstance(source_key, str):
+            raise ValueError("source_key is required")
+        key_name = arguments.get("key_name") or source_key
+        if not isinstance(key_name, str):
+            raise ValueError("key_name must be a string")
+        _validate_key_name(key_name)
+        description = arguments.get("description")
+        if description is not None and not isinstance(description, str):
+            raise ValueError("description must be a string")
+        origin_repo = _validate_origin(arguments.get("source_repo"), "source_repo")
+        origin_file = _validate_origin(arguments.get("source_file"), "source_file")
+
+        parsed = self._parse_for_mutation(content)
+        try:
+            source_parsed = yaml.safe_load(source_content)
+        except yaml.YAMLError as exc:
+            # Not echoed, as in _parse_for_mutation: the parser quotes the
+            # offending line, and this may be a decrypted file.
+            raise ValueError("Source content is not valid YAML") from exc
+        if not isinstance(source_parsed, dict) or not isinstance(
+            source_parsed.get("sops"), dict
+        ):
+            raise ValueError(
+                "Source content is not a SOPS-encrypted file (no 'sops' "
+                "metadata block)"
+            )
+        if _is_k8s_secret_layout(source_parsed):
+            raise ValueError(
+                "Source is a Kubernetes Secret manifest. Copying out of one "
+                "is not supported: its values sit under stringData, not at "
+                "the top level."
+            )
+
+        existing_keys = {
+            k for k in parsed if k != "sops" and not k.startswith("_")
+        }
+        if key_name in existing_keys:
+            raise ValueError(
+                f"Key {key_name!r} already exists in the destination file. "
+                "Pass a different key_name, or delete it first to refresh "
+                "a copy."
+            )
+        source_keys = {
+            k for k in source_parsed
+            if k != "sops" and isinstance(k, str) and not k.startswith("_")
+        }
+        if source_key not in source_keys:
+            raise ValueError(f"Key {source_key!r} not found in source file")
+
+        meta = parsed.get("_meta_unencrypted", {})
+        meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
+        if not isinstance(meta_secrets, dict):
+            meta_secrets = {}
+        source_meta = source_parsed.get("_meta_unencrypted", {})
+
+        domain = self._resolve_domain(arguments, meta)
+        source_domain = self._resolve_domain(arguments, source_meta)
+        if source_domain.name != domain.name:
+            raise ValueError(
+                f"Source file belongs to domain '{source_domain.name}' and "
+                f"the destination to '{domain.name}'. sops_copy_secret only "
+                "copies within one domain, so a copy is never readable by "
+                "anyone who could not already read the original. To move a "
+                "value between domains deliberately, use the sops CLI."
+            )
+        try:
+            self._check_recipients(source_content, domain)
+        except ValueError as exc:
+            raise ValueError(f"Source file: {exc}") from exc
+        self._check_recipients(content, domain)
+
+        source_values = self.encryptor.decrypt(source_content, domain)
+        if source_key not in source_values:
+            # The envelope listed it, so sops dropped or renamed it: never
+            # expected, and not worth guessing about.
+            raise ValueError(f"Key {source_key!r} not found in source file")
+        decrypted = self.encryptor.decrypt(content, domain)
+
+        new_data: dict[str, Any] = {
+            k: v for k, v in decrypted.items() if not k.startswith("_")
+        }
+        preserved = list(new_data)
+        new_data[key_name] = source_values[source_key]
+
+        # Read after the decrypt, so the MAC has vouched for the source's
+        # metadata; a field of the wrong type still reads as absent.
+        source_info: Any = {}
+        if isinstance(source_meta, dict) and isinstance(
+            source_meta.get("secrets"), dict
+        ):
+            source_info = source_meta["secrets"].get(source_key, {})
+        if not isinstance(source_info, dict):
+            source_info = {}
+        if description is None and isinstance(
+            source_info.get("description"), str
+        ):
+            description = source_info["description"]
+
+        copied_from: dict[str, Any] = {"key": source_key}
+        if origin_repo:
+            copied_from["repo"] = origin_repo
+        if origin_file:
+            copied_from["file"] = origin_file
+        entry: dict[str, Any] = {"source": COPIED_SOURCE}
+        if description:
+            entry["description"] = description
+        entry["copied_from"] = copied_from
+        # The time this file's value was set. A source whose own
+        # last_rotated is later than this has been rotated since, and the
+        # copy is stale.
+        entry["last_rotated"] = datetime.now(UTC).isoformat()
+
+        merged_meta = dict(meta_secrets)
+        merged_meta[key_name] = entry
+        new_data["_meta_unencrypted"] = self._meta_block(
+            merged_meta,
+            domain,
+            meta.get("version", 1) if isinstance(meta, dict) else 1,
+        )
+
+        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+
+        where = " ".join(
+            part for part in (origin_repo, origin_file) if part
+        )
+        summary = [
+            "Secret copied:",
+            f"  {key_name}: copied from {source_key}"
+            + (f" ({where})" if where else ""),
+        ]
+        if preserved:
+            summary.append(f"Preserved: {', '.join(preserved)}")
+        summary.append(
+            "The copy does not follow the original: after rotating "
+            f"{source_key} at its origin, delete {key_name} here and copy "
+            "it again."
+        )
+        return [
+            TextContent(type="text", text=encrypted_yaml),
+            TextContent(type="text", text="\n".join(summary)),
+        ]
 
     async def _add_metadata(
         self, arguments: dict[str, Any]
@@ -2131,8 +2421,14 @@ class SopsMcpServer:
         if source != "external":
             raise ValueError(
                 f"Cannot update {key_name!r}: source is {source!r}, "
-                "not 'external'. Use sops_rotate_generated for generated "
-                "or derived secrets."
+                "not 'external'. "
+                + (
+                    "A copied secret changes only at its origin: delete it "
+                    "here and run sops_copy_secret again."
+                    if source == COPIED_SOURCE
+                    else "Use sops_rotate_generated for generated or "
+                    "derived secrets."
+                )
             )
 
         domain = self._resolve_domain(arguments, meta)
