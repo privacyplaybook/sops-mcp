@@ -401,6 +401,8 @@ async def test_rotation_preserves_a_copy_and_says_so(server):
     out = await _rotate(server, await _copied(server))
     assert _decrypt(server, out[0])["OLLAMA_TOKEN"] == PLAINTEXT
     assert "Not rotated (copied from another file): OLLAMA_TOKEN" in out[1]
+    preserved = next(x for x in out[1].splitlines() if "Preserved:" in x)
+    assert "OLLAMA_TOKEN" not in preserved
 
 
 async def _rotate(server, blob) -> list[str]:
@@ -442,3 +444,94 @@ async def test_list_shows_the_copy(server):
     })
     line = next(x for x in texts[0].splitlines() if x.startswith("OLLAMA_TOKEN"))
     assert "copied" in line
+
+
+# --- review round 1 ---------------------------------------------------------
+
+
+async def test_refuses_a_legacy_destination_without_decrypting(
+    server, monkeypatch
+):
+    """A block naming only the copy would make rotation drop the rest."""
+    default = server.domains["default"]
+    legacy = server.encryptor.encrypt(
+        {"LEGACY_A": "a", "LEGACY_B": "b"}, default
+    )
+    source = await _source(server)
+    calls = _count_decrypts(server, monkeypatch)
+    texts = await _call(server, "sops_copy_secret", {
+        "encrypted_content": legacy,
+        "source_content": source,
+        "source_key": "OLLAMA_TOKEN",
+    })
+    assert "no _meta_unencrypted block" in texts[0]
+    assert "sops_add_metadata" in texts[0]
+    assert calls[0] == 0
+
+
+async def test_source_domain_errors_name_the_source(server):
+    dest = await _dest(server)
+    source = server.encryptor.encrypt(
+        {
+            "OLLAMA_TOKEN": PLAINTEXT,
+            "_meta_unencrypted": {"version": 1, "domain": "gamma",
+                                  "secrets": {}},
+        },
+        server.domains["default"],
+    )
+    texts = await _call(server, "sops_copy_secret", {
+        "encrypted_content": dest,
+        "source_content": source,
+        "source_key": "OLLAMA_TOKEN",
+    })
+    assert texts[0].startswith("Error: Source file: Unknown domain 'gamma'")
+
+
+async def test_source_decrypt_errors_name_the_source(server):
+    """A tampered source fails its MAC; the error says which file."""
+    dest = await _dest(server)
+    source = (await _source(server)).replace(
+        "Ollama bearer token", "Ollama bearer tokeX"
+    )
+    texts = await _call(server, "sops_copy_secret", {
+        "encrypted_content": dest,
+        "source_content": source,
+        "source_key": "OLLAMA_TOKEN",
+    })
+    assert texts[0].startswith("Error: Source file: sops decrypt failed")
+    assert PLAINTEXT not in texts[0]
+
+
+async def test_cross_domain_refusal_points_at_the_domain_argument(server):
+    beta = server.domains["beta"]
+    source = await _source(server, domain="beta")
+    # Has metadata but records no domain, as an older version leaves it.
+    dest = server.encryptor.encrypt(
+        {
+            "DB_PASSWORD": DEST_PLAINTEXT,
+            "_meta_unencrypted": {"version": 1, "secrets": {
+                "DB_PASSWORD": {"source": "external"},
+            }},
+        },
+        beta,
+    )
+    args = {
+        "encrypted_content": dest,
+        "source_content": source,
+        "source_key": "OLLAMA_TOKEN",
+    }
+    texts = await _call(server, "sops_copy_secret", args)
+    assert "pass 'domain'" in texts[0]
+    out = await _call(server, "sops_copy_secret", {**args, "domain": "beta"})
+    assert _decrypt(server, out[0], "beta")["OLLAMA_TOKEN"] == PLAINTEXT
+
+
+async def test_client_facing_descriptions_mention_copies(server):
+    from mcp.types import ListToolsRequest
+
+    result = await server.server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+    tools = {t.name: t.description for t in result.root.tools}
+    assert "'copied'" in tools["sops_rotate_generated"]
+    assert "'copied'" in tools["sops_update_external"]

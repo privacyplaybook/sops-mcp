@@ -807,7 +807,10 @@ class SopsMcpServer:
                     name="sops_rotate_generated",
                     description=(
                         "Re-generate 'generated' secrets with new random values "
-                        "while preserving 'external' secrets. Requires "
+                        "while preserving 'external' secrets. 'copied' "
+                        "secrets are preserved too: they change only by "
+                        "copying again, and rotating a key here does not "
+                        "update copies of it in other files. Requires "
                         "a private key for the target domain."
                     ),
                     inputSchema={
@@ -1054,7 +1057,9 @@ class SopsMcpServer:
                         "(e.g. after the user rotated an upstream API "
                         "key). Rejects attempts to update 'generated' "
                         "or 'derived' secrets — use sops_rotate_generated "
-                        "for those. Recomputes any derived secrets that "
+                        "for those — and 'copied' ones, which change only "
+                        "by deleting and copying again. Recomputes any "
+                        "derived secrets that "
                         "reference this key. Requires a private key for the domain."
                     ),
                     inputSchema={
@@ -1814,15 +1819,15 @@ class SopsMcpServer:
                     new_data[key] = decrypted[key]
                     preserved.append(key)
             else:
+                is_copy = source == COPIED_SOURCE
                 if key not in decrypted:
                     raise ValueError(
-                        f"External secret {key!r} is in metadata but "
-                        "missing from encrypted file"
+                        f"{'Copied' if is_copy else 'External'} secret "
+                        f"{key!r} is in metadata but missing from encrypted "
+                        "file"
                     )
                 new_data[key] = decrypted[key]
-                preserved.append(key)
-                if info.get("source") == COPIED_SOURCE:
-                    copied.append(key)
+                (copied if is_copy else preserved).append(key)
 
         new_data["_meta_unencrypted"] = self._meta_block(
             meta_secrets, domain, meta.get("version", 1)
@@ -1990,21 +1995,37 @@ class SopsMcpServer:
         if source_key not in source_keys:
             raise ValueError(f"Key {source_key!r} not found in source file")
 
-        meta = parsed.get("_meta_unencrypted", {})
-        meta_secrets = meta.get("secrets", {}) if isinstance(meta, dict) else {}
-        if not isinstance(meta_secrets, dict):
-            meta_secrets = {}
+        meta = parsed.get("_meta_unencrypted")
+        if not isinstance(meta, dict) or not isinstance(
+            meta.get("secrets"), dict
+        ):
+            # A block holding only the copy would describe one key of
+            # several: sops_add_metadata then refuses the file, and
+            # sops_rotate_generated, which rebuilds from the block, drops
+            # every key it does not list.
+            raise ValueError(
+                "Destination file has no _meta_unencrypted block. Run "
+                "sops_add_metadata on it first, so every key it holds is "
+                "described, then copy."
+            )
+        meta_secrets = meta["secrets"]
         source_meta = source_parsed.get("_meta_unencrypted", {})
 
         domain = self._resolve_domain(arguments, meta)
-        source_domain = self._resolve_domain(arguments, source_meta)
+        try:
+            source_domain = self._resolve_domain(arguments, source_meta)
+        except ValueError as exc:
+            raise ValueError(f"Source file: {exc}") from exc
         if source_domain.name != domain.name:
             raise ValueError(
                 f"Source file belongs to domain '{source_domain.name}' and "
                 f"the destination to '{domain.name}'. sops_copy_secret only "
                 "copies within one domain, so a copy is never readable by "
-                "anyone who could not already read the original. To move a "
-                "value between domains deliberately, use the sops CLI."
+                "anyone who could not already read the original. If a file "
+                "records no domain (it then counts as "
+                f"'{DEFAULT_DOMAIN}'), pass 'domain' to name the one both "
+                "are in. To move a value between domains deliberately, use "
+                "the sops CLI."
             )
         try:
             self._check_recipients(source_content, domain)
@@ -2012,7 +2033,10 @@ class SopsMcpServer:
             raise ValueError(f"Source file: {exc}") from exc
         self._check_recipients(content, domain)
 
-        source_values = self.encryptor.decrypt(source_content, domain)
+        try:
+            source_values = self.encryptor.decrypt(source_content, domain)
+        except SopsError as exc:
+            raise SopsError(f"Source file: {exc}") from exc
         if source_key not in source_values:
             # The envelope listed it, so sops dropped or renamed it: never
             # expected, and not worth guessing about.
@@ -2078,10 +2102,8 @@ class SopsMcpServer:
             f"{source_key} at its origin, delete {key_name} here and copy "
             "it again."
         )
-        return [
-            TextContent(type="text", text=encrypted_yaml),
-            TextContent(type="text", text="\n".join(summary)),
-        ]
+        # Never any derived plaintexts: a copy derives nothing.
+        return _mutation_response(encrypted_yaml, summary, [], "new")
 
     async def _add_metadata(
         self, arguments: dict[str, Any]
