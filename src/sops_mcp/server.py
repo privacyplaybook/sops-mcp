@@ -864,7 +864,10 @@ class SopsMcpServer:
                         "returned. Both files must belong to the same domain "
                         "and be encrypted to its recipients, so a copy never "
                         "changes who can read the value. Rejects a key name "
-                        "that already exists in the destination. The copy "
+                        "that already exists in the destination, and a "
+                        "destination whose _meta_unencrypted block is "
+                        "missing or does not describe every key (run "
+                        "sops_add_metadata on a legacy file first). The copy "
                         "is recorded as source 'copied'; it does not follow "
                         "later rotations of the original, so re-copy (delete "
                         "it, then copy again) after rotating the source. "
@@ -1057,8 +1060,9 @@ class SopsMcpServer:
                         "(e.g. after the user rotated an upstream API "
                         "key). Rejects attempts to update 'generated' "
                         "or 'derived' secrets — use sops_rotate_generated "
-                        "for those — and 'copied' ones, which change only "
-                        "by deleting and copying again. Recomputes any "
+                        "for those. Also rejects 'copied' secrets: delete "
+                        "them with sops_delete_secrets and run "
+                        "sops_copy_secret again. Recomputes any "
                         "derived secrets that "
                         "reference this key. Requires a private key for the domain."
                     ),
@@ -1821,10 +1825,13 @@ class SopsMcpServer:
             else:
                 is_copy = source == COPIED_SOURCE
                 if key not in decrypted:
+                    kind = {
+                        "external": "External secret",
+                        COPIED_SOURCE: "Copied secret",
+                    }.get(source, f"Secret (source {source!r})")
                     raise ValueError(
-                        f"{'Copied' if is_copy else 'External'} secret "
-                        f"{key!r} is in metadata but missing from encrypted "
-                        "file"
+                        f"{kind} {key!r} is in metadata but missing from "
+                        "encrypted file"
                     )
                 new_data[key] = decrypted[key]
                 (copied if is_copy else preserved).append(key)
@@ -1995,20 +2002,36 @@ class SopsMcpServer:
         if source_key not in source_keys:
             raise ValueError(f"Key {source_key!r} not found in source file")
 
-        meta = parsed.get("_meta_unencrypted")
-        if not isinstance(meta, dict) or not isinstance(
-            meta.get("secrets"), dict
-        ):
-            # A block holding only the copy would describe one key of
-            # several: sops_add_metadata then refuses the file, and
-            # sops_rotate_generated, which rebuilds from the block, drops
-            # every key it does not list.
+        # The destination's metadata must describe every key it holds.
+        # sops_rotate_generated rebuilds a file from its block, so a key the
+        # block does not list is dropped by the next rotation; adding the
+        # copy would also turn a file with no block into one that
+        # sops_add_metadata refuses, and one with an empty block (which
+        # rotation refuses) into one rotation accepts.
+        if "_meta_unencrypted" not in parsed:
             raise ValueError(
                 "Destination file has no _meta_unencrypted block. Run "
                 "sops_add_metadata on it first, so every key it holds is "
                 "described, then copy."
             )
+        meta = parsed["_meta_unencrypted"]
+        if not isinstance(meta, dict) or not isinstance(
+            meta.get("secrets"), dict
+        ):
+            raise ValueError(
+                "Destination file's _meta_unencrypted block is malformed "
+                "(no 'secrets' mapping). sops_add_metadata cannot repair "
+                "a file that has a block; fix it with the sops CLI."
+            )
         meta_secrets = meta["secrets"]
+        undescribed = sorted(existing_keys - set(meta_secrets))
+        if undescribed:
+            raise ValueError(
+                "Destination file's _meta_unencrypted block does not "
+                f"describe {', '.join(undescribed)}, so a later "
+                "sops_rotate_generated would drop them. Describe them with "
+                "the sops CLI (or rebuild the file), then copy."
+            )
         source_meta = source_parsed.get("_meta_unencrypted", {})
 
         domain = self._resolve_domain(arguments, meta)
@@ -2031,7 +2054,10 @@ class SopsMcpServer:
             self._check_recipients(source_content, domain)
         except ValueError as exc:
             raise ValueError(f"Source file: {exc}") from exc
-        self._check_recipients(content, domain)
+        try:
+            self._check_recipients(content, domain)
+        except ValueError as exc:
+            raise ValueError(f"Destination file: {exc}") from exc
 
         try:
             source_values = self.encryptor.decrypt(source_content, domain)
@@ -2041,7 +2067,10 @@ class SopsMcpServer:
             # The envelope listed it, so sops dropped or renamed it: never
             # expected, and not worth guessing about.
             raise ValueError(f"Key {source_key!r} not found in source file")
-        decrypted = self.encryptor.decrypt(content, domain)
+        try:
+            decrypted = self.encryptor.decrypt(content, domain)
+        except SopsError as exc:
+            raise SopsError(f"Destination file: {exc}") from exc
 
         new_data: dict[str, Any] = {
             k: v for k, v in decrypted.items() if not k.startswith("_")
@@ -2080,9 +2109,7 @@ class SopsMcpServer:
         merged_meta = dict(meta_secrets)
         merged_meta[key_name] = entry
         new_data["_meta_unencrypted"] = self._meta_block(
-            merged_meta,
-            domain,
-            meta.get("version", 1) if isinstance(meta, dict) else 1,
+            merged_meta, domain, meta.get("version", 1)
         )
 
         encrypted_yaml = self.encryptor.encrypt(new_data, domain)

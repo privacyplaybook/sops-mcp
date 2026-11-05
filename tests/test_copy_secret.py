@@ -535,3 +535,85 @@ async def test_client_facing_descriptions_mention_copies(server):
     tools = {t.name: t.description for t in result.root.tools}
     assert "'copied'" in tools["sops_rotate_generated"]
     assert "'copied'" in tools["sops_update_external"]
+
+
+# --- review round 2 ---------------------------------------------------------
+
+
+def _dest_with_meta(server, meta) -> str:
+    return server.encryptor.encrypt(
+        {"LEGACY_A": "a", "LEGACY_B": "b", "_meta_unencrypted": meta},
+        server.domains["default"],
+    )
+
+
+@pytest.mark.parametrize(
+    "secrets",
+    [{}, {"LEGACY_A": {"source": "external"}}],
+    ids=["empty", "partial"],
+)
+async def test_refuses_a_destination_whose_block_misses_keys(
+    server, monkeypatch, secrets
+):
+    """Rotation rebuilds from the block, so an unlisted key would be lost."""
+    dest = _dest_with_meta(server, {"version": 1, "secrets": secrets})
+    source = await _source(server)
+    calls = _count_decrypts(server, monkeypatch)
+    texts = await _call(server, "sops_copy_secret", {
+        "encrypted_content": dest,
+        "source_content": source,
+        "source_key": "OLLAMA_TOKEN",
+    })
+    assert "does not describe" in texts[0]
+    assert "LEGACY_B" in texts[0]
+    assert calls[0] == 0
+
+
+@pytest.mark.parametrize("meta", [None, {"version": 1, "secrets": []}])
+async def test_a_malformed_destination_block_is_not_sent_to_add_metadata(
+    server, meta
+):
+    dest = _dest_with_meta(server, meta)
+    texts = await _call(server, "sops_copy_secret", {
+        "encrypted_content": dest,
+        "source_content": await _source(server),
+        "source_key": "OLLAMA_TOKEN",
+    })
+    assert "malformed" in texts[0]
+    assert "sops_add_metadata on it first" not in texts[0]
+
+
+async def test_destination_errors_name_the_destination(server):
+    source = await _source(server)
+    # An edited metadata value: the MAC covers it, so decryption fails.
+    tampered = yaml.safe_load(await _dest(server))
+    tampered["_meta_unencrypted"]["secrets"]["DB_PASSWORD"]["description"] = "x"
+    dest = yaml.safe_dump(tampered)
+    texts = await _call(server, "sops_copy_secret", {
+        "encrypted_content": dest,
+        "source_content": source,
+        "source_key": "OLLAMA_TOKEN",
+    })
+    assert texts[0].startswith("Error: Destination file: sops decrypt failed")
+    assert PLAINTEXT not in texts[0]
+
+
+@pytest.mark.parametrize(
+    ("source", "kind"),
+    [("copied", "Copied secret"), ("externl", "Secret (source 'externl')")],
+)
+async def test_rotation_names_a_missing_key_by_its_source(server, source, kind):
+    blob = server.encryptor.encrypt(
+        {
+            "DB_PASSWORD": DEST_PLAINTEXT,
+            "_meta_unencrypted": {"version": 1, "domain": "default", "secrets": {
+                "DB_PASSWORD": {"source": "external"},
+                "GONE": {"source": source},
+            }},
+        },
+        server.domains["default"],
+    )
+    texts = await _rotate(server, blob)
+    assert texts[0] == (
+        f"Error: {kind} 'GONE' is in metadata but missing from encrypted file"
+    )

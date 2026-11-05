@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into a destination file, decrypting and re-encrypting on the server, so
   the value never reaches the client. It returns only the destination's new
   ciphertext. Both files must be in the same domain and encrypted to its
-  recipients; an existing destination key is refused. The copy is recorded
-  as a new source, `copied`, with a `copied_from` entry naming the source
+  recipients; an existing destination key is refused, and so is a
+  destination whose `_meta_unencrypted` block is missing or does not
+  describe every key it holds (rotation would drop those keys). The copy is
+  recorded as a new source, `copied`, with a `copied_from` entry naming the source
   key and, if given, its repo and file. Rotation does not follow a copy:
   `sops_rotate_generated` preserves it and says so, and
   `sops_update_external` refuses it. Refresh one by deleting it and copying
