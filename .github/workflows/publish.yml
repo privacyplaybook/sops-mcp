@@ -27,25 +27,28 @@ jobs:
       - name: Gate on a clean dependency vulnerability scan
         uses: ./.github/actions/vuln-scan
 
-  publish:
+  # Builds the image once, to an OCI archive on the runner, and scans that
+  # archive. Nothing is pushed here, and this job holds no write token, no
+  # registry login and no OIDC permission: the scanner (a downloaded Grype
+  # binary reading a freshly downloaded DB) never runs next to a credential.
+  # The publish job below pushes these exact bytes, so the image on GHCR is
+  # the one scanned, by digest.
+  build-and-scan:
     needs: verify-supply-chain
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
+      # No token left in .git/config for the scanner to find.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags
         id: meta
@@ -57,16 +60,95 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push image
+      # The OCI archive holds the image index, the image and the BuildKit
+      # SBOM and provenance attestations, all pushed unchanged below.
+      - name: Build image to an OCI archive (no push)
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=oci,dest=${{ runner.temp }}/image.tar
           labels: ${{ steps.meta.outputs.labels }}
           provenance: mode=max
           sbom: true
+
+      # Threshold: fails on a fixable vulnerability of severity HIGH or
+      # CRITICAL (same as ci.yml). Allowlist: .grype.yaml.
+      - name: Scan the image for vulnerabilities
+        uses: ./.github/actions/image-scan
+        with:
+          image: oci-archive:${{ runner.temp }}/image.tar
+          fail-on: high
+
+      - name: Hand the scanned archive to the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-oci
+          path: ${{ runner.temp }}/image.tar
+          # Long enough to re-run only the publish job after a transient
+          # GHCR or Sigstore failure, without rebuilding.
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Fetch the scanned archive
+        uses: actions/download-artifact@v4
+        with:
+          name: image-oci
+          path: ${{ runner.temp }}/oci
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The archive is unpacked once into an OCI layout. Before anything is
+      # pushed, its index must be exactly the one the scan job built
+      # (BUILT); a swapped or corrupted artifact stops here. Then skopeo
+      # (preinstalled on ubuntu-latest) copies the image index, with every
+      # manifest and attestation, to each tag: --preserve-digests refuses
+      # any conversion that would change the digest, and each tag is checked
+      # again after its push. skopeo reads the credential docker/login-action
+      # wrote to ~/.docker/config.json.
+      - name: Push the scanned image
+        id: push
+        env:
+          ARCHIVE: ${{ runner.temp }}/oci/image.tar
+          TAGS: ${{ needs.build-and-scan.outputs.tags }}
+          BUILT: ${{ needs.build-and-scan.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$BUILT" in sha256:*) ;; *) echo "::error::no build digest"; exit 1;; esac
+          layout="$RUNNER_TEMP/oci-layout"
+          mkdir -p "$layout"
+          tar -xf "$ARCHIVE" -C "$layout"
+          archived=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].digest else "several" end' "$layout/index.json")
+          if [ "$archived" != "$BUILT" ]; then
+            echo "::error::archive holds $archived, not the scanned $BUILT; nothing pushed"
+            exit 1
+          fi
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/pushed" \
+              "oci:$layout" "docker://$tag"
+            pushed=$(cat "$RUNNER_TEMP/pushed")
+            echo "$tag -> $pushed"
+            if [ "$pushed" != "$BUILT" ]; then
+              echo "::error::$tag was pushed as $pushed, not the scanned $BUILT; not signing"
+              exit 1
+            fi
+          done <<< "$TAGS"
+          echo "digest=$BUILT" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -74,5 +156,5 @@ jobs:
       - name: Sign image with cosign (keyless)
         env:
           IMAGE: ghcr.io/${{ github.repository }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"

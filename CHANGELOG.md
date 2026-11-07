@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trust-store check and import, before it merges rather than after.
 - The README no longer claims `sops` and `age` are pinned by the base image
   digest: `apk` installs the newest at build time.
+- **The Docker image is scanned for vulnerabilities** with Grype 0.121.1
+  (pinned by SHA-256): the Wolfi OS packages, the venv's Python packages and
+  the Go binaries `sops`, `age` and `age-keygen`. A fixable vulnerability of
+  severity high or above fails the PR image build and stops `publish.yml`
+  before anything is pushed. `publish.yml` now builds once to an OCI archive,
+  scans it in a job with no credentials, and pushes those exact bytes by
+  digest with `skopeo`, then signs them. Accepted findings go in
+  `.grype.yaml`, one `vulnerability:` and `reason:` per rule.
 
 ### Security
 

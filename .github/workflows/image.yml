@@ -1,15 +1,16 @@
 name: Image build
 
-# Builds the Docker image on every pull request, without pushing it, and
-# smoke-tests the result. publish.yml builds only after merge, so a
+# Builds the Docker image on every pull request, without pushing it,
+# smoke-tests the result and scans it with Grype
+# (.github/actions/image-scan). publish.yml builds only after merge, so a
 # base-image or lockfile change (a new Python, an sdist that won't compile,
 # a trust-store regression caught by lib/check_trust_store.py, a locked
 # upgrade that breaks on import) would otherwise first fail on main.
 #
-# Keep the build inputs in step with publish.yml's "Build and push image"
-# step (context, platforms, build args). It does not cover that step's
-# provenance and SBOM attestations, which a loaded (non-pushed) image can't
-# carry; see #49 for sharing one build definition.
+# Keep the build inputs in step with publish.yml's "Build image to an OCI
+# archive (no push)" step (context, platforms, build args). It does not
+# cover that step's provenance and SBOM attestations, which a loaded
+# (non-pushed) image can't carry; see #49 for sharing one build definition.
 on:
   pull_request:
     branches: [main]
@@ -27,7 +28,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # No token left in .git/config for the scanner below to find.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -62,3 +66,19 @@ jobs:
           fi
           echo "$out" | tail -n 1
           echo "$out" | grep -q 'Refusing to bind the SSE transport to 0.0.0.0'
+
+      # Scans the image just built for OS-package (Wolfi apk), Python and
+      # binary vulnerabilities, including the Go binaries sops, age and
+      # age-keygen copied into the runtime stage (catalogued by their
+      # embedded Go build info). Threshold: fails on a fixable
+      # vulnerability of severity HIGH or CRITICAL; unfixed ones and lower
+      # severities don't fail. Allowlist: .grype.yaml (each rule names a
+      # vulnerability and gives a reason).
+      # publish.yml runs the same scan, at the same threshold, before it
+      # pushes anything. Not a required check (the ruleset is the
+      # operator's to change).
+      - name: Scan the image for vulnerabilities
+        uses: ./.github/actions/image-scan
+        with:
+          image: docker:sops-mcp:pr
+          fail-on: high

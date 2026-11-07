@@ -1,0 +1,149 @@
+name: Image vulnerability scan
+description: >
+  Fail if a container image carries a known vulnerability that has a fix
+  available, at or above a severity threshold. Scans everything Grype
+  catalogs in the image: the Wolfi apk database (glibc, zlib, python and the
+  rest of the base), the Python packages in /opt/venv, and any Go or Rust
+  binary by its embedded build info. This complements vuln-scan, which
+  audits only requirements.lock.txt and never sees the base image.
+
+  Why: on 2026-11-07 the pinned runtime base carried open Wolfi advisories
+  against python-3.14, glibc and zlib while every check was green (#47,
+  #52). Dependabot moves the base digests weekly, but it tracks digests,
+  not vulnerabilities.
+
+  Allowlist: .grype.yaml at the repo root (`ignore:` rules). Every rule
+  must name a `vulnerability:` and carry a non-empty `reason:`, and the file
+  may hold no other setting; the first step below fails otherwise.
+
+  Runs on x86-64 Linux runners only (the pinned Grype asset is
+  linux_amd64); it fails up front anywhere else.
+
+inputs:
+  image:
+    description: >
+      Image to scan, as Grype source syntax. `docker:<ref>` reads an image
+      loaded into the local Docker daemon (build-push-action with
+      `load: true`); `oci-archive:<path>` reads an OCI archive
+      (build-push-action with `outputs: type=oci,dest=<path>`);
+      `registry:<ref>` pulls straight from a registry.
+    required: true
+  fail-on:
+    description: >
+      Lowest severity that fails the scan (negligible, low, medium, high,
+      critical). Only vulnerabilities with a fix available count. Callers
+      state it explicitly, so the threshold is visible in the workflow.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check the runner and the allowlist
+      shell: bash
+      # PyYAML ships with the runner's system Python; no install needed.
+      run: |
+        if [ "$RUNNER_OS" != Linux ] || [ "$RUNNER_ARCH" != X64 ]; then
+          echo "::error::image-scan pins the linux_amd64 Grype asset; this runner is $RUNNER_OS/$RUNNER_ARCH"
+          exit 1
+        fi
+        /usr/bin/python3 -I - <<'PY'
+        import sys, yaml
+        with open(".grype.yaml") as f:
+            cfg = yaml.safe_load(f) or {}
+        # Only `ignore:` is allowed. Any other Grype setting here (`exclude:`
+        # paths, `match:` toggles, `only-fixed`, `fail-on-severity`, ...)
+        # could narrow the scan with no reason recorded; the gate's settings
+        # belong in the action and its callers.
+        if not isinstance(cfg, dict):
+            print("::error file=.grype.yaml::must be a mapping with only an `ignore:` key")
+            sys.exit(1)
+        extra = sorted(set(cfg) - {"ignore"})
+        if extra:
+            print(f"::error file=.grype.yaml::only `ignore:` is allowed here, found: {', '.join(map(str, extra))}")
+            sys.exit(1)
+        rules = cfg.get("ignore") or []
+        # Each rule must name one vulnerability and say why. A rule with no
+        # `vulnerability:` (say `package: {name: python-3.14}`, or
+        # `fix-state: fixed`) would silence a whole package, or the whole
+        # gate under --only-fixed, so it is refused even with a reason.
+        if not isinstance(rules, list):
+            print("::error file=.grype.yaml::`ignore:` must be a list of rules")
+            sys.exit(1)
+        bad = 0
+        for r in rules:
+            if not isinstance(r, dict):
+                problem = "is not a mapping"
+            elif not str(r.get("vulnerability") or "").strip():
+                problem = "names no vulnerability"
+            elif not str(r.get("reason") or "").strip():
+                problem = "has no reason"
+            else:
+                continue
+            bad += 1
+            print(f"::error file=.grype.yaml::ignore rule {problem}: {r}")
+        sys.exit(1 if bad else 0)
+        PY
+
+    - name: Install Grype (version and SHA-256 pinned)
+      shell: bash
+      # Pinned by version and by the tarball's SHA-256, taken from the
+      # release's grype_<v>_checksums.txt after verifying that file's
+      # Sigstore bundle (signed by anchore/grype's release workflow). To
+      # bump: download the new tarball and checksums file, run
+      #   cosign verify-blob --bundle grype_<v>_checksums.txt.sigstore.json \
+      #     --certificate-identity-regexp '^https://github.com/anchore/grype/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     grype_<v>_checksums.txt
+      # and copy the linux_amd64.tar.gz line here. No install script, no
+      # third-party action: nothing is fetched that isn't checked.
+      env:
+        GRYPE_VERSION: "0.121.1"
+        GRYPE_SHA256: bc3ea3f9e6fd56ac781c08c6c5e614271b79f438200757f6932085c19b0a4657
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/grype"
+        mkdir -p "$dir"
+        tarball="$dir/grype.tar.gz"
+        curl -sSfL --retry 3 -o "$tarball" \
+          "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+        echo "${GRYPE_SHA256}  ${tarball}" | sha256sum --check --strict
+        tar -xzf "$tarball" -C "$dir" grype
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Scan ${{ inputs.image }}
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        GRYPE_CHECK_FOR_APP_UPDATE: "false"
+        # The vulnerability DB is downloaded fresh each run (~70 MB) and
+        # Grype refuses one older than 5 days, so a stale DB fails the
+        # scan rather than passing it.
+        GRYPE_DB_VALIDATE_AGE: "true"
+      # --only-fixed: a vulnerability with no fix yet can't be acted on by
+      # bumping anything, so it is neither reported nor failed on.
+      # Default scope (squashed): what the final filesystem holds, which is
+      # what runs. all-layers would also report package versions a later
+      # layer upgraded away, as false positives.
+      run: |
+        set -euo pipefail
+        report="$RUNNER_TEMP/grype-report.txt"
+        set +e
+        grype "$IMAGE" -c .grype.yaml \
+          --only-fixed --fail-on "$FAIL_ON" -o table --file "$report"
+        rc=$?
+        set -e
+        {
+          echo "### Image scan: \`$IMAGE\`"
+          echo
+          echo "Fails on fixable vulnerabilities of severity **$FAIL_ON** or above (allowlist: \`.grype.yaml\`)."
+          echo
+          echo '```'
+          cat "$report" 2>/dev/null || echo "(no report)"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        cat "$report" 2>/dev/null || true
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::grype exited $rc: fixable vulnerabilities at or above $FAIL_ON (or a scan error). See the table above."
+        fi
+        exit "$rc"
