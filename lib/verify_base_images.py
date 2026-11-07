@@ -91,7 +91,7 @@ def check_lock_agreement(root: str) -> list[str]:
                 if not m:
                     continue
                 image_ref = m.group(1)
-                # Same skips as check_digest_pins and pin_base_images.py.
+                # Same skips as check_digest_pins.
                 if image_ref.lower() == "scratch" or image_ref.startswith("$"):
                     continue
                 pinned = PINNED_RE.match(image_ref)
@@ -200,10 +200,11 @@ def main(root: str | None = None) -> int:
 
     # Check 3: Cosign signatures (advisory for now)
     print("\nChecking cosign signatures...")
-    # Only once the lock agrees: on a malformed lock this would crash, and
-    # on a stale one it would verify digests the Dockerfile no longer uses.
-    if lock_errors:
-        warnings = ["skipped until the Dockerfile and lock agree"]
+    # Only once both checks pass: on a malformed lock this would crash, and
+    # on a stale lock or an unpinned FROM it would verify digests the
+    # Dockerfile does not use.
+    if errors or lock_errors:
+        warnings = ["skipped until the checks above pass"]
     else:
         warnings = check_cosign_signatures(root)
     if warnings:

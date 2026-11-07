@@ -141,3 +141,16 @@ def test_bad_lock_skips_cosign(tmp_path: Path, monkeypatch, lock_text) -> None:
 
     monkeypatch.setattr(verifier, "check_cosign_signatures", _cosign)
     assert verifier.main(str(tmp_path)) == 1
+
+
+def test_pin_error_skips_cosign(tmp_path: Path, monkeypatch) -> None:
+    """An unpinned FROM with a bad lock entry fails cleanly, without cosign."""
+    _write(tmp_path, f"FROM {DEV}@{D1} AS build\nFROM {RUN}\n", None)
+    lock = {DEV: _entry(D1), RUN: "not an object"}
+    (tmp_path / "base-images.lock.json").write_text(json.dumps(lock))
+
+    def _cosign(root):
+        raise AssertionError("cosign check ran despite a pin error")
+
+    monkeypatch.setattr(verifier, "check_cosign_signatures", _cosign)
+    assert verifier.main(str(tmp_path)) == 1
