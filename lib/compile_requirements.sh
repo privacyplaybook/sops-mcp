@@ -24,6 +24,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 IN_FILES=(
     "requirements.in"
+    "requirements-build.in"
 )
 
 failed=0

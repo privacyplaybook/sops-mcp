@@ -1,9 +1,13 @@
 name: Image build
 
-# Builds the Docker image on every pull request, without pushing it.
-# publish.yml builds only after merge, so a base-image or lockfile change
-# (a new Python, an sdist that won't compile, a trust-store regression
-# caught by lib/check_trust_store.py) would otherwise first fail on main.
+# Builds the Docker image on every pull request, without pushing it, and
+# smoke-tests the result. publish.yml builds only after merge, so a
+# base-image or lockfile change (a new Python, an sdist that won't compile,
+# a trust-store regression caught by lib/check_trust_store.py, a locked
+# upgrade that breaks on import) would otherwise first fail on main.
+#
+# Keep the build inputs in step with publish.yml's "Build and push image"
+# step (context, platforms, build args): this proves that build.
 on:
   pull_request:
     branches: [main]
@@ -12,6 +16,10 @@ on:
 # Reads the repo only: no registry login, no push, no signing.
 permissions:
   contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -27,3 +35,15 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: sops-mcp:pr
+
+      # The ci.yml tests resolve dependencies afresh; this is the only place
+      # the locked versions, as shipped, are imported before merge.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /opt/venv/bin/python sops-mcp:pr -I -c \
+            'import sys, yaml, sops_mcp.server; print(sys.version); print("pyyaml", yaml.__version__, "libyaml:", yaml.__with_libyaml__)'
+          docker run --rm --entrypoint /usr/bin/sops sops-mcp:pr --version
+          docker run --rm --entrypoint /usr/bin/age sops-mcp:pr --version

@@ -25,4 +25,7 @@ runs:
       # Allowlist: to suppress an advisory that is genuinely not exploitable
       # in this server, append `--ignore-vuln <GHSA-or-CVE-or-PYSEC-id>` and
       # leave a comment saying why. Keep this empty unless justified.
-      run: pip-audit --no-deps -r requirements.lock.txt
+      run: |
+        pip-audit --no-deps -r requirements.lock.txt
+        # Build tools: not shipped, but they run as root in the build stage.
+        pip-audit --no-deps -r requirements-build.lock.txt

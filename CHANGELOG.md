@@ -17,9 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its hash-pinned sdist, without libyaml (the pure-Python loader; sops-mcp
   only uses `safe_load` and `dump`). Python 3.15 is added to the CI matrix
   and the package classifiers.
-- **Pull requests now build the Docker image** (without pushing it), so a
-  base or lockfile change is proven to build, including the trust-store
-  check, before it merges rather than after.
+- **Build tools are hash-pinned too.** A new `requirements-build.lock.txt`
+  (hatchling, setuptools, Cython) is installed hash-checked, sdists build
+  with `--no-build-isolation` against it, and the tools are removed before
+  the venv is copied. Previously pip's build isolation fetched the newest
+  build backend from PyPI unpinned. The dependency scan covers both
+  lockfiles.
+- **Pull requests now build and smoke-test the Docker image** (without
+  pushing it), so a base or lockfile change is proven to build, pass the
+  trust-store check and import, before it merges rather than after.
+- The README no longer claims `sops` and `age` are pinned by the base image
+  digest: `apk` installs the newest at build time.
 
 ### Security
 

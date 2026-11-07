@@ -7,16 +7,19 @@ FROM cgr.dev/chainguard/python:latest-dev@sha256:64f414bffa25ca9ff518f35975ad153
 
 USER root
 
-# sops and age come from Wolfi's apk repo, signed by Chainguard. Pinned
-# transitively by the digest of the build base image.
+# sops and age come from Wolfi's apk repo, signed by Chainguard. They are
+# NOT pinned by the base digest: apk fetches the newest in the live repo at
+# build time, so they move with every rebuild.
 RUN apk add --no-cache sops age
 
-# Floor the CA bundle. The runtime stage copies this stage's bundle, since
-# that stage has no apk. 20260909-r3 is the first that no longer trusts
-# emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2). The pinned bases (Python
-# 3.15) already ship a later bundle, so today this is a no-op; it stays so a
-# future digest bump can't quietly bring the distrusted root back.
-# lib/check_trust_store.py in the runtime stage is the gate either way.
+# Upgrade the CA bundle to the newest in the live Wolfi repo, with a floor.
+# The runtime stage copies this stage's bundle, since that stage has no apk.
+# Like sops and age above, the result follows the build date, not the base
+# digest. 20260909-r3 is the first bundle that no longer trusts emSign ECC
+# Root CA - G3 (GHSA-6q48-6c7w-9gw2). The pinned bases (Python 3.15) already
+# ship a later one; the floor stays so a future digest change can't bring the
+# distrusted root back. lib/check_trust_store.py in the runtime stage is the
+# gate either way.
 RUN apk add --no-cache -u 'ca-certificates-bundle>=20260909-r3'
 
 WORKDIR /app
@@ -26,12 +29,26 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 
-COPY requirements.lock.txt .
-RUN pip install --no-cache-dir --require-hashes -r requirements.lock.txt
+# Build tools first, hash-checked (requirements-build.lock.txt), so every
+# sdist below builds with --no-build-isolation against them. Isolation would
+# fetch the newest setuptools/Cython/hatchling from PyPI unpinned and
+# unhashed. --only-binary :all: makes any other locked package that loses
+# its wheel fail the build instead of silently compiling.
+#
+# pyyaml is the one sdist: 6.0.3 has no cp315 wheel. It builds without
+# libyaml (this stage has no libyaml-dev), i.e. the pure-Python loader;
+# sops-mcp only calls safe_load and dump. If a later base ships libyaml-dev,
+# pyyaml builds its C extension instead, which is equally fine.
+COPY requirements.lock.txt requirements-build.lock.txt ./
+RUN pip install --no-cache-dir --require-hashes --only-binary :all: \
+        -r requirements-build.lock.txt \
+ && pip install --no-cache-dir --require-hashes --no-build-isolation \
+        --only-binary :all: --no-binary pyyaml -r requirements.lock.txt
 
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps --no-build-isolation . \
+ && pip uninstall --yes -r requirements-build.lock.txt
 
 # pip is not needed at runtime, and it vendors its own certifi bundle
 # (pip/_vendor/certifi/cacert.pem), which would ship in /opt/venv with

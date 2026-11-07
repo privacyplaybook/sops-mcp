@@ -16,6 +16,7 @@ import sys
 
 IN_FILES = [
     "requirements.in",
+    "requirements-build.in",
 ]
 
 # Matches a package pin line like "flask==3.1.3 \"
