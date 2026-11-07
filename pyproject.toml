@@ -31,6 +31,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Security :: Cryptography",
     "Topic :: System :: Systems Administration",
 ]
@@ -164,8 +165,8 @@ warn_unused_ignores = true
 # yaml stubs are installed, so it can gate merges TODAY.
 #
 # python_version is pinned at the floor, so every leg of the CI matrix
-# (3.11-3.14) analyses 3.11 semantics — a 3.12-only branch is invisible to
-# all four. What still differs per leg is dependency and stub resolution.
+# (3.11-3.15) analyses 3.11 semantics — a 3.12-only branch is invisible to
+# all five. What still differs per leg is dependency and stub resolution.
 # Raise this when the floor rises.
 #
 # Getting to strict is worth doing and is its own change — mostly

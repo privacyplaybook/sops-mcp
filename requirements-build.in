@@ -1,0 +1,9 @@
+# Build-time only: never shipped in the image. The Dockerfile installs these
+# hash-checked, builds every sdist with --no-build-isolation, then removes
+# them, so no build backend is fetched unpinned from PyPI.
+#
+# sops-mcp's own build backend (pyproject.toml [build-system]):
+hatchling
+# pyyaml 6.0.3's sdist (no cp315 wheel yet) on Python >= 3.13:
+setuptools
+cython>=3.0

@@ -7,11 +7,14 @@ on:
       - Dockerfile
       - requirements.in
       - requirements.lock.txt
+      - requirements-build.in
+      - requirements-build.lock.txt
       - base-images.lock.json
       - pyproject.toml
       - server.json
       - lib/**
       - .github/workflows/supply-chain.yml
+      - .github/actions/**
   pull_request:
     branches: [main]
   workflow_dispatch:

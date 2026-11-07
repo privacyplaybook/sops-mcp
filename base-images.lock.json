@@ -2,7 +2,7 @@
   "cgr.dev/chainguard/python:latest": {
     "cosign_detail": "keyless verification passed",
     "cosign_signed": true,
-    "digest": "sha256:18a4fbda8c280978b6aa5329f7acd4dbb106876e76fdc87913855ebf4876f2ff",
+    "digest": "sha256:f3e5face39b0acd813fae456df27b33bf6a6bffba5d201d15f6498138cb8fd96",
     "used_in": [
       "Dockerfile"
     ]
@@ -10,7 +10,7 @@
   "cgr.dev/chainguard/python:latest-dev": {
     "cosign_detail": "keyless verification passed",
     "cosign_signed": true,
-    "digest": "sha256:2c0fbbac86b72ebb4bfee15b64d8cd5fd6b49dfe7bb279b5c9f193198a84c1c9",
+    "digest": "sha256:64f414bffa25ca9ff518f35975ad153a921b2e4850c4a84c31a96885fdb86a02",
     "used_in": [
       "Dockerfile"
     ]

@@ -16,7 +16,14 @@ import sys
 
 IN_FILES = [
     "requirements.in",
+    "requirements-build.in",
 ]
+
+# The Dockerfile installs the build lock, builds, then runs
+# `pip uninstall -r requirements-build.lock.txt`. A package pinned in both
+# would be uninstalled from the shipped venv, so the two must not overlap.
+RUNTIME_LOCK = "requirements.lock.txt"
+BUILD_LOCK = "requirements-build.lock.txt"
 
 # Matches a package pin line like "flask==3.1.3 \"
 PIN_RE = re.compile(r"^([a-zA-Z0-9_.-]+)==[\d]")
@@ -81,6 +88,24 @@ def verify_lockfile(in_file: str) -> tuple[bool, list[str]]:
     return len(errors) == 0, errors
 
 
+def pinned_names(lock_file: str) -> set[str]:
+    """Normalised names of every package pinned in a lockfile."""
+    with open(lock_file) as f:
+        return {
+            m.group(1).lower().replace("-", "_")
+            for line in f
+            if (m := PIN_RE.match(line))
+        }
+
+
+def check_build_runtime_overlap() -> list[str]:
+    """Packages pinned in both the runtime and the build lockfile."""
+    if not (os.path.exists(RUNTIME_LOCK) and os.path.exists(BUILD_LOCK)):
+        return []
+    shared = pinned_names(RUNTIME_LOCK) & pinned_names(BUILD_LOCK)
+    return sorted(shared)
+
+
 def main():
     # Change to repo root
     repo_root = subprocess.run(
@@ -102,6 +127,15 @@ def main():
             for err in errors:
                 print(f"  ERROR: {err}")
             failed.append(in_file)
+
+    shared = check_build_runtime_overlap()
+    if shared:
+        print(
+            f"  ERROR: {', '.join(shared)} pinned in both {RUNTIME_LOCK} and "
+            f"{BUILD_LOCK}; the Dockerfile uninstalls the build lock after "
+            "building, which would remove them from the image."
+        )
+        failed.append(BUILD_LOCK)
 
     if failed:
         print(f"\n{len(failed)} lockfile(s) have issues:")

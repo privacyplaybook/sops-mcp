@@ -3,19 +3,23 @@
 # ---- build stage ----
 # Wolfi-based image with apk + shell + build toolchain. Used to install
 # Python deps into a venv and to source the sops + age binaries.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:2c0fbbac86b72ebb4bfee15b64d8cd5fd6b49dfe7bb279b5c9f193198a84c1c9 AS build
+FROM cgr.dev/chainguard/python:latest-dev@sha256:64f414bffa25ca9ff518f35975ad153a921b2e4850c4a84c31a96885fdb86a02 AS build
 
 USER root
 
-# sops and age come from Wolfi's apk repo, signed by Chainguard. Pinned
-# transitively by the digest of the build base image.
+# sops and age come from Wolfi's apk repo, signed by Chainguard. They are
+# NOT pinned by the base digest: apk fetches the newest in the live repo at
+# build time, so they move with every rebuild.
 RUN apk add --no-cache sops age
 
-# Upgrade the CA bundle past the pinned base's. The runtime stage copies it,
-# since that stage has no apk. 20260413-r0 in the pinned bases still trusts
-# emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2); 20260909-r3 and later don't.
-# The upstream rebuilds that dropped it moved to Python 3.15, so the digests
-# stay put and the bundle is upgraded here instead.
+# Upgrade the CA bundle to the newest in the live Wolfi repo, with a floor.
+# The runtime stage copies this stage's bundle, since that stage has no apk.
+# Like sops and age above, the result follows the build date, not the base
+# digest. 20260909-r3 is the first bundle that no longer trusts emSign ECC
+# Root CA - G3 (GHSA-6q48-6c7w-9gw2). The pinned bases (Python 3.15) already
+# ship a later one; the floor stays so a future digest change can't bring the
+# distrusted root back. lib/check_trust_store.py in the runtime stage is the
+# gate either way.
 RUN apk add --no-cache -u 'ca-certificates-bundle>=20260909-r3'
 
 WORKDIR /app
@@ -25,12 +29,31 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 
-COPY requirements.lock.txt .
-RUN pip install --no-cache-dir --require-hashes -r requirements.lock.txt
+# Build tools first, hash-checked (requirements-build.lock.txt), so every
+# sdist below builds with --no-build-isolation against them. Isolation would
+# fetch the newest setuptools/Cython/hatchling from PyPI unpinned and
+# unhashed. --only-binary :all: makes any other locked package that loses
+# its wheel fail the build instead of silently compiling.
+#
+# pyyaml is the one sdist: 6.0.3 has no cp315 wheel. It builds without
+# libyaml (this stage has no libyaml-dev), i.e. the pure-Python loader;
+# sops-mcp only calls safe_load and dump. Don't add libyaml-dev here: the
+# runtime stage has no libyaml.so, so a C extension built against it would
+# fail to load there and pyyaml would fall back to pure Python anyway.
+#
+# When pyyaml publishes a cp315 wheel: recompile the lock, drop
+# `--no-binary pyyaml`, and drop setuptools and Cython from
+# requirements-build.in (hatchling stays, for sops-mcp itself).
+COPY requirements.lock.txt requirements-build.lock.txt ./
+RUN pip install --no-cache-dir --require-hashes --only-binary :all: \
+        -r requirements-build.lock.txt \
+ && pip install --no-cache-dir --require-hashes --no-build-isolation \
+        --only-binary :all: --no-binary pyyaml -r requirements.lock.txt
 
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ src/
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps --no-build-isolation . \
+ && pip uninstall --yes -r requirements-build.lock.txt
 
 # pip is not needed at runtime, and it vendors its own certifi bundle
 # (pip/_vendor/certifi/cacert.pem), which would ship in /opt/venv with
@@ -40,7 +63,7 @@ RUN python -m pip uninstall --yes pip
 # ---- runtime stage ----
 # Distroless Wolfi Python. No shell, no apk, no package manager. Runs as
 # the built-in `nonroot` user (uid 65532) by default.
-FROM cgr.dev/chainguard/python:latest@sha256:18a4fbda8c280978b6aa5329f7acd4dbb106876e76fdc87913855ebf4876f2ff
+FROM cgr.dev/chainguard/python:latest@sha256:f3e5face39b0acd813fae456df27b33bf6a6bffba5d201d15f6498138cb8fd96
 
 # Anti-squatting annotation required by registry.modelcontextprotocol.io
 # when an OCI image is referenced by a server.json submission. The label
