@@ -418,6 +418,34 @@ pip install requests  # one-time; cosign on PATH is needed for the signature che
 python3 lib/pin_base_images.py
 ```
 
+**Base image updates from Dependabot.** `.github/dependabot.yml` checks
+the two `cgr.dev/chainguard/python` digests every Monday. When one has
+moved, Dependabot opens a single PR that changes the `FROM` lines in
+the `Dockerfile` and nothing else. It does not touch
+`base-images.lock.json`, and CI does not notice: `lib/verify_base_images.py`
+only checks that every `FROM` line is digest-pinned, and does not compare
+the pins with the lock file. So the PR goes green with a stale lock.
+Before merging it, regenerate the lock on the PR branch:
+
+```bash
+gh pr checkout <number>
+pip install requests  # one-time; cosign on PATH for the signature checks
+python3 lib/pin_base_images.py
+git add Dockerfile base-images.lock.json
+git commit -m "build(deps): regenerate base-images.lock.json"
+git push
+```
+
+The script re-resolves both tags, so it may pin a digest newer than the one
+Dependabot proposed; that's expected. Check that its summary ends
+`2/2 cosign verified`: without cosign on PATH it writes
+`"cosign_signed": false` for both images. Once you push to its branch,
+Dependabot stops rebasing that PR.
+
+Dependabot tracks digest moves only. It does not report vulnerabilities in
+the image's OS packages: the vulnerability scan in CI audits
+`requirements.lock.txt` with `pip-audit`, not the image.
+
 ### Signed binaries from Wolfi
 
 The `sops` and `age` binaries are installed with `apk` from Wolfi's package repository, whose index is signed by Chainguard. They are pinned transitively through the base image digest, so re-pinning the base image also re-pins these binaries.

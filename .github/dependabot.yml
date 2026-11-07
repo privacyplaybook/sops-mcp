@@ -1,0 +1,34 @@
+# Dependabot: keep the Chainguard base image digests in the Dockerfile current.
+#
+# Both FROM lines pin a non-version tag by digest
+# (cgr.dev/chainguard/python:latest-dev@sha256:... and :latest@sha256:...).
+# For a tag like these, Dependabot keeps the tag and proposes the digest the
+# tag points to now. cgr.dev serves public images to anonymous pulls, so no
+# registry credentials are configured.
+#
+# A Dependabot PR changes only the Dockerfile. base-images.lock.json has to be
+# regenerated on the PR branch by hand before merging; see "Base image
+# updates from Dependabot" in README.md.
+#
+# Scope is the base images only. The pip lock is hash-pinned through
+# pip-compile and is updated by hand.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      # Chainguard rebuilds :latest almost daily; weekly keeps the noise down.
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    groups:
+      # Build and runtime stages move together, in one PR.
+      chainguard-base-images:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: build
+      include: scope
+    labels:
+      - dependencies
