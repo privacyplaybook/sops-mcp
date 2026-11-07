@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI fails when the Dockerfile's base image digests and
+  `base-images.lock.json` disagree.** The `verify` job checked only that
+  each `FROM` line was digest-pinned, so a Dependabot base-image PR went
+  green with a stale lock, and the cosign check vouched for the lock's old
+  digests. It now fails, naming `lib/pin_base_images.py` as the fix. The
+  lock is regenerated for the digests already on `main`.
 - **The Docker image runs Python 3.15** (was 3.14). Both Chainguard Wolfi
   bases are re-pinned to current digests, which upstream has moved to
   Python 3.15.2. `requirements.lock.txt` is recompiled for 3.15 with

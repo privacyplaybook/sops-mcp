@@ -34,7 +34,7 @@ jobs:
           python-version: "3.13"
       - name: Verify requirements lockfile
         run: python3 lib/verify_requirements.py
-      - name: Verify base images are digest-pinned
+      - name: Verify base images are digest-pinned and match the lock
         run: python3 lib/verify_base_images.py
       - name: Verify version is single-sourced from pyproject
         run: python3 lib/verify_version.py
