@@ -1,0 +1,64 @@
+name: Image build
+
+# Builds the Docker image on every pull request, without pushing it, and
+# smoke-tests the result. publish.yml builds only after merge, so a
+# base-image or lockfile change (a new Python, an sdist that won't compile,
+# a trust-store regression caught by lib/check_trust_store.py, a locked
+# upgrade that breaks on import) would otherwise first fail on main.
+#
+# Keep the build inputs in step with publish.yml's "Build and push image"
+# step (context, platforms, build args). It does not cover that step's
+# provenance and SBOM attestations, which a loaded (non-pushed) image can't
+# carry; see #49 for sharing one build definition.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Reads the repo only: no registry login, no push, no signing.
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sops-mcp:pr
+
+      # The ci.yml tests resolve dependencies afresh; this is the only place
+      # the locked versions, as shipped, are imported before merge.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /opt/venv/bin/python sops-mcp:pr -I -c \
+            'import sys, yaml, sops_mcp.server; print(sys.version); print("pyyaml", yaml.__version__, "libyaml:", yaml.__with_libyaml__)'
+          docker run --rm --entrypoint /usr/bin/sops sops-mcp:pr --version
+          docker run --rm --entrypoint /usr/bin/age sops-mcp:pr --version
+          # age-keygen, and the real entrypoint (console-script shebang,
+          # create_server, the SSE config path): with a recipient but no
+          # SOPS_MCP_API_TOKEN, the image's 0.0.0.0 default must refuse.
+          keygen=$(docker run --rm --entrypoint /usr/bin/age-keygen sops-mcp:pr 2>&1)
+          pk=$(grep -m 1 -o 'age1[0-9a-z]*' <<<"$keygen")
+          test -n "$pk"
+          # timeout: a server that wrongly starts would otherwise hang the job.
+          if out=$(timeout 60 docker run --rm -e SOPS_MCP_AGE_PUBLIC_KEY="$pk" sops-mcp:pr 2>&1); then
+            echo "::error::sops-mcp started on 0.0.0.0 without SOPS_MCP_API_TOKEN"
+            exit 1
+          fi
+          echo "$out" | tail -n 1
+          echo "$out" | grep -q 'Refusing to bind the SSE transport to 0.0.0.0'

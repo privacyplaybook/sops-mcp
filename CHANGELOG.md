@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The Docker image runs Python 3.15** (was 3.14). Both Chainguard Wolfi
+  bases are re-pinned to current digests, which upstream has moved to
+  Python 3.15.2. `requirements.lock.txt` is recompiled for 3.15 with
+  `--upgrade` (pydantic-core 2.46.5 had no cp315 wheel; 2.50.4 does).
+  PyYAML 6.0.3 has no cp315 wheel yet, so the build stage compiles it from
+  its hash-pinned sdist, without libyaml (the pure-Python loader; sops-mcp
+  only uses `safe_load` and `dump`). Python 3.15 is added to the CI matrix
+  and the package classifiers.
+- **Build tools are hash-pinned too.** A new `requirements-build.lock.txt`
+  (hatchling, setuptools, Cython) is installed hash-checked, sdists build
+  with `--no-build-isolation` against it, and the tools are removed before
+  the venv is copied. Previously pip's build isolation fetched the newest
+  build backend from PyPI unpinned. The dependency scan covers both
+  lockfiles.
+- **Pull requests now build and smoke-test the Docker image** (without
+  pushing it), so a base or lockfile change is proven to build, pass the
+  trust-store check and import, before it merges rather than after.
+- The README no longer claims `sops` and `age` are pinned by the base image
+  digest: `apk` installs the newest at build time.
+
+### Security
+
+- **Base images re-pinned past open Wolfi advisories** in the old runtime
+  base: python-3.14 3.14.4-r3 (about 43 CVEs/GHSAs, fixed in 3.14.10),
+  glibc 2.43-r6 (6, fixed in 2.43-r10) and zlib 1.3.2-r2 (2, fixed in
+  1.3.2.1). The new runtime base has none open against the Wolfi secdb.
+
 ## [0.12.0]
 
 ### Added

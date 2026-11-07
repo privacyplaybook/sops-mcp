@@ -465,7 +465,7 @@ the image's OS packages: the vulnerability scan in CI audits
 
 ### Signed binaries from Wolfi
 
-The `sops` and `age` binaries are installed with `apk` from Wolfi's package repository, whose index is signed by Chainguard. They are pinned transitively through the base image digest, so re-pinning the base image also re-pins these binaries.
+The `sops` and `age` binaries are installed with `apk` from Wolfi's package repository, whose index is signed by Chainguard. They are **not** pinned by the base image digest: `apk` installs the newest version in the repository when the image is built, so every rebuild can pick up a newer `sops` or `age`. The Wolfi CA bundle is upgraded the same way.
 
 ### Python dependency hash pinning
 
