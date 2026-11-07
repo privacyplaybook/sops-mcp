@@ -3,7 +3,7 @@
 # ---- build stage ----
 # Wolfi-based image with apk + shell + build toolchain. Used to install
 # Python deps into a venv and to source the sops + age binaries.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:2c0fbbac86b72ebb4bfee15b64d8cd5fd6b49dfe7bb279b5c9f193198a84c1c9 AS build
+FROM cgr.dev/chainguard/python:latest-dev@sha256:64f414bffa25ca9ff518f35975ad153a921b2e4850c4a84c31a96885fdb86a02 AS build
 
 USER root
 
@@ -11,11 +11,12 @@ USER root
 # transitively by the digest of the build base image.
 RUN apk add --no-cache sops age
 
-# Upgrade the CA bundle past the pinned base's. The runtime stage copies it,
-# since that stage has no apk. 20260413-r0 in the pinned bases still trusts
-# emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2); 20260909-r3 and later don't.
-# The upstream rebuilds that dropped it moved to Python 3.15, so the digests
-# stay put and the bundle is upgraded here instead.
+# Floor the CA bundle. The runtime stage copies this stage's bundle, since
+# that stage has no apk. 20260909-r3 is the first that no longer trusts
+# emSign ECC Root CA - G3 (GHSA-6q48-6c7w-9gw2). The pinned bases (Python
+# 3.15) already ship a later bundle, so today this is a no-op; it stays so a
+# future digest bump can't quietly bring the distrusted root back.
+# lib/check_trust_store.py in the runtime stage is the gate either way.
 RUN apk add --no-cache -u 'ca-certificates-bundle>=20260909-r3'
 
 WORKDIR /app
@@ -40,7 +41,7 @@ RUN python -m pip uninstall --yes pip
 # ---- runtime stage ----
 # Distroless Wolfi Python. No shell, no apk, no package manager. Runs as
 # the built-in `nonroot` user (uid 65532) by default.
-FROM cgr.dev/chainguard/python:latest@sha256:18a4fbda8c280978b6aa5329f7acd4dbb106876e76fdc87913855ebf4876f2ff
+FROM cgr.dev/chainguard/python:latest@sha256:f3e5face39b0acd813fae456df27b33bf6a6bffba5d201d15f6498138cb8fd96
 
 # Anti-squatting annotation required by registry.modelcontextprotocol.io
 # when an OCI image is referenced by a server.json submission. The label
