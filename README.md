@@ -422,12 +422,12 @@ python3 lib/pin_base_images.py
 the two `cgr.dev/chainguard/python` digests every Monday. When one has
 moved, Dependabot opens a single PR that changes the `FROM` lines in
 the `Dockerfile` and nothing else. It does not touch
-`base-images.lock.json`, and CI does not notice: `lib/verify_base_images.py`
-only checks that every `FROM` line is digest-pinned, and does not compare
-the pins with the lock file. So the PR goes green with a stale lock, and
-the advisory cosign check in that script, when cosign is available, checks
-the lock's old digests rather than the new ones in the `Dockerfile`.
-Before merging it, regenerate the lock on the PR branch:
+`base-images.lock.json`, so the PR's `verify` check fails:
+`lib/verify_base_images.py` requires every `FROM` digest to be the one the
+lock records for that image, and every image in either file to be in the
+other. (The advisory cosign check in that script verifies the lock's
+digests, so a stale lock would have it vouch for images no longer in use.)
+The PR stays red until the lock is regenerated on its branch:
 
 ```bash
 gh pr checkout <number>

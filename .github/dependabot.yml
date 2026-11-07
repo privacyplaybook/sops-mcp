@@ -6,9 +6,10 @@
 # tag points to now. cgr.dev serves public images to anonymous pulls, so no
 # registry credentials are configured.
 #
-# A Dependabot PR changes only the Dockerfile. base-images.lock.json has to be
-# regenerated on the PR branch by hand before merging; see "Base image
-# updates from Dependabot" in README.md.
+# A Dependabot PR changes only the Dockerfile, so its verify check fails until
+# base-images.lock.json is regenerated on the PR branch by hand
+# (lib/pin_base_images.py); see "Base image updates from Dependabot" in
+# README.md.
 #
 # Scope is the base images only. The pip lock is hash-pinned through
 # pip-compile and is updated by hand.
