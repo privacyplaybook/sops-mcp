@@ -73,7 +73,7 @@ jobs:
           sbom: true
 
       # Threshold: fails on a fixable vulnerability of severity HIGH or
-      # CRITICAL (same as ci.yml). Allowlist: .grype.yaml.
+      # CRITICAL (same as image.yml). Allowlist: .grype.yaml.
       - name: Scan the image for vulnerabilities
         uses: ./.github/actions/image-scan
         with:
@@ -114,7 +114,10 @@ jobs:
 
       # The archive is unpacked once into an OCI layout. Before anything is
       # pushed, its index must be exactly the one the scan job built
-      # (BUILT); a swapped or corrupted artifact stops here. Then skopeo
+      # (BUILT), both as index.json names it and as the bytes of the blob
+      # it points to; a swapped or corrupted artifact stops here. (Every
+      # blob and manifest below that one is content-addressed: the registry
+      # rejects any whose bytes don't match its digest.) Then skopeo
       # (preinstalled on ubuntu-latest) copies the image index, with every
       # manifest and attestation, to each tag: --preserve-digests refuses
       # any conversion that would change the digest, and each tag is checked
@@ -135,6 +138,12 @@ jobs:
           archived=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].digest else "several" end' "$layout/index.json")
           if [ "$archived" != "$BUILT" ]; then
             echo "::error::archive holds $archived, not the scanned $BUILT; nothing pushed"
+            exit 1
+          fi
+          blob="$layout/blobs/sha256/${BUILT#sha256:}"
+          actual="sha256:$(sha256sum "$blob" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$BUILT" ]; then
+            echo "::error::the archive's index blob hashes to $actual, not the scanned $BUILT; nothing pushed"
             exit 1
           fi
           while read -r tag; do

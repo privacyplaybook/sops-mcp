@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Go binaries `sops`, `age` and `age-keygen`. A fixable vulnerability of
   severity high or above fails the PR image build and stops `publish.yml`
   before anything is pushed. `publish.yml` now builds once to an OCI archive,
-  scans it in a job with no credentials, and pushes those exact bytes by
-  digest with `skopeo`, then signs them. Accepted findings go in
+  scans it in a job with no credentials, checks the archive is the one
+  scanned, pushes it to each tag with `skopeo` (checking each tag lands at
+  the scanned digest), then signs it. Accepted findings go in
   `.grype.yaml`, one `vulnerability:` and `reason:` per rule.
 
 ### Security
