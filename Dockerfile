@@ -37,8 +37,13 @@ ENV PATH=/opt/venv/bin:$PATH
 #
 # pyyaml is the one sdist: 6.0.3 has no cp315 wheel. It builds without
 # libyaml (this stage has no libyaml-dev), i.e. the pure-Python loader;
-# sops-mcp only calls safe_load and dump. If a later base ships libyaml-dev,
-# pyyaml builds its C extension instead, which is equally fine.
+# sops-mcp only calls safe_load and dump. Don't add libyaml-dev here: the
+# runtime stage has no libyaml.so, so a C extension built against it would
+# fail to load there and pyyaml would fall back to pure Python anyway.
+#
+# When pyyaml publishes a cp315 wheel: recompile the lock, drop
+# `--no-binary pyyaml`, and drop setuptools and Cython from
+# requirements-build.in (hatchling stays, for sops-mcp itself).
 COPY requirements.lock.txt requirements-build.lock.txt ./
 RUN pip install --no-cache-dir --require-hashes --only-binary :all: \
         -r requirements-build.lock.txt \

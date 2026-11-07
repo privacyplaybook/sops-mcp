@@ -1,7 +1,8 @@
 name: Vulnerability scan
 description: >
-  Fail if any pinned dependency in requirements.lock.txt has a known
-  vulnerability (GitHub Advisory DB / OSV / PyPI Advisory DB). This is the
+  Fail if any pinned dependency in requirements.lock.txt (shipped) or
+  requirements-build.lock.txt (build tools, run in the image build stage)
+  has a known vulnerability (GitHub Advisory DB / OSV / PyPI Advisory DB). This is the
   release-time, secret-free equivalent of a clean Dependabot bill of health:
   pip-audit queries the same advisory data, but needs no token (the
   Dependabot alerts API is not readable by the Actions GITHUB_TOKEN).
@@ -16,16 +17,21 @@ runs:
     - name: Install pip-audit
       shell: bash
       run: python3 -m pip install --quiet "pip-audit>=2.7"
-    - name: Audit requirements.lock.txt
+    - name: Audit requirements.lock.txt and requirements-build.lock.txt
       shell: bash
       # --no-deps audits exactly the pinned closure (the lockfile already
       # lists every transitive dependency); pip-audit exits non-zero if any
       # listed version has a known advisory.
       #
       # Allowlist: to suppress an advisory that is genuinely not exploitable
-      # in this server, append `--ignore-vuln <GHSA-or-CVE-or-PYSEC-id>` and
-      # leave a comment saying why. Keep this empty unless justified.
+      # in this server, append `--ignore-vuln <GHSA-or-CVE-or-PYSEC-id>` to
+      # the audit of the lockfile that pins the package, and leave a comment
+      # saying why. Keep this empty unless justified.
+      #
+      # Both audits always run, so one lockfile's findings never hide the
+      # other's; the step fails if either does.
       run: |
-        pip-audit --no-deps -r requirements.lock.txt
-        # Build tools: not shipped, but they run as root in the build stage.
-        pip-audit --no-deps -r requirements-build.lock.txt
+        rc=0
+        pip-audit --no-deps -r requirements.lock.txt || rc=1
+        pip-audit --no-deps -r requirements-build.lock.txt || rc=1
+        exit "$rc"
