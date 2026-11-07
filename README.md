@@ -424,23 +424,40 @@ moved, Dependabot opens a single PR that changes the `FROM` lines in
 the `Dockerfile` and nothing else. It does not touch
 `base-images.lock.json`, and CI does not notice: `lib/verify_base_images.py`
 only checks that every `FROM` line is digest-pinned, and does not compare
-the pins with the lock file. So the PR goes green with a stale lock.
+the pins with the lock file. So the PR goes green with a stale lock, and
+the advisory cosign check in that script, when cosign is available, checks
+the lock's old digests rather than the new ones in the `Dockerfile`.
 Before merging it, regenerate the lock on the PR branch:
 
 ```bash
 gh pr checkout <number>
 pip install requests  # one-time; cosign on PATH for the signature checks
 python3 lib/pin_base_images.py
+```
+
+Commit only if the script exited 0 and its summary reads
+`2/2 pinned, 2/2 cosign verified`. If a tag failed to resolve it exits 1
+and writes `"digest": null`; without cosign on PATH it writes
+`"cosign_signed": false`. Either way, fix that and re-run. Then:
+
+```bash
 git add Dockerfile base-images.lock.json
-git commit -m "build(deps): regenerate base-images.lock.json"
+git commit -S -m "build(deps): regenerate base-images.lock.json"
 git push
 ```
 
-The script re-resolves both tags, so it may pin a digest newer than the one
-Dependabot proposed; that's expected. Check that its summary ends
-`2/2 cosign verified`: without cosign on PATH it writes
-`"cosign_signed": false` for both images. Once you push to its branch,
-Dependabot stops rebasing that PR.
+`main` requires signed commits, hence `-S` (or `commit.gpgsign` set). The
+script re-resolves both tags, so it may pin a digest newer than the one
+Dependabot proposed; that's expected, and it is the digest the lock then
+records and cosign verified. Once you push to its branch, Dependabot stops
+rebasing that PR, so merge it or close it before the next Monday run.
+
+A `latest` move can also be a Python minor upgrade (3.13 to 3.15, say), and
+CI's test jobs don't run on the image's Python. Before merging, check the
+Python version in the new image
+(`docker run --rm cgr.dev/chainguard/python:latest --version`). If it
+changed, recompile `requirements.lock.txt` for it
+(`lib/compile_requirements.sh`) and make sure the image builds.
 
 Dependabot tracks digest moves only. It does not report vulnerabilities in
 the image's OS packages: the vulnerability scan in CI audits
