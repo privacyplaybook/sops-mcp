@@ -65,7 +65,8 @@ def test_mismatched_digest_fails(tmp_path: Path, capsys) -> None:
     errors = verifier.check_lock_agreement(str(tmp_path))
     assert len(errors) == 1
     assert "Dockerfile:3" in errors[0]
-    assert D3 in errors[0] and D2 in errors[0]
+    assert D3 in errors[0]
+    assert D2 in errors[0]
     assert verifier.main(str(tmp_path)) == 1
     assert "lib/pin_base_images.py" in capsys.readouterr().out
 
@@ -74,7 +75,8 @@ def test_image_missing_from_lock_fails(tmp_path: Path) -> None:
     _write(tmp_path, DOCKERFILE, {DEV: _entry(D1)})
     errors = verifier.check_lock_agreement(str(tmp_path))
     assert len(errors) == 1
-    assert RUN in errors[0] and "not in" in errors[0]
+    assert RUN in errors[0]
+    assert "not in" in errors[0]
     assert verifier.main(str(tmp_path)) == 1
 
 
@@ -106,7 +108,8 @@ def test_unpinned_from_is_reported_once(tmp_path: Path) -> None:
     assert verifier.check_digest_pins(str(tmp_path)) != []
     lock_errors = verifier.check_lock_agreement(str(tmp_path))
     # RUN's lock entry is now unused by any pinned FROM line.
-    assert len(lock_errors) == 1 and RUN in lock_errors[0]
+    assert len(lock_errors) == 1
+    assert RUN in lock_errors[0]
     assert verifier.main(str(tmp_path)) == 1
 
 
