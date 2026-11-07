@@ -25,7 +25,6 @@ FROM_RE = re.compile(
     re.IGNORECASE,
 )
 
-DIGEST_RE = re.compile(r"@sha256:[a-f0-9]{64}")
 PINNED_RE = re.compile(r"^(?P<base>[^@]+)@(?P<digest>sha256:[a-f0-9]{64})$")
 
 LOCK_FILE = "base-images.lock.json"
@@ -58,7 +57,7 @@ def check_digest_pins(root: str) -> list[str]:
                 # Skip scratch and ARG-based refs
                 if image_ref.lower() == "scratch" or image_ref.startswith("$"):
                     continue
-                if not DIGEST_RE.search(image_ref):
+                if not PINNED_RE.match(image_ref):
                     errors.append(f"{relpath}:{i}: {image_ref} is not digest-pinned")
     return errors
 
@@ -91,9 +90,16 @@ def check_lock_agreement(root: str) -> list[str]:
                 m = FROM_RE.match(line)
                 if not m:
                     continue
-                pinned = PINNED_RE.match(m.group(1))
+                image_ref = m.group(1)
+                # Same skips as check_digest_pins and pin_base_images.py.
+                if image_ref.lower() == "scratch" or image_ref.startswith("$"):
+                    continue
+                pinned = PINNED_RE.match(image_ref)
                 if not pinned:
-                    continue  # unpinned, scratch or ARG: check_digest_pins
+                    # Unpinned: check_digest_pins reports it. Count the image
+                    # as used so its lock entry is not reported a second time.
+                    seen.add(image_ref.split("@", 1)[0])
+                    continue
                 base, digest = pinned.group("base"), pinned.group("digest")
                 seen.add(base)
                 entry = lock_data.get(base)
@@ -110,9 +116,7 @@ def check_lock_agreement(root: str) -> list[str]:
                     )
 
     for base in sorted(set(lock_data) - seen):
-        errors.append(
-            f"{LOCK_FILE}: {base} is not used by any digest-pinned FROM line"
-        )
+        errors.append(f"{LOCK_FILE}: {base} is not used by any FROM line")
     return errors
 
 
@@ -196,7 +200,12 @@ def main(root: str | None = None) -> int:
 
     # Check 3: Cosign signatures (advisory for now)
     print("\nChecking cosign signatures...")
-    warnings = check_cosign_signatures(root)
+    # Only once the lock agrees: on a malformed lock this would crash, and
+    # on a stale one it would verify digests the Dockerfile no longer uses.
+    if lock_errors:
+        warnings = ["skipped until the Dockerfile and lock agree"]
+    else:
+        warnings = check_cosign_signatures(root)
     if warnings:
         for w in warnings:
             print(f"  WARNING: {w}")

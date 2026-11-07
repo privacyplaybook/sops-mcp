@@ -106,13 +106,38 @@ def test_unpinned_from_is_reported_once(tmp_path: Path) -> None:
     """An unpinned FROM is a pin error, not also a lock error for that line."""
     _write(tmp_path, f"FROM {DEV}@{D1} AS build\nFROM {RUN}\n", LOCK)
     assert verifier.check_digest_pins(str(tmp_path)) != []
-    lock_errors = verifier.check_lock_agreement(str(tmp_path))
-    # RUN's lock entry is now unused by any pinned FROM line.
-    assert len(lock_errors) == 1
-    assert RUN in lock_errors[0]
+    assert verifier.check_lock_agreement(str(tmp_path)) == []
     assert verifier.main(str(tmp_path)) == 1
 
 
 def test_repository_dockerfile_matches_lock() -> None:
     """The committed Dockerfile and lock agree, as the verify job requires."""
     assert verifier.check_lock_agreement(str(ROOT)) == []
+
+
+def test_malformed_digest_is_a_pin_error(tmp_path: Path) -> None:
+    """A digest with trailing junk is neither pinned nor silently skipped."""
+    _write(tmp_path, DOCKERFILE.replace(D2, D2 + "x"), LOCK)
+    assert verifier.check_digest_pins(str(tmp_path)) != []
+    assert verifier.main(str(tmp_path)) == 1
+
+
+def test_arg_and_scratch_refs_are_skipped(tmp_path: Path) -> None:
+    """pin_base_images.py never locks ARG refs, so they cannot be required."""
+    dockerfile = DOCKERFILE + f"FROM ${{BASE}}@{D3}\nFROM scratch\n"
+    _write(tmp_path, dockerfile, LOCK)
+    assert verifier.check_lock_agreement(str(tmp_path)) == []
+    assert verifier.main(str(tmp_path)) == 0
+
+
+@pytest.mark.parametrize("lock_text", ["{not json", '{"x": "not an object"}'])
+def test_bad_lock_skips_cosign(tmp_path: Path, monkeypatch, lock_text) -> None:
+    """A bad lock fails cleanly instead of crashing in the cosign check."""
+    _write(tmp_path, DOCKERFILE, None)
+    (tmp_path / "base-images.lock.json").write_text(lock_text)
+
+    def _cosign(root):
+        raise AssertionError("cosign check ran on a lock that disagrees")
+
+    monkeypatch.setattr(verifier, "check_cosign_signatures", _cosign)
+    assert verifier.main(str(tmp_path)) == 1
