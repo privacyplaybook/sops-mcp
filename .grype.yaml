@@ -1,0 +1,20 @@
+# Grype configuration for the image scan (.github/actions/image-scan).
+#
+# Only `ignore:` may appear here (the action fails on any other key). The
+# severity threshold and --only-fixed are set by the action and the workflows
+# that call it, so they stay visible where the gate is.
+#
+# Allowlist. To suppress a finding that is genuinely not exploitable in this
+# server, add an `ignore:` rule. Every rule MUST name a `vulnerability:` and
+# carry a `reason:` saying why (the action fails on a rule missing either),
+# and should be as narrow as possible: add the package name too. Keep it empty unless
+# justified, and remove a rule once the fix ships. Example:
+#
+#   ignore:
+#     - vulnerability: CVE-2026-00000
+#       package:
+#         name: zlib
+#       reason: >-
+#         Only the minizip contrib code is affected; the image never links it.
+#         Remove when Wolfi ships zlib 1.3.2. (#NN)
+ignore: []
