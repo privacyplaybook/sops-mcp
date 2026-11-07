@@ -1,4 +1,10 @@
-"""Verify that all Dockerfile FROM lines are digest-pinned.
+"""Verify the Dockerfile base images against base-images.lock.json.
+
+Checks that every FROM line is pinned by digest, and that each pinned
+digest is the one base-images.lock.json records for that image (and that
+neither side has an image the other lacks). A Dependabot base-image PR
+changes only the Dockerfile, so it fails here until the lock is
+regenerated with lib/pin_base_images.py.
 
 Optionally runs cosign verification for images recorded as signed
 in base-images.lock.json.
@@ -20,6 +26,14 @@ FROM_RE = re.compile(
 )
 
 DIGEST_RE = re.compile(r"@sha256:[a-f0-9]{64}")
+PINNED_RE = re.compile(r"^(?P<base>[^@]+)@(?P<digest>sha256:[a-f0-9]{64})$")
+
+LOCK_FILE = "base-images.lock.json"
+FIX_HINT = (
+    "Run 'python3 lib/pin_base_images.py' on this branch and commit the "
+    "resulting Dockerfile and base-images.lock.json (see \"Base image "
+    "updates from Dependabot\" in README.md)."
+)
 
 
 def find_dockerfiles(root: str) -> list[str]:
@@ -46,6 +60,59 @@ def check_digest_pins(root: str) -> list[str]:
                     continue
                 if not DIGEST_RE.search(image_ref):
                     errors.append(f"{relpath}:{i}: {image_ref} is not digest-pinned")
+    return errors
+
+
+def check_lock_agreement(root: str) -> list[str]:
+    """Check the Dockerfile digests and base-images.lock.json agree.
+
+    Every digest-pinned FROM image must have a lock entry with the same
+    digest, and every lock entry must be used by some FROM line. FROM lines
+    that are not digest-pinned are left to check_digest_pins. Returns a
+    list of errors.
+    """
+    lock_path = os.path.join(root, LOCK_FILE)
+    if not os.path.exists(lock_path):
+        return [f"{LOCK_FILE} not found"]
+    try:
+        with open(lock_path) as f:
+            lock_data = json.load(f)
+    except (OSError, ValueError) as e:
+        return [f"{LOCK_FILE} could not be read: {e}"]
+    if not isinstance(lock_data, dict):
+        return [f"{LOCK_FILE} is not a JSON object"]
+
+    errors = []
+    seen = set()
+    for df in find_dockerfiles(root):
+        relpath = os.path.relpath(df, root)
+        with open(df) as f:
+            for i, line in enumerate(f, 1):
+                m = FROM_RE.match(line)
+                if not m:
+                    continue
+                pinned = PINNED_RE.match(m.group(1))
+                if not pinned:
+                    continue  # unpinned, scratch or ARG: check_digest_pins
+                base, digest = pinned.group("base"), pinned.group("digest")
+                seen.add(base)
+                entry = lock_data.get(base)
+                if entry is None:
+                    errors.append(
+                        f"{relpath}:{i}: {base} is not in {LOCK_FILE}"
+                    )
+                    continue
+                locked = entry.get("digest") if isinstance(entry, dict) else None
+                if locked != digest:
+                    errors.append(
+                        f"{relpath}:{i}: {base} is pinned to {digest}, "
+                        f"but {LOCK_FILE} records {locked}"
+                    )
+
+    for base in sorted(set(lock_data) - seen):
+        errors.append(
+            f"{LOCK_FILE}: {base} is not used by any digest-pinned FROM line"
+        )
     return errors
 
 
@@ -99,11 +166,12 @@ def check_cosign_signatures(root: str) -> list[str]:
     return warnings
 
 
-def main():
-    root = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+def main(root: str | None = None) -> int:
+    if root is None:
+        root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
     os.chdir(root)
 
     # Check 1: Digest pins (mandatory)
@@ -115,20 +183,35 @@ def main():
     else:
         print("  All FROM lines are digest-pinned.")
 
-    # Check 2: Cosign signatures (advisory for now)
+    # Check 2: Dockerfile digests match the lock (mandatory). The cosign
+    # check below verifies the lock's digests, so a stale lock would have
+    # it vouch for images the Dockerfile no longer uses.
+    print(f"\nChecking Dockerfile digests against {LOCK_FILE}...")
+    lock_errors = check_lock_agreement(root)
+    if lock_errors:
+        for err in lock_errors:
+            print(f"  ERROR: {err}")
+    else:
+        print(f"  Dockerfile digests match {LOCK_FILE}.")
+
+    # Check 3: Cosign signatures (advisory for now)
     print("\nChecking cosign signatures...")
     warnings = check_cosign_signatures(root)
     if warnings:
         for w in warnings:
             print(f"  WARNING: {w}")
 
-    if errors:
-        print(f"\n{len(errors)} digest pin error(s) found.")
-        print("Run 'python3 lib/pin_base_images.py' to pin all base images.")
-        sys.exit(1)
+    if errors or lock_errors:
+        print(
+            f"\n{len(errors)} digest pin error(s), "
+            f"{len(lock_errors)} lock mismatch error(s) found."
+        )
+        print(FIX_HINT)
+        return 1
 
     print("\nAll base image checks passed.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
