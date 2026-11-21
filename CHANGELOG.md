@@ -46,20 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Base images re-pinned past open Wolfi advisories** in the old runtime
-  base: python-3.14 3.14.4-r3 (about 43 CVEs/GHSAs, fixed in 3.14.10),
-  glibc 2.43-r6 (6, fixed in 2.43-r10) and zlib 1.3.2-r2 (2, fixed in
-  1.3.2.1). The new runtime base has none open against the Wolfi secdb.
-- **Base images re-pinned again, to the 2026-11-20 Wolfi builds**
-  (`python:latest` `sha256:f6e5c2e0…`, `python:latest-dev`
-  `sha256:c047e6d1…`; both cosign-verified as signed by Chainguard's
-  release workflow). The runtime base stays on Python 3.15.2 and picks up
-  glibc 2.44-r24 (was r14), zlib 1.4 (was 1.3.2.1-rc), libffi 3.8.1, and
-  rebuilds of sqlite-libs, xz, ncurses and py3-pip-wheel. The findings in
-  the deployed 0.12.0 image's scan (py3-pip-wheel, libexpat1, python-3.14)
-  were already cleared by the earlier re-pin; they reach users with this
-  release. `sops` and `age` still come from `apk add` at build time, so
-  their versions follow the build date, not the base digest.
+- **Base images re-pinned past open Wolfi advisories**, to the
+  2026-11-20 Wolfi builds (`python:latest` `sha256:f6e5c2e0…`,
+  `python:latest-dev` `sha256:c047e6d1…`; both signatures checked by hand
+  against Chainguard's release workflow identity). Compared with 0.12.0's
+  runtime base, this clears python-3.14 3.14.4-r3 (about 43 CVEs/GHSAs; the
+  image now runs Python 3.15.2), glibc 2.43-r6 (6; now 2.44-r24), zlib
+  1.3.2-r2 (2; now 1.4), and the py3-pip-wheel 26.0.1 and libexpat1 2.8.0
+  findings in the nightly scan of the deployed 0.12.0 image. libffi (3.8.1),
+  sqlite-libs, xz and ncurses are rebuilt too. `sops` and `age` still come
+  from `apk add` at build time, so their versions follow the build date, not
+  the base digest.
 
 ## [0.12.0]
 
