@@ -1,5 +1,7 @@
 """What the server says about itself at MCP initialize."""
 
+from importlib.metadata import version
+
 from mcp.shared.memory import create_connected_server_and_client_session
 
 import sops_mcp
@@ -19,3 +21,6 @@ async def test_initialize_reports_the_sops_mcp_version():
         result = await client.initialize()
     assert result.serverInfo.name == "sops-mcp"
     assert result.serverInfo.version == sops_mcp.__version__
+    # The equality above holds trivially if both sides are the same
+    # fallback; this is the bug's actual symptom.
+    assert result.serverInfo.version != version("mcp")
