@@ -93,16 +93,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **follows symlinked directories**, walking each real directory once so a
   link loop or a venv's `lib64 -> lib` ends; before, a bundle reachable only
   through a directory symlink was never scanned (#42 item 3).
-- **A release ships only if its Docker image passes the scan.**
-  `publish-pypi.yml` builds the tag's image and scans it with Grype at the
-  same threshold as `publish.yml`; the PyPI upload and the GitHub Release
-  (and so the MCP registry entry) wait on that scan. Before, a tag whose
-  image failed the scan still reached PyPI and the Release, and a failed
-  package build let the Release through as well.
-- **Image publishes no longer overlap.** `publish.yml` runs one publish per
-  ref at a time, queued, never cancelled midway, and moves `latest` only
-  while the run's commit is still `main`'s head, so a re-run of an older
-  run can't move `latest` back.
+- **A release ships only once its Docker image is published.** The PyPI
+  upload and the GitHub Release (and so the MCP registry entry) now wait
+  for a cosign signature from `publish.yml` on the tag's image, at the
+  tag's commit, which `publish.yml` adds only after the image passes its
+  supply-chain checks and the Grype scan. Before, a tag whose image failed
+  the scan still reached PyPI and the Release, and a failed package build
+  let the Release through as well. `publish-pypi.yml` no longer uploads
+  when dispatched on a branch.
+- **`latest` can't move back to an older image.** `publish.yml` moves it in
+  its own job, after signing, one move at a time (a `concurrency:` group
+  that queues rather than cancels), and only when the commit it holds is
+  the run's commit or an ancestor of it. Two publishes finishing out of
+  order, or a re-run of an old one, used to be able to move it back.
 
 ## [0.12.0]
 

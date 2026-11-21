@@ -11,16 +11,6 @@ on:
 permissions:
   contents: read
 
-# One publish per ref at a time, queued rather than cancelled: a publish
-# cancelled midway can leave some tags pushed and the image unsigned. Main's
-# runs move `latest`, so they must not overlap or finish out of order; each
-# tag gets its own group. GitHub keeps at most one run waiting per group: a
-# newer run replaces a waiting (not yet started) one, which has pushed
-# nothing, and the newer commit's image supersedes it.
-concurrency:
-  group: publish-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   verify-supply-chain:
     runs-on: ubuntu-latest
@@ -68,7 +58,7 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=short
             type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
+          # `latest` is moved by the move-latest job below, after signing.
 
       # The OCI archive holds the image index, the image and the BuildKit
       # SBOM and provenance attestations, all pushed unchanged below.
@@ -108,6 +98,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Fetch the scanned archive
         uses: actions/download-artifact@v4
@@ -132,17 +124,13 @@ jobs:
       # manifest and attestation, to each tag: --preserve-digests refuses
       # any conversion that would change the digest, and each tag is checked
       # again after its push. skopeo reads the credential docker/login-action
-      # wrote to ~/.docker/config.json. `latest` moves only while this run's
-      # commit is still main's head, so re-running an old run (its archive
-      # is kept 7 days) can't move it back to an older image; the run's
-      # other tags are still pushed and signed.
+      # wrote to ~/.docker/config.json.
       - name: Push the scanned image
         id: push
         env:
           ARCHIVE: ${{ runner.temp }}/oci/image.tar
           TAGS: ${{ needs.build-and-scan.outputs.tags }}
           BUILT: ${{ needs.build-and-scan.outputs.digest }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           case "$BUILT" in sha256:*) ;; *) echo "::error::no build digest"; exit 1;; esac
@@ -162,15 +150,8 @@ jobs:
           fi
           while read -r tag; do
             [ -n "$tag" ] || continue
-            if [ "${tag##*:}" = latest ]; then
-              head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-              if [ "$head" != "$GITHUB_SHA" ]; then
-                echo "::warning::main is at $head, not this run's $GITHUB_SHA; not moving $tag"
-                continue
-              fi
-            fi
             skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/pushed" \
-              "oci:$layout" "docker://$tag"
+              "oci:$layout" "docker://$tag" </dev/null
             pushed=$(cat "$RUNNER_TEMP/pushed")
             echo "$tag -> $pushed"
             if [ "$pushed" != "$BUILT" ]; then
@@ -188,3 +169,70 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  # Moves `latest` on main to the image just pushed and signed, unless
+  # `latest` already holds a newer commit. Runs on main only.
+  #
+  # Concurrency: every run's move-latest job shares one group, so two moves
+  # never overlap, and they queue rather than cancel (a move is one skopeo
+  # copy; cancel-in-progress: false never stops one midway). GitHub keeps at
+  # most one waiting job per group, so a newer move replaces a waiting
+  # older one, which is what `latest` should do anyway. The rest of the
+  # workflow is deliberately not grouped: a waiting run replaced in a
+  # workflow-level group never pushes its commit's sha- or version tag.
+  #
+  # The ancestry check makes the order of the moves irrelevant: `latest`
+  # moves only when the commit it holds (the image's
+  # org.opencontainers.image.revision label) is this run's commit or an
+  # ancestor of it. So a re-run of an old run (its archive is kept 7 days)
+  # or a run that finishes late can't move it back to an older image.
+  move-latest:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-latest
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move latest unless it holds a newer commit
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$DIGEST" in sha256:*) ;; *) echo "::error::no published digest"; exit 1;; esac
+          current=$(skopeo inspect --no-tags "docker://$IMAGE:latest" </dev/null \
+            | jq -r '.Labels["org.opencontainers.image.revision"] // ""')
+          if [ -n "$current" ]; then
+            # status of this run's commit relative to latest's: "ahead" means
+            # latest's commit is an ancestor of this one.
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$current...$GITHUB_SHA" --jq .status </dev/null)
+            case "$status" in
+              ahead|identical) ;;
+              *)
+                echo "::warning::latest holds $current; this run's $GITHUB_SHA is $status of it, so latest stays"
+                exit 0
+                ;;
+            esac
+          else
+            echo "::warning::latest carries no revision label; moving it"
+          fi
+          skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/moved" \
+            "docker://$IMAGE@$DIGEST" "docker://$IMAGE:latest" </dev/null
+          moved=$(cat "$RUNNER_TEMP/moved")
+          if [ "$moved" != "$DIGEST" ]; then
+            echo "::error::latest was pushed as $moved, not $DIGEST"
+            exit 1
+          fi
+          echo "latest -> $DIGEST ($GITHUB_SHA)"

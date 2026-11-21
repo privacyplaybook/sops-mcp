@@ -484,14 +484,16 @@ image scan runs in the `Image build` workflow on pull requests, and in
 `publish.yml`, which builds the image once to an OCI archive, scans it in a
 job holding no credentials, and only then pushes that same archive (same
 digest) to GHCR and signs it. Nothing reaches GHCR unless the scan passes.
-On a version tag, `publish-pypi.yml` runs the same scan on its own build of
-the tag's image, and the PyPI upload and the GitHub Release wait on it.
-It fails on a vulnerability that has a fix available at severity high or
+The scan fails on a vulnerability that has a fix available at severity high or
 above; one with no fix yet doesn't fail. When it fails on a base package,
 the fix is usually a base digest bump (`python3 lib/pin_base_images.py`);
 on `sops` or `age`, a rebuild picks up Wolfi's newest (see below). To accept
 a finding instead, add an `ignore:` rule naming the `vulnerability:` with a
 `reason:` to `.grype.yaml`.
+
+A version tag reaches PyPI and the GitHub Release only after `publish.yml`
+has pushed and signed that tag's image: `publish-pypi.yml` waits for the
+signature before it uploads.
 
 ### Signed binaries from Wolfi
 
