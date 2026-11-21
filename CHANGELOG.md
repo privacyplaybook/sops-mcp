@@ -108,6 +108,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image is signed, and only when the commit `latest` holds is an ancestor
   of the one it moves to. Two publishes finishing out of
   order, or a re-run of an old one, used to be able to move it back.
+- **Key and domain names with a trailing newline are refused** (#58). Both
+  patterns were applied with `.match()`, and Python's `$` also matches
+  before a final `\n`, so `DB_PASSWORD\n` passed as a key name and
+  `prod\n` as a domain name. Both now use `fullmatch`.
+- **`SopsEncryptor.encrypt()` checks a flat file's root keys itself** (#58),
+  as a last guard behind each tool's input validation: a new root key that
+  doesn't match `^[A-Z][A-Z0-9_]*$`, other than `_meta_unencrypted`, is
+  refused before sops runs. Keys carried over from the file being
+  re-encrypted pass as they are, so a legacy file made with the sops CLI
+  (`db_user`, say) can still be rekeyed, renamed or trimmed. A root key
+  ending in `_unencrypted`, which sops would leave in plaintext, is always
+  refused (an incompatible change: see the upgrade note below).
+- **A secret spec without `key_name` or `source` gets a validation error**
+  (#58), not "Internal error". The tools' input schema already requires
+  both, so this reached only a handler called directly.
+
+### Upgrade note
+
+- **Incompatible change: files with an `*_unencrypted` root key can no
+  longer be edited** (#58). An existing file with a root key ending in
+  `_unencrypted`, other than `_meta_unencrypted`, is refused by every edit
+  tool (add, delete, rename, rotate, update, rekey and add_metadata), since
+  sops would store a new value for that key in plaintext. Rename such keys
+  with the sops CLI first (`sops edit <file>`), then manage the file here
+  as before.
 
 ## [0.12.0]
 

@@ -1,9 +1,12 @@
 """SOPS encryption/decryption via CLI with secure temp file handling."""
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Collection
+from typing import Any
 
 import yaml
 
@@ -89,6 +92,65 @@ _UNSUPPORTED_FLAGS = ("key_groups", "shamir_threshold", "mac_only_encrypted")
 # ending in it (the `_meta_unencrypted` block) stay plaintext, and every
 # other value is encrypted.
 UNENCRYPTED_SUFFIX = "_unencrypted"
+
+# A root key of a flat file: what server.py's _validate_key_name enforces
+# on input. Here too so encrypt() can refuse what a caller failed to check.
+# Always applied with fullmatch: `$` also matches before a trailing newline.
+KEY_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# The one root key a flat file holds besides its secrets.
+META_KEY = "_meta_unencrypted"
+
+
+def _check_flat_root_keys(data: Any, carried: Collection[Any]) -> None:
+    """Refuse to encrypt a flat file with a root key no tool may write.
+
+    The last guard before the YAML is written: every handler validates the
+    key names it adds, so this fires only for a caller that skipped that.
+    Keys in `carried` came out of the file being re-encrypted and pass as
+    they are, so a legacy file made with the sops CLI, whose keys need not
+    follow the pattern, can still be rekeyed, renamed or trimmed. The one
+    exception is a key ending in the unencrypted suffix, which is always
+    refused.
+    """
+    if not isinstance(data, dict):
+        raise SopsError("refusing to encrypt: data is not a mapping")
+    for key in data:
+        if key == META_KEY:
+            continue
+        if isinstance(key, str) and key.endswith(UNENCRYPTED_SUFFIX):
+            # sops would leave this value in the clear. Never excused by
+            # `carried`: a handler may be writing a new value into it.
+            raise SopsError(
+                f"refusing to encrypt: key {_shown(key)} ends in "
+                f"{UNENCRYPTED_SUFFIX!r}, so its value would be stored in "
+                "plaintext. Manage this file with the sops CLI."
+            )
+        if key in carried:
+            continue
+        if not isinstance(key, str) or not KEY_NAME_PATTERN.fullmatch(key):
+            raise SopsError(
+                f"refusing to encrypt: invalid key name {_shown(key)}. Key "
+                "names must match ^[A-Z][A-Z0-9_]*$."
+            )
+
+
+# How much of a refused key an error message quotes.
+_SHOWN_KEY_MAX = 64
+
+
+def _shown(key: Any) -> str:
+    """A key for an error message: repr-escaped, and cut short.
+
+    Key names are plaintext in an encrypted file, but a refused key never
+    reached one, and a caller that skipped validation could have put
+    anything there.
+    """
+    text = repr(key)
+    if len(text) <= _SHOWN_KEY_MAX:
+        return text
+    return text[:_SHOWN_KEY_MAX] + "…"
+
 
 # What `sops_create_k8s_secret` encrypts with: only the `data` and
 # `stringData` subtrees, so `apiVersion`, `kind`, `metadata` and `type`
@@ -256,6 +318,7 @@ class SopsEncryptor:
         domain: Domain,
         *,
         encrypted_regex: str | None = None,
+        carried: Collection[Any] = (),
     ) -> str:
         """Encrypt a dict as SOPS YAML, returning the encrypted content.
 
@@ -269,10 +332,19 @@ class SopsEncryptor:
             encrypted_regex: Encrypt only the subtrees under keys matching
                   this regex, and leave everything else plaintext, instead
                   of the suffix rule. sops records it in the envelope.
+            carried: Root keys taken from the file being re-encrypted.
+                  Under the suffix rule every other root key must be a
+                  valid key name or `_meta_unencrypted`, or SopsError is
+                  raised before sops runs.
 
         Returns:
             SOPS-encrypted YAML string.
         """
+        if encrypted_regex is None:
+            # Under the suffix rule every root key is a secret or the
+            # metadata block. A manifest (encrypted_regex) has its own root
+            # keys, and its caller validates the keys under stringData.
+            _check_flat_root_keys(data, carried)
         plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
         # sops refuses more than one encryption-mode flag, so exactly one.
         mode = (
