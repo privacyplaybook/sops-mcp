@@ -11,6 +11,16 @@ on:
 permissions:
   contents: read
 
+# One publish per ref at a time, queued rather than cancelled: a publish
+# cancelled midway can leave some tags pushed and the image unsigned. Main's
+# runs move `latest`, so they must not overlap or finish out of order; each
+# tag gets its own group. GitHub keeps at most one run waiting per group: a
+# newer run replaces a waiting (not yet started) one, which has pushed
+# nothing, and the newer commit's image supersedes it.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   verify-supply-chain:
     runs-on: ubuntu-latest
@@ -122,13 +132,17 @@ jobs:
       # manifest and attestation, to each tag: --preserve-digests refuses
       # any conversion that would change the digest, and each tag is checked
       # again after its push. skopeo reads the credential docker/login-action
-      # wrote to ~/.docker/config.json.
+      # wrote to ~/.docker/config.json. `latest` moves only while this run's
+      # commit is still main's head, so re-running an old run (its archive
+      # is kept 7 days) can't move it back to an older image; the run's
+      # other tags are still pushed and signed.
       - name: Push the scanned image
         id: push
         env:
           ARCHIVE: ${{ runner.temp }}/oci/image.tar
           TAGS: ${{ needs.build-and-scan.outputs.tags }}
           BUILT: ${{ needs.build-and-scan.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           case "$BUILT" in sha256:*) ;; *) echo "::error::no build digest"; exit 1;; esac
@@ -148,6 +162,13 @@ jobs:
           fi
           while read -r tag; do
             [ -n "$tag" ] || continue
+            if [ "${tag##*:}" = latest ]; then
+              head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+              if [ "$head" != "$GITHUB_SHA" ]; then
+                echo "::warning::main is at $head, not this run's $GITHUB_SHA; not moving $tag"
+                continue
+              fi
+            fi
             skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/pushed" \
               "oci:$layout" "docker://$tag"
             pushed=$(cat "$RUNNER_TEMP/pushed")

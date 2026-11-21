@@ -49,8 +49,43 @@ jobs:
           name: dist
           path: dist/
 
+  # The tag's Docker image must pass the same Grype scan that publish.yml
+  # runs before it pushes, or nothing ships to PyPI or the Release: a tag
+  # whose image fails the scan would otherwise release a version with no
+  # image. This is a separate build of the same commit (publish.yml's own
+  # scanned archive lives in another workflow run), loaded locally and never
+  # pushed; this job holds no write token, no registry login and no OIDC
+  # permission. Keep its build inputs in step with image.yml and publish.yml.
+  image-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # No token left in .git/config for the scanner to find.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sops-mcp:release
+
+      # Threshold: same as publish.yml and image.yml. Allowlist: .grype.yaml.
+      - name: Scan the image for vulnerabilities
+        uses: ./.github/actions/image-scan
+        with:
+          image: docker:sops-mcp:release
+          fail-on: high
+
   publish:
-    needs: build
+    needs: [build, image-scan]
     runs-on: ubuntu-latest
     # Pre-release tags (v1.2.3-rc1) build and vuln-scan above, and publish.yml
     # still produces a cosign-signed image for deploy validation — but they do
@@ -80,11 +115,19 @@ jobs:
   # final release — the wheel is live before the registry entry (which
   # references it). For a pre-release the `publish` job is skipped, and this
   # still runs to cut the pre-release Release (the reusable workflow does not
-  # dispatch the registry for pre-release tags). Skipped only if `publish`
-  # actually failed.
+  # dispatch the registry for pre-release tags). It runs only when the
+  # package build and the image scan both passed, and `publish` either
+  # succeeded or was skipped for a pre-release tag: a skipped `publish`
+  # (whose `needs` failed) no longer lets the Release through.
   create-release:
-    needs: publish
-    if: ${{ !cancelled() && needs.publish.result != 'failure' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build, image-scan, publish]
+    if: >-
+      ${{ !cancelled()
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.build.result == 'success'
+          && needs.image-scan.result == 'success'
+          && (needs.publish.result == 'success'
+              || (needs.publish.result == 'skipped' && contains(github.ref_name, '-'))) }}
     permissions:
       contents: write
       actions: write
