@@ -3,7 +3,7 @@
 # ---- build stage ----
 # Wolfi-based image with apk + shell + build toolchain. Used to install
 # Python deps into a venv and to source the sops + age binaries.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:898360ca56a2a65c3facdd36a4e6151133a580aa367195261554e82948921ff1 AS build
+FROM cgr.dev/chainguard/python:latest-dev@sha256:c047e6d1e47b09144a771bfde6595a00c49dc8571caa7dd62df88634e84304ae AS build
 
 USER root
 
@@ -63,7 +63,7 @@ RUN python -m pip uninstall --yes pip
 # ---- runtime stage ----
 # Distroless Wolfi Python. No shell, no apk, no package manager. Runs as
 # the built-in `nonroot` user (uid 65532) by default.
-FROM cgr.dev/chainguard/python:latest@sha256:1a00964779bf570a8cb2ea4fa086614af19c35069029785c08fcec0c50b66ac0
+FROM cgr.dev/chainguard/python:latest@sha256:f6e5c2e056393d48fa8afa1ea58a1394db4cd5de1a8f0f48105c8e88fcd4f9d3
 
 # Anti-squatting annotation required by registry.modelcontextprotocol.io
 # when an OCI image is referenced by a server.json submission. The label
