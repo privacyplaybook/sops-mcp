@@ -11,7 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A `urlsafe` charset for generated secrets**: letters, digits, `-` and
   `_` (the RFC 4648 URL-safe alphabet). Same 6 bits per character as
-  `base64`, without the `+` and `/` that break in URLs (#62).
+  `base64`, without the `+` and `/` that break in URLs (#62). It is
+  forward-only: a file whose metadata records `charset: urlsafe` can be
+  rotated only by this version or later; older builds refuse it with
+  `Unknown charset 'urlsafe'`.
 - **Weak generated secrets come back with a warning.** When a generated
   secret's effective entropy (length × log2(charset size, after
   `exclude_chars`)) is under 64 bits, `sops_create_secrets`,

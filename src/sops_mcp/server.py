@@ -1685,7 +1685,7 @@ class SopsMcpServer:
                 rotated.append(key)
                 warning = entropy_warning(length, charset, exclude_chars)
                 if warning:
-                    weak.append(f"  {key}: {warning}")
+                    weak.append(f"    {key}: {warning}")
                 changed.add(key)
             elif source == "derived":
                 derivation = info.get("derivation", {})
@@ -1735,11 +1735,11 @@ class SopsMcpServer:
         summary_lines = ["Rotation complete:"]
         if rotated:
             summary_lines.append(f"  Rotated: {', '.join(rotated)}")
+            summary_lines.extend(weak)
         if recomputed:
             summary_lines.append(f"  Recomputed (derived): {', '.join(recomputed)}")
         if preserved:
             summary_lines.append(f"  Preserved: {', '.join(preserved)}")
-        summary_lines.extend(weak)
 
         return _mutation_response(
             encrypted_yaml, summary_lines, derived_plaintexts, "changed"

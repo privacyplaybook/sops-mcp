@@ -47,7 +47,7 @@ Three ideas shape the tool surface:
 | Charset | Characters | Bits per char |
 |---------|------------|---------------|
 | `alphanumeric` (default) | `A-Z a-z 0-9` | 5.95 |
-| `alphanumeric_symbols` | `A-Z a-z 0-9` and `!@#$%^&*()-_=+` | 6.36 |
+| `alphanumeric_symbols` | `A-Z a-z 0-9` and `!@#$%^&*()-_=+` | 6.25 |
 | `hex` | `0-9 a-f` | 4 |
 | `base64` | `A-Z a-z 0-9 + /` | 6 |
 | `urlsafe` | `A-Z a-z 0-9 - _` | 6 |
@@ -55,7 +55,7 @@ Three ideas shape the tool surface:
 
 `base64` is a 64-character *alphabet*, not base64 encoding: each character is drawn independently, there is no `=` padding, any length is allowed, and the value does not decode to anything. Its `+` and `/` need escaping in URLs, paths and form data; `urlsafe` (the RFC 4648 URL- and filename-safe alphabet) has the same strength without them. `exclude_chars` removes characters from the chosen set.
 
-A generated secret's effective entropy is length × log2(charset size, after exclusions). Below **64 bits** (for example `length: 6, charset: numeric`, about 20 bits), the secret is still created, and the response carries a `WARNING` line naming the key, its entropy and its parameters, never its value. `sops_rotate_generated` warns the same way when it regenerates such a key. There is no hard floor: short values have legitimate uses, and existing callers keep working.
+A generated secret's effective entropy is length × log2(charset size, after exclusions). Below **64 bits** (for example `length: 6, charset: numeric`, about 20 bits), the secret is still created, and the response carries a `WARNING` line naming the key, its entropy and its parameters, never its value. `sops_rotate_generated` warns the same way when it regenerates such a key. A `derived` secret is no stronger than its source (a hash of a 4-digit PIN can be brute-forced in 10,000 tries), but only the generated source carries the warning. There is no hard floor: short values have legitimate uses, and existing callers keep working.
 
 ### Transforms (for `derived` secrets)
 
