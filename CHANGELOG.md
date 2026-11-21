@@ -93,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **follows symlinked directories**, walking each real directory once so a
   link loop or a venv's `lib64 -> lib` ends; before, a bundle reachable only
   through a directory symlink was never scanned (#42 item 3).
+- **A release ships only if its Docker image passes the scan.**
+  `publish-pypi.yml` builds the tag's image and scans it with Grype at the
+  same threshold as `publish.yml`; the PyPI upload and the GitHub Release
+  (and so the MCP registry entry) wait on that scan. Before, a tag whose
+  image failed the scan still reached PyPI and the Release, and a failed
+  package build let the Release through as well.
+- **Image publishes no longer overlap.** `publish.yml` runs one publish per
+  ref at a time, queued, never cancelled midway, and moves `latest` only
+  while the run's commit is still `main`'s head, so a re-run of an older
+  run can't move `latest` back.
 
 ## [0.12.0]
 
