@@ -86,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sqlite-libs, xz and ncurses are rebuilt too. `sops` and `age` still come
   from `apk add` at build time, so their versions follow the build date, not
   the base digest.
+- **The build-time trust-store guard fails on a directory it can't list**
+  instead of skipping it as if empty. It runs in the runtime stage as
+  nonroot, so a restricted directory in a future base could otherwise have
+  hidden a distrusted bundle while the build passed (#43). It now also
+  **follows symlinked directories**, walking each real directory once so a
+  link loop or a venv's `lib64 -> lib` ends; before, a bundle reachable only
+  through a directory symlink was never scanned (#42 item 3).
 
 ## [0.12.0]
 
