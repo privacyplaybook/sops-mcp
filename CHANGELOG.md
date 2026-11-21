@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The image scan refuses unknown keys in a `.grype.yaml` rule.** Grype
+  ignores a key it doesn't know, so a misspelled `pacakge:` left a rule
+  that silenced its CVE in every package, and the check passed it. Each
+  rule key must now be one Grype supports, with the expected shape
+  (strings, `include-aliases` a boolean, `fix-state`, `match-type` and the
+  VEX fields from Grype's own values, `package` a non-empty mapping of
+  known keys), and a key repeated in one mapping is refused. The checks
+  moved from inline Python in the action to `lib/verify_grype_config.py`,
+  with tests in `tests/test_verify_grype_config.py` (#60).
 - **CI fails when the Dockerfile's base image digests and
   `base-images.lock.json` disagree.** The `verify` job checked only that
   each `FROM` line was digest-pinned, so a Dependabot base-image PR went
