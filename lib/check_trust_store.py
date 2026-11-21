@@ -49,8 +49,8 @@ def bundle_files(path: str, bad: list[str], seen: set[tuple[int, int]]) -> list[
     trusted, and each real directory (by device and inode) is walked once,
     so a link loop or a venv's `lib64 -> lib` ends rather than recursing.
     `seen` is shared across arguments, so a directory two of them reach is
-    scanned once. A link os.walk can't classify (its target can't be
-    stat'ed) is listed among the files, so it is checked and reported too.
+    walked once. A link os.walk can't classify because its target is
+    permission-denied is listed among the files; it is reported too.
     """
     if not os.path.isdir(path):
         return [path]  # a missing file is reported when it is opened
@@ -72,17 +72,21 @@ def bundle_files(path: str, bad: list[str], seen: set[tuple[int, int]]) -> list[
         seen.add((st.st_dev, st.st_ino))
         for name in files:
             # os.walk puts a link whose target it can't stat among the
-            # files, where it would be dropped unread: a restricted target
-            # must fail like an unlistable directory. A dangling link holds
-            # nothing, and a dangling bundle name fails when it is opened.
+            # files, where it would be dropped unread: a permission-denied
+            # target may be a directory, so it fails like an unlistable one.
+            # Other errors (dangling, a loop, a path through a file) mean
+            # nothing is behind the link. A bundle name is opened below,
+            # which reports it already.
+            if name.endswith(BUNDLE_SUFFIXES) or CAPATH_ENTRY.match(name):
+                continue
             link = os.path.join(root, name)
             if os.path.islink(link):
                 try:
                     os.stat(link)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
+                except PermissionError as exc:
                     bad.append(f"{link}: unreadable link target ({exc.strerror})")
+                except OSError:
+                    pass  # dangling, a loop, or through a file: nothing there
         found.extend(
             os.path.join(root, name)
             for name in files

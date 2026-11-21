@@ -124,7 +124,6 @@ def test_symlink_loop_is_walked_once(tmp_path: Path, capsys) -> None:
 def test_link_to_unreachable_directory_fails(tmp_path: Path, capsys) -> None:
     # os.walk can't stat a link whose target sits under a 0700 directory,
     # files it as a non-directory and would drop it: it must fail instead.
-    (tmp_path / "ok.pem").write_text(G1)
     vault = tmp_path / "vault"
     (vault / "certs").mkdir(parents=True)
     (vault / "certs" / "cacert.pem").write_text(G3)
@@ -142,9 +141,12 @@ def test_link_to_unreachable_directory_fails(tmp_path: Path, capsys) -> None:
         vault.chmod(0o700)
 
 
-def test_dangling_directory_link_is_ignored(tmp_path: Path) -> None:
+def test_links_to_nothing_are_ignored(tmp_path: Path) -> None:
+    # Dangling, looping, or through a regular file: nothing is behind them.
     (tmp_path / "ok.pem").write_text(G1)
     (tmp_path / "gone").symlink_to(tmp_path / "absent", target_is_directory=True)
+    (tmp_path / "self").symlink_to("self")
+    (tmp_path / "through").symlink_to(tmp_path / "ok.pem" / "sub")
     assert guard.main([str(tmp_path)]) == 0
 
 
@@ -157,3 +159,23 @@ def test_directory_reached_twice_is_scanned_once(tmp_path: Path, capsys) -> None
     (tmp_path / "b" / "a").symlink_to(tmp_path / "a", target_is_directory=True)
     assert guard.main([str(tmp_path / "a"), str(tmp_path / "b")]) == 0
     assert "Trust store OK: 1 certificates" in capsys.readouterr().out
+
+
+def test_bundle_named_link_to_unreachable_target_is_reported_once(
+    tmp_path: Path, capsys
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "cacert.pem").write_text(G3)
+    scanned = tmp_path / "scanned"
+    scanned.mkdir()
+    (scanned / "ok.pem").write_text(G1)
+    (scanned / "cacert.pem").symlink_to(vault / "cacert.pem")
+    vault.chmod(0)
+    try:
+        if os.access(vault, os.R_OK):
+            pytest.skip("running as root: permissions are not enforced")
+        assert guard.main([str(scanned)]) == 1
+        assert capsys.readouterr().out.count("cacert.pem: unreadable") == 1
+    finally:
+        vault.chmod(0o700)
