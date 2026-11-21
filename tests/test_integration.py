@@ -460,9 +460,10 @@ async def test_rotate_refuses_each_kind_of_undescribed_key(
         # yaml.dump quotes 'NO'; a hand-written file wouldn't.
         return real_dump(data, *args, **kwargs).replace("'NO':", "NO:")
 
-    monkeypatch.setattr(sops_module.yaml, "dump", unquoted_no)
-    content = await _with_extra(server, extra, entries)
-    monkeypatch.setattr(sops_module.yaml, "dump", real_dump)
+    with monkeypatch.context() as patch:
+        if "NO" in extra:
+            patch.setattr(sops_module.yaml, "dump", unquoted_no)
+        content = await _with_extra(server, extra, entries)
     with pytest.raises(ValueError, match="does not describe") as excinfo:
         await server._rotate_generated({"encrypted_content": content})
     message = str(excinfo.value)

@@ -1713,9 +1713,9 @@ class SopsMcpServer:
                 f"{len(undescribed)} key(s) in this file: "
                 f"{', '.join(undescribed)}. Rotation rebuilds the file from "
                 "the block, so it would drop them; nothing was changed. "
-                "With the sops CLI, give each one an entry with a 'source' "
-                "in the block, or remove it ('_'-prefixed keys can only be "
-                "removed), then rotate again."
+                "With the sops CLI, give each one an entry in the block "
+                "(source 'external' keeps its value; 'generated' replaces "
+                "it), or remove it, then rotate again."
             )
 
         now = datetime.now(UTC).isoformat()
