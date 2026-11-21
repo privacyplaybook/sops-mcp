@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A `urlsafe` charset for generated secrets**: letters, digits, `-` and
+  `_` (the RFC 4648 URL-safe alphabet). Same 6 bits per character as
+  `base64`, without the `+` and `/` that break in URLs (#62). It is
+  forward-only: a file whose metadata records `charset: urlsafe` can be
+  rotated only by this version or later; older builds refuse it with
+  `Unknown charset 'urlsafe'`.
+- **Weak generated secrets come back with a warning.** When a generated
+  secret's effective entropy (length × log2(charset size, after
+  `exclude_chars`)) is under 64 bits, `sops_create_secrets`,
+  `sops_add_secrets`, `sops_create_k8s_secret` and `sops_rotate_generated`
+  add a `WARNING` line to their summary naming the key and its parameters,
+  never its value. Nothing is refused: existing callers keep working (#62).
+
+### Documentation
+
+- **`base64` is documented as what it is**: a 64-character alphabet, not
+  base64 encoding (no padding, any length). It keeps working unchanged.
+  The README gains a charsets table (#62).
+
 ### Changed
 
 - **CI fails when the Dockerfile's base image digests and
@@ -43,6 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scanned, pushes it to each tag with `skopeo` (checking each tag lands at
   the scanned digest), then signs it. Accepted findings go in
   `.grype.yaml`, one `vulnerability:` and `reason:` per rule.
+
+### Fixed
+
+- **`initialize` reports sops-mcp's own version.** `serverInfo.version`
+  was the `mcp` SDK's version (0.12.0 reported 1.30.0), because the server
+  was built without one. It now passes `sops_mcp.__version__`, read from
+  the package metadata, so a client or operator can tell which release is
+  running (#37).
 
 ### Security
 
