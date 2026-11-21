@@ -13,8 +13,10 @@ description: >
   not vulnerabilities.
 
   Allowlist: .grype.yaml at the repo root (`ignore:` rules). Every rule
-  must name a `vulnerability:` and carry a non-empty `reason:`, and the file
-  may hold no other setting; the first step below fails otherwise.
+  must name a `vulnerability:` and carry a non-empty `reason:`, may use only
+  the rule keys Grype supports, each of the right shape, and the file may
+  hold no other setting; the first step below fails otherwise
+  (lib/verify_grype_config.py).
 
   Runs on x86-64 Linux runners only (the pinned Grype asset is
   linux_amd64); it fails up front anywhere else.
@@ -40,49 +42,17 @@ runs:
   steps:
     - name: Check the runner and the allowlist
       shell: bash
-      # PyYAML ships with the runner's system Python; no install needed.
+      # The checks, and why each exists: lib/verify_grype_config.py (tested
+      # in tests/test_verify_grype_config.py). PyYAML ships with the
+      # runner's system Python; no install needed.
       run: |
         if [ "$RUNNER_OS" != Linux ] || [ "$RUNNER_ARCH" != X64 ]; then
           echo "::error::image-scan pins the linux_amd64 Grype asset; this runner is $RUNNER_OS/$RUNNER_ARCH"
           exit 1
         fi
-        /usr/bin/python3 -I - <<'PY'
-        import sys, yaml
-        with open(".grype.yaml") as f:
-            cfg = yaml.safe_load(f) or {}
-        # Only `ignore:` is allowed. Any other Grype setting here (`exclude:`
-        # paths, `match:` toggles, `only-fixed`, `fail-on-severity`, ...)
-        # could narrow the scan with no reason recorded; the gate's settings
-        # belong in the action and its callers.
-        if not isinstance(cfg, dict):
-            print("::error file=.grype.yaml::must be a mapping with only an `ignore:` key")
-            sys.exit(1)
-        extra = sorted(set(cfg) - {"ignore"})
-        if extra:
-            print(f"::error file=.grype.yaml::only `ignore:` is allowed here, found: {', '.join(map(str, extra))}")
-            sys.exit(1)
-        rules = cfg.get("ignore") or []
-        # Each rule must name one vulnerability and say why. A rule with no
-        # `vulnerability:` (say `package: {name: python-3.14}`, or
-        # `fix-state: fixed`) would silence a whole package, or the whole
-        # gate under --only-fixed, so it is refused even with a reason.
-        if not isinstance(rules, list):
-            print("::error file=.grype.yaml::`ignore:` must be a list of rules")
-            sys.exit(1)
-        bad = 0
-        for r in rules:
-            if not isinstance(r, dict):
-                problem = "is not a mapping"
-            elif not str(r.get("vulnerability") or "").strip():
-                problem = "names no vulnerability"
-            elif not str(r.get("reason") or "").strip():
-                problem = "has no reason"
-            else:
-                continue
-            bad += 1
-            print(f"::error file=.grype.yaml::ignore rule {problem}: {r}")
-        sys.exit(1 if bad else 0)
-        PY
+        # The script from this action's own checkout; the allowlist is the
+        # caller's, at its workspace root.
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/../../../lib/verify_grype_config.py" .grype.yaml
 
     - name: Install Grype (version and SHA-256 pinned)
       shell: bash

@@ -7,7 +7,10 @@
 # Allowlist. To suppress a finding that is genuinely not exploitable in this
 # server, add an `ignore:` rule. Every rule MUST name a `vulnerability:` and
 # carry a `reason:` saying why (the action fails on a rule missing either),
-# and should be as narrow as possible: add the package name too. Keep it empty unless
+# and should be as narrow as possible: add the package name too. Only the rule
+# keys Grype supports are accepted, so a typo such as `pacakge:` fails the
+# action instead of widening the rule to every package (the checks:
+# lib/verify_grype_config.py). Keep it empty unless
 # justified, and remove a rule once the fix ships. Example:
 #
 #   ignore:
