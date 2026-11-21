@@ -8,6 +8,7 @@ import subprocess
 import pytest
 import yaml
 
+import sops_mcp.sops as sops_module
 from sops_mcp.domains import load_domains
 from sops_mcp.server import SopsMcpServer
 from sops_mcp.sops import SopsEncryptor
@@ -417,3 +418,55 @@ async def test_rotate_refuses_keys_the_metadata_block_does_not_describe(server):
     after = server.encryptor.decrypt(partial, domain)
     assert after == before
     assert {"LEGACY_A", "LEGACY_B", "NEW_TOKEN"} <= set(after)
+
+
+async def _with_extra(server, extra, entries=None):
+    """A file made by sops_create_secrets (so its block is complete), then
+    re-encrypted with `extra` keys added and `entries` merged into the
+    block's secrets, the way a hand edit with the sops CLI would."""
+    domain = _domain(server)
+    created = await server._create_secrets({
+        "secrets": [
+            {"key_name": "TOKEN", "source": "generated", "length": 16},
+        ],
+    })
+    values = server.encryptor.decrypt(created[0].text, domain)
+    values.update(extra)
+    values["_meta_unencrypted"]["secrets"].update(entries or {})
+    return server.encryptor.encrypt(values, domain)
+
+
+@pytest.mark.parametrize(
+    ("extra", "entries", "named"),
+    [
+        # A bare or scalar entry doesn't describe the key: topological_order
+        # skips it, so rotating would drop the value and keep the entry.
+        ({"LEGACY_A": "value-zz93"}, {"LEGACY_A": None}, "LEGACY_A"),
+        ({"LEGACY_A": "value-zz93"}, {"LEGACY_A": "external"}, "LEGACY_A"),
+        # '_'-prefixed keys would be dropped too.
+        ({"_note": "value-zz94"}, {}, "_note"),
+        # An unquoted NO, which PyYAML (YAML 1.1) would load as False. sops
+        # keeps it a string key and quotes it on decrypt, so it is named as
+        # written (the guard's str() is only a backstop).
+        ({"NO": "value-zz95", "LEGACY_B": "value-zz96"}, {}, "NO"),
+    ],
+)
+async def test_rotate_refuses_each_kind_of_undescribed_key(
+    server, extra, entries, named, monkeypatch
+):
+    real_dump = sops_module.yaml.dump
+
+    def unquoted_no(data, *args, **kwargs):
+        # yaml.dump quotes 'NO'; a hand-written file wouldn't.
+        return real_dump(data, *args, **kwargs).replace("'NO':", "NO:")
+
+    monkeypatch.setattr(sops_module.yaml, "dump", unquoted_no)
+    content = await _with_extra(server, extra, entries)
+    monkeypatch.setattr(sops_module.yaml, "dump", real_dump)
+    with pytest.raises(ValueError, match="does not describe") as excinfo:
+        await server._rotate_generated({"encrypted_content": content})
+    message = str(excinfo.value)
+    assert named in message
+    assert "TOKEN" not in message
+    for value in extra.values():
+        assert value not in message

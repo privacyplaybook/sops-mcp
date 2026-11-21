@@ -1693,11 +1693,19 @@ class SopsMcpServer:
         # sops_add_secrets on a legacy file writes a block listing only the
         # new keys). Refuse and name them; never values. Every decrypted key
         # but the block itself counts, '_'-prefixed ones included, since
-        # they would be dropped too.
+        # they would be dropped too. An entry that isn't a mapping doesn't
+        # describe its key: topological_order skips it, so its value would
+        # be dropped as well. Names are stringified because YAML 1.1 loads
+        # keys such as NO or 2024 as bool or int.
+        def _described(key: Any) -> bool:
+            return isinstance(meta_secrets, dict) and isinstance(
+                meta_secrets.get(key), dict
+            )
+
         undescribed = sorted(
-            key
+            str(key)
             for key in decrypted
-            if key != "_meta_unencrypted" and key not in meta_secrets
+            if key != "_meta_unencrypted" and not _described(key)
         )
         if undescribed:
             raise ValueError(
@@ -1705,8 +1713,9 @@ class SopsMcpServer:
                 f"{len(undescribed)} key(s) in this file: "
                 f"{', '.join(undescribed)}. Rotation rebuilds the file from "
                 "the block, so it would drop them; nothing was changed. "
-                "Describe them in the block, or remove them, with the sops "
-                "CLI, then rotate again."
+                "With the sops CLI, give each one an entry with a 'source' "
+                "in the block, or remove it ('_'-prefixed keys can only be "
+                "removed), then rotate again."
             )
 
         now = datetime.now(UTC).isoformat()
