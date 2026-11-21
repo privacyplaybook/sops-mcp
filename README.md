@@ -491,9 +491,10 @@ on `sops` or `age`, a rebuild picks up Wolfi's newest (see below). To accept
 a finding instead, add an `ignore:` rule naming the `vulnerability:` with a
 `reason:` to `.grype.yaml`.
 
-A version tag reaches PyPI and the GitHub Release only after `publish.yml`
-has pushed and signed that tag's image: `publish-pypi.yml` waits for the
-signature before it uploads.
+A pushed version tag reaches PyPI and the GitHub Release only after
+`publish.yml` has pushed and signed that tag's image: `publish-pypi.yml`
+waits for the signature before it uploads. (A Release made by hand, by
+dispatching `create-release.yml` or in the UI, is not gated.)
 
 ### Signed binaries from Wolfi
 
