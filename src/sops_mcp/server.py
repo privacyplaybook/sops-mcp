@@ -34,7 +34,7 @@ from .secrets_derive import (
     derive_secret,
     topological_order,
 )
-from .secrets_generator import CHARSETS, generate_secret
+from .secrets_generator import CHARSETS, entropy_warning, generate_secret
 from .sops import (
     K8S_ENCRYPTED_REGEX,
     SopsEncryptor,
@@ -264,7 +264,14 @@ SECRET_ITEM_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": list(VALID_CHARSETS),
             "default": "alphanumeric",
-            "description": "Character set for generated secrets",
+            "description": (
+                "Character set for generated secrets. 'base64' is a "
+                "64-character alphabet (letters, digits, '+', '/'), not "
+                "base64 encoding; 'urlsafe' is the same size with '-' and "
+                "'_' instead, safe in URLs. A secret under 64 bits of "
+                "entropy (length x log2(charset size)) is still created, "
+                "with a warning in the response."
+            ),
         },
         "exclude_chars": {
             "type": "string",
@@ -497,6 +504,11 @@ def _process_batch(
                 f"  {key}: generated "
                 f"({gen['length']} chars, {gen['charset']}){desc_str}"
             )
+            warning = entropy_warning(
+                gen["length"], gen["charset"], gen.get("exclude_chars", "")
+            )
+            if warning:
+                summary.append(f"    {warning}")
         elif source == "derived":
             deriv = meta["derivation"]
             summary.append(
@@ -1656,6 +1668,7 @@ class SopsMcpServer:
         recomputed: list[str] = []
         preserved: list[str] = []
         derived_plaintexts: list[str] = []
+        weak: list[str] = []
 
         order = topological_order(meta_secrets)
         changed: set[str] = set()
@@ -1671,6 +1684,9 @@ class SopsMcpServer:
                 new_data[key] = generate_secret(length, charset, exclude_chars)
                 info["last_rotated"] = now
                 rotated.append(key)
+                warning = entropy_warning(length, charset, exclude_chars)
+                if warning:
+                    weak.append(f"    {key}: {warning}")
                 changed.add(key)
             elif source == "derived":
                 derivation = info.get("derivation", {})
@@ -1720,6 +1736,7 @@ class SopsMcpServer:
         summary_lines = ["Rotation complete:"]
         if rotated:
             summary_lines.append(f"  Rotated: {', '.join(rotated)}")
+            summary_lines.extend(weak)
         if recomputed:
             summary_lines.append(f"  Recomputed (derived): {', '.join(recomputed)}")
         if preserved:
