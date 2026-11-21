@@ -1,0 +1,138 @@
+name: Re-scan latest image
+
+# Re-scans the published ghcr.io/<repo>:latest daily with Grype, at the same
+# threshold and with the same allowlist (.grype.yaml) as the image-scan gate
+# in image.yml and publish.yml. Those gates scan an image once, when it is
+# built; a vulnerability published after that (a stale base image, #47, #52)
+# would otherwise be noticed only when someone looked (#61).
+#
+# On a finding it opens one issue, labelled scheduled-image-scan, or updates
+# the open one; a clean scan closes it (lib/latest_scan_issue.py). A scan
+# error (registry or DB download down, a DB over 5 days old) fails the run
+# and touches no issue: GitHub's failed-run notification covers it.
+#
+# Cost: one scan job (about 2-3 min: the ~70 MB DB, the image pull) and one
+# short issue job, once a day. Schedules run on the default branch only, and
+# GitHub disables them in a repo with no activity for 60 days.
+on:
+  schedule:
+    # 05:23 UTC: off the hour, when scheduled runs are most often delayed.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# Same threshold as image.yml and publish.yml; both jobs below read it.
+env:
+  FAIL_ON: high
+
+concurrency:
+  group: rescan-latest
+  cancel-in-progress: false
+
+jobs:
+  # Holds no write token: the scanner (a downloaded Grype binary reading a
+  # freshly downloaded DB and a pulled image) never runs next to one. The
+  # package is public, so the pull needs no login.
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+      digest: ${{ steps.resolve.outputs.digest }}
+      revision: ${{ steps.resolve.outputs.revision }}
+    steps:
+      # No token left in .git/config for the scanner to find. This checks
+      # out the default branch, so the allowlist is the current one.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Pin the tag to a digest once, so the scan and the issue name the
+      # same image even if `latest` moves mid-run. skopeo is preinstalled on
+      # ubuntu-latest.
+      - name: Resolve latest to a digest
+        id: resolve
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          out=$(skopeo inspect --no-tags "docker://$IMAGE:latest" </dev/null)
+          digest=$(jq -r '.Digest' <<<"$out")
+          revision=$(jq -r '.Labels["org.opencontainers.image.revision"] // ""' <<<"$out")
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::latest resolved to '$digest', not a digest"
+            exit 1
+          fi
+          # A label is image content, not ours: keep only a commit SHA.
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || revision=""
+          echo "$IMAGE:latest is $digest (revision ${revision:-unknown})"
+          {
+            echo "digest=$digest"
+            echo "revision=$revision"
+          } >> "$GITHUB_OUTPUT"
+
+      # on-findings: report
+      # passes the step on a finding, so the issue job below can report it;
+      # a scan error still fails here.
+      - name: Scan the image for vulnerabilities
+        id: scan
+        uses: ./.github/actions/image-scan
+        with:
+          image: registry:ghcr.io/${{ github.repository }}@${{ steps.resolve.outputs.digest }}
+          fail-on: ${{ env.FAIL_ON }}
+          on-findings: report
+
+      - name: Hand the report to the issue job
+        if: steps.scan.outputs.findings == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-report
+          path: ${{ steps.scan.outputs.report-json }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # The only job with a write permission, and only issues: write. It runs no
+  # scanner and reads only the scan job's JSON report.
+  issue:
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: lib
+
+      - name: Fetch the report
+        if: needs.scan.outputs.findings == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: grype-report
+          path: ${{ runner.temp }}/report
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FINDINGS: ${{ needs.scan.outputs.findings }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ needs.scan.outputs.digest }}
+          REVISION: ${{ needs.scan.outputs.revision }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          common=(--image "$IMAGE" --digest "$DIGEST" --revision "$REVISION" --run-url "$RUN_URL")
+          if [ "$FINDINGS" = true ]; then
+            /usr/bin/python3 -I lib/latest_scan_issue.py findings \
+              "$RUNNER_TEMP/report/grype-report.json" --fail-on "$FAIL_ON" "${common[@]}"
+            # Red, so the run list shows it as well as the issue.
+            echo "::error::fixable vulnerabilities in $IMAGE@$DIGEST; see the scheduled-image-scan issue"
+            exit 1
+          fi
+          /usr/bin/python3 -I lib/latest_scan_issue.py clean "${common[@]}"
