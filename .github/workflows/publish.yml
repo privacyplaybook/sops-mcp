@@ -58,7 +58,7 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=short
             type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
+          # `latest` is moved by the move-latest job below, after signing.
 
       # The OCI archive holds the image index, the image and the BuildKit
       # SBOM and provenance attestations, all pushed unchanged below.
@@ -98,6 +98,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Fetch the scanned archive
         uses: actions/download-artifact@v4
@@ -149,7 +151,7 @@ jobs:
           while read -r tag; do
             [ -n "$tag" ] || continue
             skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/pushed" \
-              "oci:$layout" "docker://$tag"
+              "oci:$layout" "docker://$tag" </dev/null
             pushed=$(cat "$RUNNER_TEMP/pushed")
             echo "$tag -> $pushed"
             if [ "$pushed" != "$BUILT" ]; then
@@ -167,3 +169,103 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  # Moves `latest` on main to the newest signed image, never back to an
+  # older one. Runs on main only, after this run's image is signed.
+  #
+  # Concurrency: every run's move-latest job shares one group, so two moves
+  # never overlap, and they queue rather than cancel (cancel-in-progress:
+  # false never stops a move midway). GitHub keeps at most one waiting job
+  # per group, and a new arrival replaces (cancels) the waiting one, even
+  # when the arrival is an older commit's run (one that finished late, or a
+  # re-run). So a move must not depend on which job survives: each one
+  # targets main's head, when that commit's image is already pushed and
+  # signed by this workflow, and only otherwise this run's own image. A
+  # replaced move leaves its run marked Cancelled although its sha- tag was
+  # pushed and signed; the publish job's result is what says so. The rest
+  # of the workflow is deliberately not grouped: a run replaced in a
+  # workflow-level group would never push its sha- or version tag.
+  #
+  # Ancestry check: `latest` moves only when the commit it holds (the
+  # image's org.opencontainers.image.revision label) is the target commit
+  # or an ancestor of it, so it can't move back to an older image.
+  move-latest:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-latest
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Move latest to the newest signed image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          REPO: ${{ github.repository }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$DIGEST" in sha256:*) ;; *) echo "::error::no published digest"; exit 1;; esac
+          target_sha=$GITHUB_SHA target=$DIGEST
+          head=$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha </dev/null)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            # The head's image counts only if this workflow signed it at
+            # that commit; its digest is taken from the verified signature.
+            if signed=$(cosign verify \
+                --certificate-identity-regexp "^https://github\.com/$REPO/\.github/workflows/publish\.yml@refs/(heads/main|tags/v.*)\$" \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-github-workflow-sha "$head" \
+                --output json "$IMAGE:sha-${head:0:7}" 2>/dev/null </dev/null); then
+              target_sha=$head
+              target=$(jq -r '.[0].critical.image."docker-manifest-digest"' <<<"$signed")
+              echo "main is at $head, whose signed image is $target; moving latest there"
+            else
+              echo "main is at $head, whose image isn't signed yet; its own run moves latest later"
+            fi
+          fi
+          case "$target" in sha256:*) ;; *) echo "::error::no target digest"; exit 1;; esac
+          # A missing `latest` (manifest unknown) is created; any other
+          # inspect error fails the step.
+          if out=$(skopeo inspect --no-tags "docker://$IMAGE:latest" 2>&1 </dev/null); then
+            current=$(jq -r '.Labels["org.opencontainers.image.revision"] // ""' <<<"$out")
+            [ -n "$current" ] || echo "::warning::latest carries no revision label; moving it"
+          elif grep -qi 'manifest unknown' <<<"$out"; then
+            current=""
+            echo "::warning::no latest tag yet; creating it"
+          else
+            echo "$out"
+            exit 1
+          fi
+          if [ -n "$current" ]; then
+            # Status of the target relative to latest's commit: "ahead"
+            # means latest's commit is an ancestor of the target.
+            status=$(gh api "repos/$REPO/compare/$current...$target_sha" --jq .status </dev/null)
+            case "$status" in
+              ahead|identical) ;;
+              *)
+                echo "::warning::latest holds $current; $target_sha is $status of it, so latest stays"
+                exit 0
+                ;;
+            esac
+          fi
+          skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/moved" \
+            "docker://$IMAGE@$target" "docker://$IMAGE:latest" </dev/null
+          moved=$(cat "$RUNNER_TEMP/moved")
+          if [ "$moved" != "$target" ]; then
+            echo "::error::latest was pushed as $moved, not $target"
+            exit 1
+          fi
+          echo "latest -> $target ($target_sha)"

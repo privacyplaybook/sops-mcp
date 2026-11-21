@@ -49,15 +49,61 @@ jobs:
           name: dist
           path: dist/
 
+  # Nothing ships to PyPI or the Release until publish.yml has published
+  # this tag's image: scanned (it pushes nothing that fails the Grype scan
+  # or its supply-chain checks), pushed and signed. The proof is a cosign
+  # signature on the tag's image from publish.yml at this tag and this
+  # commit, the same check as the README's `cosign verify`, pinned tighter.
+  # publish.yml runs in parallel on the same tag push and takes minutes, so
+  # this waits for it, up to 45 minutes. A tag whose image fails the scan
+  # never gets a signature, so it fails here at the deadline.
+  # Not a version tag (a dispatch on a branch): fails at once.
+  tag-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Wait for the tag's image, signed by publish.yml
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/tags/v*) ;;
+            *) echo "::error::$REF is not a version tag; nothing is published from it"; exit 1 ;;
+          esac
+          identity="https://github.com/$REPO/.github/workflows/publish.yml@$REF"
+          deadline=$(( $(date +%s) + 45 * 60 ))
+          until cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-sha "$GITHUB_SHA" \
+              "$IMAGE:$TAG" >/dev/null 2>"$RUNNER_TEMP/cosign.err" </dev/null; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              tail -n 5 "$RUNNER_TEMP/cosign.err"
+              echo "::error::no image $IMAGE:$TAG signed by publish.yml at $GITHUB_SHA after 45 minutes; not publishing"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "$IMAGE:$TAG is published and signed by publish.yml at $GITHUB_SHA"
+
   publish:
-    needs: build
+    needs: [build, tag-image]
     runs-on: ubuntu-latest
     # Pre-release tags (v1.2.3-rc1) build and vuln-scan above, and publish.yml
     # still produces a cosign-signed image for deploy validation — but they do
     # NOT publish to PyPI. The package version is static in pyproject.toml, so
     # an rc tag would otherwise upload the *final* version's wheel prematurely.
-    # Only final tags reach PyPI.
-    if: ${{ !contains(github.ref_name, '-') }}
+    # Only final tags reach PyPI, and never a branch (a manual dispatch).
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     environment:
       name: pypi
       url: https://pypi.org/p/sops-mcp
@@ -80,11 +126,19 @@ jobs:
   # final release — the wheel is live before the registry entry (which
   # references it). For a pre-release the `publish` job is skipped, and this
   # still runs to cut the pre-release Release (the reusable workflow does not
-  # dispatch the registry for pre-release tags). Skipped only if `publish`
-  # actually failed.
+  # dispatch the registry for pre-release tags). It runs only when the
+  # package build passed and the tag's image is published and signed, and `publish` either
+  # succeeded or was skipped for a pre-release tag: a skipped `publish`
+  # (whose `needs` failed) no longer lets the Release through.
   create-release:
-    needs: publish
-    if: ${{ !cancelled() && needs.publish.result != 'failure' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build, tag-image, publish]
+    if: >-
+      ${{ !cancelled()
+          && startsWith(github.ref, 'refs/tags/v')
+          && needs.build.result == 'success'
+          && needs.tag-image.result == 'success'
+          && (needs.publish.result == 'success'
+              || (needs.publish.result == 'skipped' && contains(github.ref_name, '-'))) }}
     permissions:
       contents: write
       actions: write
