@@ -50,7 +50,9 @@ runs:
           echo "::error::image-scan pins the linux_amd64 Grype asset; this runner is $RUNNER_OS/$RUNNER_ARCH"
           exit 1
         fi
-        /usr/bin/python3 -I lib/verify_grype_config.py .grype.yaml
+        # The script from this action's own checkout; the allowlist is the
+        # caller's, at its workspace root.
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/../../../lib/verify_grype_config.py" .grype.yaml
 
     - name: Install Grype (version and SHA-256 pinned)
       shell: bash

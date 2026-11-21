@@ -162,7 +162,7 @@ def test_non_string_key_is_refused():
 def test_wrong_shapes_are_refused(key, value, expected):
     rule = {"vulnerability": CVE, "reason": REASON, key: value}
     (problem,) = _problems(rule)
-    assert f"`{key}`" in problem
+    assert f"`{key}" in problem
     assert expected in problem
 
 
@@ -275,3 +275,57 @@ def test_unsafe_tags_are_refused(tmp_path, capsys):
     )
     assert rc == 1
     assert "cannot read the Grype allowlist" in out
+
+
+def test_unhashable_key_is_an_annotation_not_a_traceback(tmp_path, capsys):
+    text = f"""
+ignore:
+  - vulnerability: {CVE}
+    reason: {REASON}
+    ? {{x: 1}}
+    : 2
+"""
+    rc, out = _run(tmp_path, text, capsys)
+    assert rc == 1
+    assert "found an unhashable key" in out
+
+
+def test_merge_key_override_is_not_a_duplicate(tmp_path, capsys):
+    text = f"""
+ignore:
+  - &base
+    vulnerability: {CVE}
+    reason: {REASON}
+  - <<: *base
+    reason: Another reason, written once.
+"""
+    rc, out = _run(tmp_path, text, capsys)
+    assert rc == 0, out
+
+
+def test_annotations_are_escaped_and_located(tmp_path, capsys):
+    text = f"""
+ignore:
+  - vulnerability: {CVE}
+    package:
+      name: zlib
+    package:
+      name: glibc
+    reason: {REASON}
+"""
+    rc, out = _run(tmp_path, text, capsys)
+    assert rc == 1
+    (line,) = out.splitlines()  # one annotation, its newlines escaped
+    assert ",line=6,col=5::" in line
+    assert "%0A" in line
+
+
+def test_percent_is_escaped(capsys):
+    verifier._annotate("f", "100% sure\nnext")
+    assert capsys.readouterr().out == "::error file=f::100%25 sure%0Anext\n"
+
+
+def test_package_problems_name_the_key_once():
+    rule = {"vulnerability": CVE, "reason": REASON, "package": {"nmae": "zlib"}}
+    (problem,) = _problems(rule)
+    assert problem.startswith("ignore rule unknown key `package.nmae`")

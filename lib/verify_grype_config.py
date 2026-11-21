@@ -51,7 +51,8 @@ VEX_JUSTIFICATIONS = (
 )
 
 # Each check returns a problem description, or None when the value is fine.
-Check = Callable[[object], "str | None"]
+# A list holds nested problems that already name their own key.
+Check = Callable[[object], "str | list[str] | None"]
 
 
 def _string(value: object) -> str | None:
@@ -85,13 +86,12 @@ PACKAGE_KEYS: dict[str, Check] = {
 }
 
 
-def _package(value: object) -> str | None:
+def _package(value: object) -> str | list[str] | None:
     # An empty or null `package:` (often a mis-indented one, whose `name:`
     # landed at rule level) narrows nothing, so it is refused.
     if not isinstance(value, dict) or not value:
         return "must be a non-empty mapping of " + ", ".join(PACKAGE_KEYS)
-    problems = _check_keys(value, PACKAGE_KEYS, "package.")
-    return "; ".join(problems) if problems else None
+    return _check_keys(value, PACKAGE_KEYS, "package.") or None
 
 
 RULE_KEYS: dict[str, Check] = {
@@ -124,7 +124,9 @@ def _check_keys(
             problems.append(f"unknown key `{prefix}{key}`{hint}")
             continue
         problem = check(value)
-        if problem:
+        if isinstance(problem, list):
+            problems.extend(problem)
+        elif problem:
             problems.append(f"`{prefix}{key}` {problem}")
     return problems
 
@@ -170,11 +172,20 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 def _construct_mapping(
     loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
 ):
-    loader.flatten_mapping(node)
+    # Checked before flatten_mapping, so only the keys written in this
+    # mapping count: an explicit key may override one merged in by `<<:`.
     seen = set()
     for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
         key = loader.construct_object(key_node, deep=deep)
-        if key in seen:
+        try:
+            repeated = key in seen
+        except TypeError:
+            raise yaml.constructor.ConstructorError(
+                None, None, "found an unhashable key", key_node.start_mark
+            ) from None
+        if repeated:
             raise yaml.constructor.ConstructorError(
                 None, None, f"duplicate key `{key}`", key_node.start_mark
             )
@@ -191,17 +202,30 @@ def load(text: str) -> object:
     return yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
 
 
+def _annotate(path: str, message: str, mark: yaml.Mark | None = None) -> None:
+    """Print a GitHub `::error` annotation, escaped so it keeps every line."""
+    props = f"file={path}"
+    if mark is not None:
+        props += f",line={mark.line + 1},col={mark.column + 1}"
+    message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error {props}::{message}")
+
+
 def main(argv: list[str]) -> int:
     path = argv[1] if len(argv) > 1 else DEFAULT_PATH
     try:
         with open(path) as f:
             cfg = load(f.read())
-    except (OSError, yaml.YAMLError) as e:
-        print(f"::error file={path}::cannot read the Grype allowlist: {e}")
+    except OSError as e:
+        _annotate(path, f"cannot read the Grype allowlist: {e}")
+        return 1
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        _annotate(path, f"cannot read the Grype allowlist: {e}", mark)
         return 1
     problems = check_config(cfg)
     for problem in problems:
-        print(f"::error file={path}::{problem}")
+        _annotate(path, problem)
     return 1 if problems else 0
 
 
