@@ -19,6 +19,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Mount, Route
 
+from . import __version__
 from .domains import (
     DEFAULT_DOMAIN,
     Domain,
@@ -585,7 +586,7 @@ class SopsMcpServer:
         self.encryptor = encryptor
         self.domains = domains
         self.require_domain = require_domain
-        self.server = Server("sops-mcp")
+        self.server = Server("sops-mcp", version=__version__)
         self._setup_handlers()
 
     def _domain_names(self) -> str:
