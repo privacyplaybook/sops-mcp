@@ -34,7 +34,12 @@ jobs:
   # Holds no write token: the scanner (a downloaded Grype binary reading a
   # freshly downloaded DB and a pulled image) never runs next to one. The
   # package is public, so the pull needs no login.
+  #
+  # main only: a manual run from another branch would scan with that
+  # branch's allowlist and script yet write the one shared issue (a laxer
+  # .grype.yaml could close a real finding). Such a run skips both jobs.
   scan:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -44,8 +49,8 @@ jobs:
       digest: ${{ steps.resolve.outputs.digest }}
       revision: ${{ steps.resolve.outputs.revision }}
     steps:
-      # No token left in .git/config for the scanner to find. This checks
-      # out the default branch, so the allowlist is the current one.
+      # No token left in .git/config for the scanner to find. This is main
+      # (the job's `if:`), so the allowlist is the current one.
       - uses: actions/checkout@v5
         with:
           persist-credentials: false

@@ -57,9 +57,10 @@ REPORT = {
 class FakeGitHub:
     """Answers the `gh api` calls the script makes, and records them."""
 
-    def __init__(self, issues=None, label_exists=True):
+    def __init__(self, issues=None, label_exists=True, label_error=None):
         self.issues = issues or []
         self.label_exists = label_exists
+        self.label_error = label_error
         self.calls = []
 
     def __call__(self, *args):
@@ -77,7 +78,9 @@ class FakeGitHub:
             return self.issues
         if "/labels/" in path:
             if not self.label_exists:
-                raise subprocess.CalledProcessError(1, "gh")
+                raise subprocess.CalledProcessError(
+                    1, "gh", stderr=self.label_error or "gh: Not Found (HTTP 404)"
+                )
             return {"name": lsi.LABEL}
         if path.endswith("/labels"):
             self.label_exists = True
@@ -218,6 +221,38 @@ def test_body_is_capped():
     assert len(body) < 65536
 
 
+def test_body_length_is_capped_with_long_cells():
+    rows = [
+        {
+            "id": f"GHSA-{i:05d}",
+            "severity": "High",
+            "package": "github.com/" + "x" * 500,
+            "version": "v" + "1" * 500,
+            "type": "go-module",
+            "fixed_in": ", ".join(["v9.9.9"] * 100),
+        }
+        for i in range(lsi.MAX_ROWS)
+    ]
+    body = lsi.render_body(
+        rows=rows,
+        image=IMAGE,
+        digest=DIGEST,
+        revision=REV,
+        fail_on="high",
+        run_url=RUN,
+    )
+    assert len(body) < 65536
+    assert "more: see the run's summary" in body
+    cells = [
+        c
+        for ln in body.splitlines()
+        if ln.startswith("| GHSA")
+        for c in ln.strip("| ").split(" | ")
+    ]
+    longest = max(len(c) for c in cells)
+    assert longest <= lsi.MAX_CELL
+
+
 def test_fingerprint_tracks_digest_and_findings():
     rows = _rows()
     assert lsi.fingerprint(DIGEST, rows) == lsi.fingerprint(DIGEST, list(rows))
@@ -228,15 +263,21 @@ def test_fingerprint_tracks_digest_and_findings():
 # --- find_open_issue ---------------------------------------------------------
 
 
-def test_find_skips_prs_and_other_titles():
-    gh = FakeGitHub(
-        [_issue(1, pr=True), _issue(2, title="Something else"), _issue(3), _issue(4)]
-    )
-    assert lsi.find_open_issue(gh)["number"] == 3
+def test_find_skips_prs_and_keys_on_the_label_not_the_title():
+    # The API returned only labelled issues; a retitled one still counts.
+    gh = FakeGitHub([_issue(1, pr=True), _issue(2, title="CVE-x in glibc"), _issue(3)])
+    assert lsi.find_open_issue(gh)["number"] == 2
 
 
 def test_find_none():
-    assert lsi.find_open_issue(FakeGitHub([_issue(2, title="x")])) is None
+    assert lsi.find_open_issue(FakeGitHub([_issue(1, pr=True)])) is None
+
+
+def test_label_lookup_error_other_than_404_is_raised():
+    gh = FakeGitHub([], label_exists=False, label_error="gh: Bad Gateway (HTTP 502)")
+    with pytest.raises(subprocess.CalledProcessError):
+        _report(gh)
+    assert gh.writes() == []
 
 
 # --- report_findings ---------------------------------------------------------
@@ -331,6 +372,13 @@ def test_clean_with_no_issue_writes_nothing():
     assert gh.writes() == []
 
 
+def test_clean_closes_every_labelled_issue():
+    gh = FakeGitHub([_issue(7), _issue(8, title="retitled")])
+    out = lsi.report_clean(gh, image=IMAGE, digest=DIGEST, revision=REV, run_url=RUN)
+    assert out == "clean; closed #7, #8"
+    assert ("PATCH", "repos/{owner}/{repo}/issues/8") in gh.writes()
+
+
 def test_clean_closes_the_open_issue_with_a_comment():
     gh = FakeGitHub([_issue(7)])
     out = lsi.report_clean(gh, image=IMAGE, digest=DIGEST, revision=REV, run_url=RUN)
@@ -389,3 +437,30 @@ def test_main_clean(tmp_path):
     rc, gh = _main(tmp_path, "clean", *COMMON, gh=FakeGitHub([_issue(7)]))
     assert rc == 0
     assert ("PATCH", "repos/{owner}/{repo}/issues/7") in gh.writes()
+
+
+# --- the workflow ------------------------------------------------------------
+
+
+def _workflow():
+    import yaml
+
+    return yaml.safe_load((ROOT / ".github/workflows/rescan-latest.yml").read_text())
+
+
+def test_workflow_runs_on_main_only():
+    # A dispatch from another branch would scan with its allowlist yet write
+    # the shared issue; the issue job depends on the scan job, so both skip.
+    jobs = _workflow()["jobs"]
+    assert jobs["scan"]["if"] == "github.ref == 'refs/heads/main'"
+    assert jobs["issue"]["needs"] == "scan"
+
+
+def test_only_the_issue_job_can_write():
+    wf = _workflow()
+    assert wf["permissions"] == {}
+    assert wf["jobs"]["scan"]["permissions"] == {"contents": "read"}
+    assert wf["jobs"]["issue"]["permissions"] == {
+        "contents": "read",
+        "issues": "write",
+    }

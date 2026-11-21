@@ -5,8 +5,9 @@ Run by .github/workflows/rescan-latest.yml, in a job that holds
 `issues: write` and nothing else, after the scan job (which holds no write
 token) has scanned the published image with .github/actions/image-scan.
 
-One issue, never one per run: it is the open issue carrying LABEL whose
-title is TITLE. On findings it is created, or its body is replaced with the
+One issue, never one per run: it is the oldest open issue carrying LABEL
+(created with TITLE; the label is the key, so a retitle doesn't lose it). On
+findings it is created, or its body is replaced with the
 current findings; a comment is added only when the findings or the image
 digest changed since the body was last written (a hidden fingerprint in the
 body says what it held), so a daily run doesn't add a daily comment. On a
@@ -40,8 +41,11 @@ LABEL_DESCRIPTION = "Opened and closed by the scheduled re-scan of :latest"
 
 SEVERITIES = ["negligible", "low", "medium", "high", "critical"]
 
-# Issue bodies are capped at 65536 characters; stay well under it.
+# Issue bodies are capped at 65536 characters; stay well under it, by rows,
+# by cell and by total length.
 MAX_ROWS = 200
+MAX_CELL = 120
+MAX_BODY = 60000
 
 FINGERPRINT_RE = re.compile(r"<!-- rescan-latest:fingerprint ([0-9a-f]{64}) -->")
 
@@ -107,7 +111,8 @@ def _cell(text: str) -> str:
     """A Markdown table cell: no pipes, no newlines, no backticks, no
     mentions (Grype's data comes from the image and its DB)."""
     text = text.replace("|", "/").replace("`", "'").replace("@", "@\u200b")
-    return " ".join(text.split())
+    text = " ".join(text.split())
+    return text if len(text) <= MAX_CELL else text[: MAX_CELL - 1] + "…"
 
 
 def render_body(
@@ -135,8 +140,10 @@ def render_body(
         "| Vulnerability | Severity | Package | Installed | Fixed in | Type |",
         "|---|---|---|---|---|---|",
     ]
+    shown = 0
+    length = sum(len(line) + 1 for line in lines)
     for row in rows[:MAX_ROWS]:
-        lines.append(
+        line = (
             "| "
             + " | ".join(
                 _cell(row[k])
@@ -144,8 +151,13 @@ def render_body(
             )
             + " |"
         )
-    if len(rows) > MAX_ROWS:
-        lines += ["", f"…and {len(rows) - MAX_ROWS} more: see the run's summary."]
+        if length + len(line) + 1 > MAX_BODY:
+            break
+        lines.append(line)
+        length += len(line) + 1
+        shown += 1
+    if len(rows) > shown:
+        lines += ["", f"…and {len(rows) - shown} more: see the run's summary."]
     lines += [
         "",
         (
@@ -153,14 +165,17 @@ def render_body(
             "and lockfile bumps, or `lib/pin_base_images.py`), or, if a finding is "
             "genuinely not exploitable here, an `ignore:` rule with a reason in "
             "`.grype.yaml`. This issue is updated by each scheduled run and closed "
-            "by the first clean one."
+            "by the first clean one. Closing it by hand doesn't stick: while the "
+            "finding stands, the next run opens a new one, so accept a finding "
+            "with an `ignore:` rule instead."
         ),
     ]
     return "\n".join(lines) + "\n"
 
 
-def find_open_issue(api: Api) -> dict[str, Any] | None:
-    """The oldest open issue (not PR) carrying LABEL with exactly TITLE."""
+def open_issues(api: Api) -> list[dict[str, Any]]:
+    """Every open issue (not PR) carrying LABEL, oldest first. The label is
+    the key, not the title, so a retitled issue is still found and closed."""
     issues = api(
         "--method",
         "GET",
@@ -176,18 +191,23 @@ def find_open_issue(api: Api) -> dict[str, Any] | None:
         "-f",
         "direction=asc",
     )
-    for issue in issues or []:
-        if "pull_request" in issue:
-            continue
-        if issue.get("title") == TITLE:
-            return issue
-    return None
+    return [i for i in issues or [] if "pull_request" not in i]
+
+
+def find_open_issue(api: Api) -> dict[str, Any] | None:
+    """The tracking issue: the oldest open one carrying LABEL."""
+    issues = open_issues(api)
+    return issues[0] if issues else None
 
 
 def ensure_label(api: Api) -> None:
     try:
         api("repos/{owner}/{repo}/labels/" + LABEL)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as err:
+        # Only a 404 means missing; anything else (5xx, rate limit) is raised
+        # as itself, not as a misleading 422 from creating a label that exists.
+        if "HTTP 404" not in (err.stderr or ""):
+            raise
         api(
             "--method",
             "POST",
@@ -261,10 +281,24 @@ def report_findings(
 def report_clean(
     api: Api, *, image: str, digest: str, revision: str, run_url: str
 ) -> str:
-    issue = find_open_issue(api)
-    if issue is None:
+    issues = open_issues(api)
+    if not issues:
         return "clean; no open issue"
-    number = issue["number"]
+    for issue in issues:
+        _close(
+            api,
+            issue["number"],
+            image=image,
+            digest=digest,
+            revision=revision,
+            run_url=run_url,
+        )
+    return "clean; closed " + ", ".join(f"#{i['number']}" for i in issues)
+
+
+def _close(
+    api: Api, number: int, *, image: str, digest: str, revision: str, run_url: str
+) -> None:
     api(
         "--method",
         "POST",
@@ -283,7 +317,6 @@ def report_clean(
         "-f",
         "state_reason=completed",
     )
-    return f"clean; closed #{number}"
 
 
 def gh_api(*args: str) -> Any:

@@ -48,8 +48,9 @@ inputs:
 outputs:
   findings:
     description: >
-      `true` when Grype found a fixable vulnerability at or above `fail-on`
-      (only reachable with `on-findings: report`), else `false`.
+      `true` when Grype found a fixable vulnerability at or above `fail-on`,
+      else `false`. Set under either `on-findings`; with `fail` the step
+      also fails, so only a `continue-on-error` caller would read it.
     value: ${{ steps.scan.outputs.findings }}
   report-json:
     description: Path of Grype's JSON report (matches after the allowlist).
@@ -145,7 +146,8 @@ runs:
         {
           echo "### Image scan: \`$IMAGE\`"
           echo
-          echo "Fails on fixable vulnerabilities of severity **$FAIL_ON** or above (allowlist: \`.grype.yaml\`)."
+          if [ "$ON_FINDINGS" = report ]; then verb=Reports; else verb="Fails on"; fi
+          echo "$verb fixable vulnerabilities of severity **$FAIL_ON** or above (allowlist: \`.grype.yaml\`)."
           echo
           echo '```'
           cat "$report" 2>/dev/null || echo "(no report)"
