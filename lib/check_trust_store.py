@@ -40,7 +40,7 @@ BUNDLE_SUFFIXES = (".crt", ".pem")
 CAPATH_ENTRY = re.compile(r"^[0-9a-f]{8}\.\d+$")
 
 
-def bundle_files(path: str, bad: list[str]) -> list[str]:
+def bundle_files(path: str, bad: list[str], seen: set[tuple[int, int]]) -> list[str]:
     """Return `path` itself, or the CA bundle files found under it.
 
     A directory the walk can't list is appended to `bad`: the build runs as
@@ -48,11 +48,13 @@ def bundle_files(path: str, bad: list[str]) -> list[str]:
     Symlinked directories are followed, since a bundle behind one is still
     trusted, and each real directory (by device and inode) is walked once,
     so a link loop or a venv's `lib64 -> lib` ends rather than recursing.
+    `seen` is shared across arguments, so a directory two of them reach is
+    scanned once. A link os.walk can't classify (its target can't be
+    stat'ed) is listed among the files, so it is checked and reported too.
     """
     if not os.path.isdir(path):
         return [path]  # a missing file is reported when it is opened
     found = []
-    seen: set[tuple[int, int]] = set()
 
     def unlistable(exc: OSError) -> None:
         bad.append(f"{exc.filename}: unreadable directory ({exc.strerror})")
@@ -68,6 +70,19 @@ def bundle_files(path: str, bad: list[str]) -> list[str]:
             dirs[:] = []  # already walked through another path
             continue
         seen.add((st.st_dev, st.st_ino))
+        for name in files:
+            # os.walk puts a link whose target it can't stat among the
+            # files, where it would be dropped unread: a restricted target
+            # must fail like an unlistable directory. A dangling link holds
+            # nothing, and a dangling bundle name fails when it is opened.
+            link = os.path.join(root, name)
+            if os.path.islink(link):
+                try:
+                    os.stat(link)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    bad.append(f"{link}: unreadable link target ({exc.strerror})")
         found.extend(
             os.path.join(root, name)
             for name in files
@@ -78,9 +93,10 @@ def bundle_files(path: str, bad: list[str]) -> list[str]:
 
 def main(paths: list[str]) -> int:
     scanned = 0
-    bad = []
+    bad: list[str] = []
+    seen: set[tuple[int, int]] = set()
     for path in paths:
-        for bundle in bundle_files(path, bad):
+        for bundle in bundle_files(path, bad, seen):
             try:
                 with open(bundle, encoding="ascii", errors="replace") as f:
                     certs = PEM.findall(f.read())
@@ -103,7 +119,10 @@ def main(paths: list[str]) -> int:
                     bad.append(f"{bundle}: {DISTRUSTED[fp]}")
     if bad:
         print(
-            "Distrusted root CA still trusted, or bundle unreadable:", *bad, sep="\n  "
+            "Distrusted root CA still trusted, or a bundle, directory or link"
+            " unreadable:",
+            *bad,
+            sep="\n  ",
         )
         return 1
     if scanned == 0:
