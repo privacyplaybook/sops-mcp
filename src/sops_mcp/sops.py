@@ -109,20 +109,48 @@ def _check_flat_root_keys(data: Any, carried: Collection[Any]) -> None:
     key names it adds, so this fires only for a caller that skipped that.
     Keys in `carried` came out of the file being re-encrypted and pass as
     they are, so a legacy file made with the sops CLI, whose keys need not
-    follow the pattern, can still be rekeyed, renamed or trimmed.
+    follow the pattern, can still be rekeyed, renamed or trimmed. The one
+    exception is a key ending in the unencrypted suffix, which is always
+    refused.
     """
     if not isinstance(data, dict):
         raise SopsError("refusing to encrypt: data is not a mapping")
     for key in data:
-        if key == META_KEY or key in carried:
+        if key == META_KEY:
+            continue
+        if isinstance(key, str) and key.endswith(UNENCRYPTED_SUFFIX):
+            # sops would leave this value in the clear. Never excused by
+            # `carried`: a handler may be writing a new value into it.
+            raise SopsError(
+                f"refusing to encrypt: key {_shown(key)} ends in "
+                f"{UNENCRYPTED_SUFFIX!r}, so its value would be stored in "
+                "plaintext. Manage this file with the sops CLI."
+            )
+        if key in carried:
             continue
         if not isinstance(key, str) or not KEY_NAME_PATTERN.fullmatch(key):
-            # Key names are plaintext in the encrypted file, so naming it
-            # leaks nothing; !r escapes a newline or control character.
             raise SopsError(
-                f"refusing to encrypt: invalid key name {key!r}. Key names "
-                "must match ^[A-Z][A-Z0-9_]*$."
+                f"refusing to encrypt: invalid key name {_shown(key)}. Key "
+                "names must match ^[A-Z][A-Z0-9_]*$."
             )
+
+
+# How much of a refused key an error message quotes.
+_SHOWN_KEY_MAX = 64
+
+
+def _shown(key: Any) -> str:
+    """A key for an error message: repr-escaped, and cut short.
+
+    Key names are plaintext in an encrypted file, but a refused key never
+    reached one, and a caller that skipped validation could have put
+    anything there.
+    """
+    text = repr(key)
+    if len(text) <= _SHOWN_KEY_MAX:
+        return text
+    return text[:_SHOWN_KEY_MAX] + "…"
+
 
 # What `sops_create_k8s_secret` encrypts with: only the `data` and
 # `stringData` subtrees, so `apiVersion`, `kind`, `metadata` and `type`

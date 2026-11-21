@@ -117,7 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doesn't match `^[A-Z][A-Z0-9_]*$`, other than `_meta_unencrypted`, is
   refused before sops runs. Keys carried over from the file being
   re-encrypted pass as they are, so a legacy file made with the sops CLI
-  (`db_user`, say) can still be rekeyed, renamed or trimmed.
+  (`db_user`, say) can still be rekeyed, renamed or trimmed. A root key
+  ending in `_unencrypted`, which sops would leave in plaintext, is always
+  refused.
 - **A secret spec without `key_name` or `source` gets a validation error**
   (#58), not "Internal error". The tools' input schema already requires
   both, so this reached only a handler called directly.

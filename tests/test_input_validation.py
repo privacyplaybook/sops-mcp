@@ -116,7 +116,7 @@ def test_encrypt_refuses_invalid_root_key(key, monkeypatch):
         raise AssertionError("sops must not run")
 
     monkeypatch.setattr("sops_mcp.sops.subprocess.run", no_sops)
-    with pytest.raises(SopsError, match="invalid key name"):
+    with pytest.raises(SopsError, match="refusing to encrypt"):
         SopsEncryptor().encrypt({key: "value"}, make_domain())
 
 
@@ -128,6 +128,29 @@ def test_encrypt_guard_names_the_key_escaped(monkeypatch):
     with pytest.raises(SopsError) as excinfo:
         SopsEncryptor().encrypt({"DB_PASSWORD\n": "v"}, make_domain())
     assert "'DB_PASSWORD\\n'" in str(excinfo.value)
+
+
+def test_encrypt_guard_truncates_a_long_key(monkeypatch):
+    monkeypatch.setattr(
+        "sops_mcp.sops.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("sops ran")),
+    )
+    with pytest.raises(SopsError) as excinfo:
+        SopsEncryptor().encrypt({"x" * 10_000: "v"}, make_domain())
+    assert len(str(excinfo.value)) < 200
+
+
+def test_encrypt_refuses_a_carried_unencrypted_key(monkeypatch):
+    monkeypatch.setattr(
+        "sops_mcp.sops.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("sops ran")),
+    )
+    with pytest.raises(SopsError, match="plaintext"):
+        SopsEncryptor().encrypt(
+            {"api_token_unencrypted": "new"},
+            make_domain(),
+            carried={"api_token_unencrypted"},
+        )
 
 
 def test_encrypt_refuses_a_new_key_even_when_others_are_carried(monkeypatch):
@@ -175,6 +198,16 @@ def real_server(tmp_path, monkeypatch):
         for line in out.splitlines()
         if line.startswith("# public key: ")
     )
+    # load_domains() reads the environment: keep a developer's or CI's
+    # domain config out of it.
+    for var in (
+        "SOPS_MCP_DOMAINS_FILE",
+        "SOPS_MCP_DOMAINS",
+        "SOPS_MCP_REQUIRE_DOMAIN",
+        "SOPS_AGE_RECIPIENTS",
+        "SOPS_AGE_KEY_FILE",
+    ):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("SOPS_AGE_KEY", private)
     monkeypatch.setenv("SOPS_MCP_AGE_PUBLIC_KEY", public)
     return SopsMcpServer(SopsEncryptor(), load_domains())
@@ -223,4 +256,32 @@ async def test_guard_catches_a_handler_that_skips_validation(
             "encrypted_content": legacy_file,
             "old_name": "db_user",
             "new_name": "bad_name",
+        })
+
+
+async def test_update_external_cannot_write_a_plaintext_value(
+    real_server, monkeypatch
+):
+    """A new value for a carried `*_unencrypted` key is refused, not stored."""
+    domain = real_server.domains["default"]
+    # Build the CLI-made file without the guard, as the sops CLI would.
+    with monkeypatch.context() as patch:
+        patch.setattr("sops_mcp.sops._check_flat_root_keys", lambda *a: None)
+        content = real_server.encryptor.encrypt(
+            {
+                "api_token_unencrypted": "old",
+                "_meta_unencrypted": {
+                    "version": 1,
+                    "secrets": {
+                        "api_token_unencrypted": {"source": "external"}
+                    },
+                },
+            },
+            domain,
+        )
+    with pytest.raises(SopsError, match="plaintext"):
+        await real_server._update_external({
+            "encrypted_content": content,
+            "key_name": "api_token_unencrypted",
+            "value": "new-real-token",
         })
