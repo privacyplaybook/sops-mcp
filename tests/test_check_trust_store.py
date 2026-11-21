@@ -1,8 +1,11 @@
 """lib/check_trust_store.py, the Dockerfile's build-time trust store guard."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "trust_store"
@@ -74,3 +77,45 @@ def test_undecodable_block_is_skipped(tmp_path: Path) -> None:
     (tmp_path / "broken.pem").write_text(bad)
     (tmp_path / "ok.pem").write_text(G1)
     assert guard.main([str(tmp_path)]) == 0
+
+
+def test_unlistable_directory_fails(tmp_path: Path, capsys) -> None:
+    # The runtime stage runs the guard as nonroot: a directory it can't
+    # list must fail the build, not be skipped as if empty.
+    (tmp_path / "ok.pem").write_text(G1)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "cacert.pem").write_text(G3)
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("running as root: permissions are not enforced")
+        assert guard.main([str(tmp_path)]) == 1
+        assert "unreadable directory" in capsys.readouterr().out
+    finally:
+        locked.chmod(0o700)
+
+
+def test_symlinked_directory_is_followed(tmp_path: Path, capsys) -> None:
+    # A bundle reachable only through a directory symlink is still trusted
+    # by whatever reads that path, so the guard must look behind the link.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "cacert.pem").write_text(G3)
+    scanned = tmp_path / "scanned"
+    scanned.mkdir()
+    (scanned / "ok.pem").write_text(G1)
+    (scanned / "certs").symlink_to(elsewhere, target_is_directory=True)
+    assert guard.main([str(scanned)]) == 1
+    assert "certs/cacert.pem: emSign ECC Root CA - G3" in capsys.readouterr().out
+
+
+def test_symlink_loop_is_walked_once(tmp_path: Path, capsys) -> None:
+    # A link back to an ancestor, and a venv-style `lib64 -> lib`, must end
+    # the walk with each real directory scanned once, not recurse.
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "cacert.pem").write_text(G1)
+    (tmp_path / "lib64").symlink_to("lib", target_is_directory=True)
+    (tmp_path / "lib" / "loop").symlink_to("..", target_is_directory=True)
+    assert guard.main([str(tmp_path)]) == 0
+    assert "Trust store OK: 1 certificates" in capsys.readouterr().out
