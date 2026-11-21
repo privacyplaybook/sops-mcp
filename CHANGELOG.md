@@ -119,10 +119,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-encrypted pass as they are, so a legacy file made with the sops CLI
   (`db_user`, say) can still be rekeyed, renamed or trimmed. A root key
   ending in `_unencrypted`, which sops would leave in plaintext, is always
-  refused.
+  refused (an incompatible change: see the upgrade note below).
 - **A secret spec without `key_name` or `source` gets a validation error**
   (#58), not "Internal error". The tools' input schema already requires
   both, so this reached only a handler called directly.
+
+### Upgrade note
+
+- **Incompatible change: files with an `*_unencrypted` root key can no
+  longer be edited** (#58). An existing file with a root key ending in
+  `_unencrypted`, other than `_meta_unencrypted`, is refused by every edit
+  tool (add, delete, rename, rotate, update, rekey and add_metadata), since
+  sops would store a new value for that key in plaintext. Rename such keys
+  with the sops CLI first (`sops edit <file>`), then manage the file here
+  as before.
 
 ## [0.12.0]
 
