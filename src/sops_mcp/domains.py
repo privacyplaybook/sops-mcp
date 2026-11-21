@@ -196,7 +196,8 @@ def _validate_domain(
     name: str, recipients: tuple[str, ...], keys: tuple[str, ...]
 ) -> Domain:
     """Validate one domain's key material, returning the frozen Domain."""
-    if not DOMAIN_NAME_RE.match(name):
+    # fullmatch, not match: `$` also matches before a trailing newline.
+    if not isinstance(name, str) or not DOMAIN_NAME_RE.fullmatch(name):
         raise DomainConfigError(
             f"invalid domain name {name!r}: must start with a lowercase "
             "letter and contain only lowercase letters, digits and hyphens "
