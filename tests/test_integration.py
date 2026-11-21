@@ -292,3 +292,78 @@ async def test_add_metadata_accepts_derived(server):
     assert meta["PASSWORD_HASH"]["source"] == "derived"
     assert meta["PASSWORD_HASH"]["derivation"]["from"] == "PASSWORD"
     assert meta["PASSWORD_HASH"]["derivation"]["transform"] == "sha256_hex"
+
+
+# --- Weak generated secrets come back with a warning, never refused (#62) ---
+
+
+async def test_create_warns_on_weak_secret_without_the_value(server):
+    result = await server._create_secrets({
+        "secrets": [
+            {"key_name": "PIN", "source": "generated",
+             "length": 6, "charset": "numeric"},
+            {"key_name": "STRONG", "source": "generated", "length": 32},
+        ]
+    })
+    values = server.encryptor.decrypt(result[0].text, _domain(server))
+    assert len(values["PIN"]) == 6  # created, not refused
+    summary = "\n".join(r.text for r in result[1:])
+    warnings = [line for line in summary.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1  # only PIN; STRONG is above 64 bits
+    assert "20 bits" in warnings[0]
+    assert summary.index("PIN:") < summary.index("WARNING") < summary.index(
+        "STRONG:"
+    )
+    for text in (r.text for r in result[1:]):
+        assert values["PIN"] not in text.replace("PIN", "")
+
+
+async def test_add_secrets_warns_on_weak_secret(server):
+    created = await server._create_secrets({
+        "secrets": [{"key_name": "A", "source": "generated"}]
+    })
+    added = await server._add_secrets({
+        "encrypted_content": created[0].text,
+        "secrets": [{"key_name": "B", "source": "generated",
+                     "length": 8, "charset": "hex"}],
+    })
+    summary = "\n".join(r.text for r in added[1:])
+    assert "WARNING: about 32 bits" in summary
+
+
+async def test_strong_secrets_get_no_warning(server):
+    result = await server._create_secrets({
+        "secrets": [{"key_name": "A", "source": "generated",
+                     "length": 11, "charset": "urlsafe"}]
+    })
+    assert not any("WARNING" in r.text for r in result[1:])
+
+
+async def test_rotate_warns_on_weak_secret(server):
+    created = await server._create_secrets({
+        "secrets": [
+            {"key_name": "PIN", "source": "generated",
+             "length": 4, "charset": "numeric"},
+            {"key_name": "STRONG", "source": "generated"},
+        ]
+    })
+    rotated = await server._rotate_generated(
+        {"encrypted_content": created[0].text}
+    )
+    values = server.encryptor.decrypt(rotated[0].text, _domain(server))
+    assert len(values["PIN"]) == 4
+    summary = "\n".join(r.text for r in rotated[1:])
+    warnings = [line for line in summary.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1
+    assert warnings[0].strip().startswith("PIN: WARNING: about 13 bits")
+    assert values["PIN"] not in summary.replace("PIN", "")
+
+
+def test_charset_schema_lists_urlsafe_and_documents_base64():
+    from sops_mcp.server import SECRET_ITEM_SCHEMA
+
+    charset = SECRET_ITEM_SCHEMA["properties"]["charset"]
+    assert "urlsafe" in charset["enum"]
+    assert "base64" in charset["enum"]
+    assert "not base64 encoding" in charset["description"]
+    assert "warning" in charset["description"]

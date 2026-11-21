@@ -15,6 +15,7 @@ import re
 import pytest
 
 from sops_mcp.secrets_derive import TRANSFORMS
+from sops_mcp.secrets_generator import CHARSETS
 from tests.helpers import make_server
 
 README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
@@ -138,3 +139,10 @@ def test_readme_documents_no_transform_that_does_not_exist(readme):
     assert not stale, (
         f"README.md documents transforms that do not exist: {sorted(stale)}"
     )
+
+
+def test_readme_charsets_table_matches_the_code(readme):
+    table = re.search(r"### Charsets.*?\n\n(.*?)\n\n", readme, re.DOTALL)
+    assert table, "the README no longer has a Charsets section"
+    rows = re.findall(r"^\| `([a-z0-9_]+)`", table.group(1), re.MULTILINE)
+    assert sorted(rows) == sorted(CHARSETS)

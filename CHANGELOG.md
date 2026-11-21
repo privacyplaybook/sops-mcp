@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A `urlsafe` charset for generated secrets**: letters, digits, `-` and
+  `_` (the RFC 4648 URL-safe alphabet). Same 6 bits per character as
+  `base64`, without the `+` and `/` that break in URLs (#62).
+- **Weak generated secrets come back with a warning.** When a generated
+  secret's effective entropy (length × log2(charset size, after
+  `exclude_chars`)) is under 64 bits, `sops_create_secrets`,
+  `sops_add_secrets`, `sops_create_k8s_secret` and `sops_rotate_generated`
+  add a `WARNING` line to their summary naming the key and its parameters,
+  never its value. Nothing is refused: existing callers keep working (#62).
+
+### Documentation
+
+- **`base64` is documented as what it is**: a 64-character alphabet, not
+  base64 encoding (no padding, any length). It keeps working unchanged.
+  The README gains a charsets table (#62).
+
 ### Changed
 
 - **CI fails when the Dockerfile's base image digests and
