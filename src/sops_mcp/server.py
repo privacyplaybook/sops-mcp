@@ -1635,7 +1635,9 @@ class SopsMcpServer:
                 meta.get("version", 1) if isinstance(meta, dict) else 1,
             )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         after = set(domain.recipients)
         added = len(after - before)
@@ -1755,7 +1757,9 @@ class SopsMcpServer:
             meta_secrets, domain, meta.get("version", 1)
         )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         summary_lines = ["Rotation complete:"]
         if rotated:
@@ -1826,7 +1830,9 @@ class SopsMcpServer:
             meta.get("version", 1) if isinstance(meta, dict) else 1,
         )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         summary_lines = ["Secrets added:", *summary]
         if preserved:
@@ -1949,7 +1955,9 @@ class SopsMcpServer:
 
         new_data["_meta_unencrypted"] = self._meta_block(meta_secrets, domain)
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         summary_lines = ["Added metadata:"]
         for key_name, entry in meta_secrets.items():
@@ -2056,7 +2064,9 @@ class SopsMcpServer:
             meta.get("version", 1) if isinstance(meta, dict) else 1,
         )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         summary = f"Deleted: {', '.join(sorted(to_delete))}"
         return [
@@ -2130,7 +2140,9 @@ class SopsMcpServer:
             meta.get("version", 1) if isinstance(meta, dict) else 1,
         )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         summary_lines = [f"Renamed {old_name} -> {new_name}"]
         if dependents_updated:
@@ -2230,7 +2242,9 @@ class SopsMcpServer:
             meta.get("version", 1) if isinstance(meta, dict) else 1,
         )
 
-        encrypted_yaml = self.encryptor.encrypt(new_data, domain)
+        encrypted_yaml = self.encryptor.encrypt(
+            new_data, domain, carried=decrypted.keys()
+        )
 
         summary_lines = [f"Updated external secret: {key_name}"]
         if recomputed:

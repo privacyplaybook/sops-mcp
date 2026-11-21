@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Collection
 from typing import Any
 
 import yaml
@@ -101,20 +102,27 @@ KEY_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 META_KEY = "_meta_unencrypted"
 
 
-def _check_flat_root_keys(data: Any) -> None:
+def _check_flat_root_keys(data: Any, carried: Collection[Any]) -> None:
     """Refuse to encrypt a flat file with a root key no tool may write.
 
-    The last guard before the YAML is written: every handler validates key
-    names on input, so this fires only for a caller that skipped that. The
-    key is not echoed, since it is exactly the input that was not checked.
+    The last guard before the YAML is written: every handler validates the
+    key names it adds, so this fires only for a caller that skipped that.
+    Keys in `carried` came out of the file being re-encrypted and pass as
+    they are, so a legacy file made with the sops CLI, whose keys need not
+    follow the pattern, can still be rekeyed, renamed or trimmed.
     """
     if not isinstance(data, dict):
         raise SopsError("refusing to encrypt: data is not a mapping")
     for key in data:
-        if key == META_KEY:
+        if key == META_KEY or key in carried:
             continue
         if not isinstance(key, str) or not KEY_NAME_PATTERN.fullmatch(key):
-            raise SopsError("refusing to encrypt: invalid key name")
+            # Key names are plaintext in the encrypted file, so naming it
+            # leaks nothing; !r escapes a newline or control character.
+            raise SopsError(
+                f"refusing to encrypt: invalid key name {key!r}. Key names "
+                "must match ^[A-Z][A-Z0-9_]*$."
+            )
 
 # What `sops_create_k8s_secret` encrypts with: only the `data` and
 # `stringData` subtrees, so `apiVersion`, `kind`, `metadata` and `type`
@@ -282,6 +290,7 @@ class SopsEncryptor:
         domain: Domain,
         *,
         encrypted_regex: str | None = None,
+        carried: Collection[Any] = (),
     ) -> str:
         """Encrypt a dict as SOPS YAML, returning the encrypted content.
 
@@ -295,6 +304,10 @@ class SopsEncryptor:
             encrypted_regex: Encrypt only the subtrees under keys matching
                   this regex, and leave everything else plaintext, instead
                   of the suffix rule. sops records it in the envelope.
+            carried: Root keys taken from the file being re-encrypted.
+                  Under the suffix rule every other root key must be a
+                  valid key name or `_meta_unencrypted`, or SopsError is
+                  raised before sops runs.
 
         Returns:
             SOPS-encrypted YAML string.
@@ -303,7 +316,7 @@ class SopsEncryptor:
             # Under the suffix rule every root key is a secret or the
             # metadata block. A manifest (encrypted_regex) has its own root
             # keys, and its caller validates the keys under stringData.
-            _check_flat_root_keys(data)
+            _check_flat_root_keys(data, carried)
         plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
         # sops refuses more than one encryption-mode flag, so exactly one.
         mode = (
