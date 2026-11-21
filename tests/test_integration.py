@@ -423,7 +423,11 @@ async def test_rotate_refuses_keys_the_metadata_block_does_not_describe(server):
 async def _with_extra(server, extra, entries=None):
     """A file made by sops_create_secrets (so its block is complete), then
     re-encrypted with `extra` keys added and `entries` merged into the
-    block's secrets, the way a hand edit with the sops CLI would."""
+    block's secrets, the way a hand edit with the sops CLI would.
+
+    encrypt() refuses root keys no tool may write, such as '_note' (#65),
+    so `extra` is passed as `carried`, as for any legacy file: the sops
+    CLI writes such keys, and rotate has to cope with them."""
     domain = _domain(server)
     created = await server._create_secrets({
         "secrets": [
@@ -433,7 +437,7 @@ async def _with_extra(server, extra, entries=None):
     values = server.encryptor.decrypt(created[0].text, domain)
     values.update(extra)
     values["_meta_unencrypted"]["secrets"].update(entries or {})
-    return server.encryptor.encrypt(values, domain)
+    return server.encryptor.encrypt(values, domain, carried=set(extra))
 
 
 @pytest.mark.parametrize(
