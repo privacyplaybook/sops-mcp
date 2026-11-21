@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the scanned digest), then signs it. Accepted findings go in
   `.grype.yaml`, one `vulnerability:` and `reason:` per rule.
 
+### Fixed
+
+- **`initialize` reports sops-mcp's own version.** `serverInfo.version`
+  was the `mcp` SDK's version (0.12.0 reported 1.30.0), because the server
+  was built without one. It now passes `sops_mcp.__version__`, read from
+  the package metadata, so a client or operator can tell which release is
+  running (#37).
+
 ### Security
 
 - **Base images re-pinned past open Wolfi advisories**, to the
