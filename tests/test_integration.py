@@ -378,3 +378,42 @@ def test_charset_schema_lists_urlsafe_and_documents_base64():
     assert "base64" in charset["enum"]
     assert "not base64 encoding" in charset["description"]
     assert "warning" in charset["description"]
+
+
+async def test_rotate_refuses_keys_the_metadata_block_does_not_describe(server):
+    """#46: sops_add_secrets on a legacy file writes a block that lists only
+    the new key. Rotation used to rebuild the file from that block alone, so
+    it returned a file without the legacy keys. It must refuse instead, name
+    the undescribed keys (never their values), and drop nothing."""
+    domain = _domain(server)
+    legacy = server.encryptor.encrypt(
+        {"LEGACY_A": "value-a-zz91", "LEGACY_B": "value-b-zz92"}, domain
+    )
+
+    added = await server._add_secrets({
+        "encrypted_content": legacy,
+        "secrets": [
+            {"key_name": "NEW_TOKEN", "source": "generated", "length": 24},
+        ],
+    })
+    partial = added[0].text
+    assert set(yaml.safe_load(partial)["_meta_unencrypted"]["secrets"]) == {
+        "NEW_TOKEN"
+    }
+    before = server.encryptor.decrypt(partial, domain)
+
+    with pytest.raises(ValueError, match="does not describe") as excinfo:
+        await server._rotate_generated({"encrypted_content": partial})
+    message = str(excinfo.value)
+    assert "LEGACY_A" in message
+    assert "LEGACY_B" in message
+    assert "NEW_TOKEN" not in message
+    for value in before.values():
+        if isinstance(value, str):
+            assert value not in message
+
+    # Nothing returned, so nothing dropped: the input still decrypts to
+    # every key it held.
+    after = server.encryptor.decrypt(partial, domain)
+    assert after == before
+    assert {"LEGACY_A", "LEGACY_B", "NEW_TOKEN"} <= set(after)

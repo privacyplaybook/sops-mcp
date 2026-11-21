@@ -1688,6 +1688,27 @@ class SopsMcpServer:
 
         decrypted = self.encryptor.decrypt(content, domain)
 
+        # The file is rebuilt from the block alone, so a key it doesn't
+        # describe would be silently left out of the result (#46:
+        # sops_add_secrets on a legacy file writes a block listing only the
+        # new keys). Refuse and name them; never values. Every decrypted key
+        # but the block itself counts, '_'-prefixed ones included, since
+        # they would be dropped too.
+        undescribed = sorted(
+            key
+            for key in decrypted
+            if key != "_meta_unencrypted" and key not in meta_secrets
+        )
+        if undescribed:
+            raise ValueError(
+                "The _meta_unencrypted block does not describe "
+                f"{len(undescribed)} key(s) in this file: "
+                f"{', '.join(undescribed)}. Rotation rebuilds the file from "
+                "the block, so it would drop them; nothing was changed. "
+                "Describe them in the block, or remove them, with the sops "
+                "CLI, then rotate again."
+            )
+
         now = datetime.now(UTC).isoformat()
         new_data: dict[str, Any] = {}
         rotated: list[str] = []
