@@ -319,7 +319,7 @@ Domains separate key sets, not callers. On the SSE transport a single API token 
 - **Secure temp files** — Used only for sops CLI invocation. Created with 0600 permissions, overwritten with zeros before deletion, cleanup guaranteed by `finally` block.
 - **OS-level entropy** — Secret generation uses Python's `secrets` module (backed by `/dev/urandom`).
 - **stdio transport by default** — No network exposure; runs as a client child process.
-- **Input validation** — Key names must match `^[A-Z][A-Z0-9_]*$`.
+- **Input validation** — Key names must match `^[A-Z][A-Z0-9_]*$` exactly (a trailing newline is refused), and the encryptor refuses any other root key in a flat file besides `_meta_unencrypted`.
 
 ## Encrypted file format
 

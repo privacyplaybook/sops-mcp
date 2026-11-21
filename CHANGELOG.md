@@ -108,6 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image is signed, and only when the commit `latest` holds is an ancestor
   of the one it moves to. Two publishes finishing out of
   order, or a re-run of an old one, used to be able to move it back.
+- **Key and domain names with a trailing newline are refused** (#58). Both
+  patterns were applied with `.match()`, and Python's `$` also matches
+  before a final `\n`, so `DB_PASSWORD\n` passed as a key name and
+  `prod\n` as a domain name. Both now use `fullmatch`.
+- **`SopsEncryptor.encrypt()` checks a flat file's root keys itself** (#58),
+  as a last guard behind each tool's input validation: a key that doesn't
+  match `^[A-Z][A-Z0-9_]*$`, other than `_meta_unencrypted`, is refused
+  before sops runs. A legacy file with such a root key (one made with the
+  sops CLI) can no longer be re-encrypted by `sops_rekey`, which used to
+  carry it over unchecked; manage it with the sops CLI.
+- **A secret spec without `key_name` or `source` gets a validation error**
+  (#58), not "Internal error". The tools' input schema already requires
+  both, so this reached only a handler called directly.
 
 ## [0.12.0]
 

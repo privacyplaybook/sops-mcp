@@ -37,6 +37,7 @@ from .secrets_derive import (
 from .secrets_generator import CHARSETS, entropy_warning, generate_secret
 from .sops import (
     K8S_ENCRYPTED_REGEX,
+    KEY_NAME_PATTERN,
     SopsEncryptor,
     SopsError,
     encryption_mode_features_of,
@@ -48,14 +49,15 @@ from .sops import (
 
 logger = logging.getLogger(__name__)
 
-KEY_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 VALID_SOURCES = ("generated", "external", "derived")
 VALID_CHARSETS = tuple(CHARSETS.keys())
 
 
 def _validate_key_name(name: str) -> None:
-    if not KEY_NAME_PATTERN.match(name):
+    # fullmatch, not match: `$` also matches before a trailing newline, so
+    # .match() would let 'DB_PASSWORD\n' through.
+    if not isinstance(name, str) or not KEY_NAME_PATTERN.fullmatch(name):
         raise ValueError(
             f"Invalid key name {name!r}. "
             "Must match ^[A-Z][A-Z0-9_]*$ (e.g. DB_PASSWORD)"
@@ -409,6 +411,26 @@ def _compute_value(spec: dict, resolved: dict[str, str]) -> str:
     raise ValueError(f"Unknown source {source!r}")
 
 
+def _validate_spec_shapes(specs: Any) -> None:
+    """Refuse a secrets list whose specs lack the fields read before validation.
+
+    The MCP input schema requires `key_name` and `source`, but a handler
+    called directly gets no schema check, and indexing a missing field
+    raised KeyError, which reached the client only as "Internal error".
+    """
+    if not isinstance(specs, list):
+        raise ValueError("'secrets' must be a list of secret specs")
+    for position, spec in enumerate(specs, 1):
+        if not isinstance(spec, dict):
+            raise ValueError(f"Secret {position} is not an object")
+        for field in ("key_name", "source"):
+            value = spec.get(field)
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"Secret {position} needs a '{field}' string"
+                )
+
+
 def _reject_duplicate_names(names: list[Any]) -> None:
     """Refuse a batch naming one key twice.
 
@@ -442,6 +464,7 @@ def _process_batch(
     `derived_plaintexts` is a list of "KEY = value" lines for each derived
     secret in this batch, so callers can surface them to the user.
     """
+    _validate_spec_shapes(specs)
     names = [s["key_name"] for s in specs]
     _reject_duplicate_names(names)
     new_keys = set(names)
@@ -1261,6 +1284,7 @@ class SopsMcpServer:
         secrets_list = arguments.get("secrets", [])
         if not secrets_list:
             raise ValueError("No secrets provided")
+        _validate_spec_shapes(secrets_list)
         key_names = [spec["key_name"] for spec in secrets_list]
         _reject_duplicate_names(key_names)
 
@@ -1766,6 +1790,7 @@ class SopsMcpServer:
             k for k in parsed if k != "sops" and not k.startswith("_")
         }
 
+        _validate_spec_shapes(secrets_list)
         new_key_names = [s["key_name"] for s in secrets_list]
         _reject_duplicate_names(new_key_names)
         collisions = set(new_key_names) & existing_keys

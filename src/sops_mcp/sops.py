@@ -1,9 +1,11 @@
 """SOPS encryption/decryption via CLI with secure temp file handling."""
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+from typing import Any
 
 import yaml
 
@@ -89,6 +91,30 @@ _UNSUPPORTED_FLAGS = ("key_groups", "shamir_threshold", "mac_only_encrypted")
 # ending in it (the `_meta_unencrypted` block) stay plaintext, and every
 # other value is encrypted.
 UNENCRYPTED_SUFFIX = "_unencrypted"
+
+# A root key of a flat file: what server.py's _validate_key_name enforces
+# on input. Here too so encrypt() can refuse what a caller failed to check.
+# Always applied with fullmatch: `$` also matches before a trailing newline.
+KEY_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# The one root key a flat file holds besides its secrets.
+META_KEY = "_meta_unencrypted"
+
+
+def _check_flat_root_keys(data: Any) -> None:
+    """Refuse to encrypt a flat file with a root key no tool may write.
+
+    The last guard before the YAML is written: every handler validates key
+    names on input, so this fires only for a caller that skipped that. The
+    key is not echoed, since it is exactly the input that was not checked.
+    """
+    if not isinstance(data, dict):
+        raise SopsError("refusing to encrypt: data is not a mapping")
+    for key in data:
+        if key == META_KEY:
+            continue
+        if not isinstance(key, str) or not KEY_NAME_PATTERN.fullmatch(key):
+            raise SopsError("refusing to encrypt: invalid key name")
 
 # What `sops_create_k8s_secret` encrypts with: only the `data` and
 # `stringData` subtrees, so `apiVersion`, `kind`, `metadata` and `type`
@@ -273,6 +299,11 @@ class SopsEncryptor:
         Returns:
             SOPS-encrypted YAML string.
         """
+        if encrypted_regex is None:
+            # Under the suffix rule every root key is a secret or the
+            # metadata block. A manifest (encrypted_regex) has its own root
+            # keys, and its caller validates the keys under stringData.
+            _check_flat_root_keys(data)
         plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
         # sops refuses more than one encryption-mode flag, so exactly one.
         mode = (
