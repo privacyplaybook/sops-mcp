@@ -6,7 +6,8 @@ Run by .github/workflows/rescan-latest.yml, in a job that holds
 token) has scanned the published image with .github/actions/image-scan.
 
 One issue, never one per run: it is the oldest open issue carrying LABEL
-(created with TITLE; the label is the key, so a retitle doesn't lose it). On
+that the script wrote (TITLE, or its fingerprint marker in the body, so a
+retitle doesn't lose it and an issue someone else labelled is never touched). On
 findings it is created, or its body is replaced with the
 current findings; a comment is added only when the findings or the image
 digest changed since the body was last written (a hidden fingerprint in the
@@ -107,12 +108,19 @@ def fingerprint(digest: str, rows: list[dict[str, str]]) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
-def _cell(text: str) -> str:
+# Never cut: the vulnerability and the version that fixes it are what the
+# reader acts on. MAX_BODY still bounds the total.
+UNCAPPED = ("id", "fixed_in")
+
+
+def _cell(text: str, cap: bool = True) -> str:
     """A Markdown table cell: no pipes, no newlines, no backticks, no
     mentions (Grype's data comes from the image and its DB)."""
     text = text.replace("|", "/").replace("`", "'").replace("@", "@\u200b")
     text = " ".join(text.split())
-    return text if len(text) <= MAX_CELL else text[: MAX_CELL - 1] + "…"
+    if not cap or len(text) <= MAX_CELL:
+        return text
+    return text[: MAX_CELL - 1] + "…"
 
 
 def render_body(
@@ -146,7 +154,7 @@ def render_body(
         line = (
             "| "
             + " | ".join(
-                _cell(row[k])
+                _cell(row[k], cap=k not in UNCAPPED)
                 for k in ("id", "severity", "package", "version", "fixed_in", "type")
             )
             + " |"
@@ -173,9 +181,18 @@ def render_body(
     return "\n".join(lines) + "\n"
 
 
+def is_ours(issue: dict[str, Any]) -> bool:
+    """An issue this script wrote: its fingerprint marker in the body, or
+    its title. A retitled issue keeps the marker; an issue someone else
+    labelled has neither, and is never overwritten or closed."""
+    return issue.get("title") == TITLE or bool(
+        FINGERPRINT_RE.search(issue.get("body") or "")
+    )
+
+
 def open_issues(api: Api) -> list[dict[str, Any]]:
-    """Every open issue (not PR) carrying LABEL, oldest first. The label is
-    the key, not the title, so a retitled issue is still found and closed."""
+    """Every open issue (not PR) carrying LABEL that this script wrote,
+    oldest first."""
     issues = api(
         "--method",
         "GET",
@@ -191,11 +208,11 @@ def open_issues(api: Api) -> list[dict[str, Any]]:
         "-f",
         "direction=asc",
     )
-    return [i for i in issues or [] if "pull_request" not in i]
+    return [i for i in issues or [] if "pull_request" not in i and is_ours(i)]
 
 
 def find_open_issue(api: Api) -> dict[str, Any] | None:
-    """The tracking issue: the oldest open one carrying LABEL."""
+    """The tracking issue: the oldest open one of ours carrying LABEL."""
     issues = open_issues(api)
     return issues[0] if issues else None
 
@@ -299,15 +316,8 @@ def report_clean(
 def _close(
     api: Api, number: int, *, image: str, digest: str, revision: str, run_url: str
 ) -> None:
-    api(
-        "--method",
-        "POST",
-        f"repos/{{owner}}/{{repo}}/issues/{number}/comments",
-        "-f",
-        f"body=The scheduled re-scan of `{_cell(image)}@{_cell(digest)}` "
-        f"(built from {_cell(revision) or 'unknown'}) is clean: {run_url}. "
-        "Closing.",
-    )
+    # Close first: a failed close leaves no "Closing." comment behind to be
+    # repeated by every later clean run.
     api(
         "--method",
         "PATCH",
@@ -316,6 +326,15 @@ def _close(
         "state=closed",
         "-f",
         "state_reason=completed",
+    )
+    api(
+        "--method",
+        "POST",
+        f"repos/{{owner}}/{{repo}}/issues/{number}/comments",
+        "-f",
+        f"body=The scheduled re-scan of `{_cell(image)}@{_cell(digest)}` "
+        f"(built from {_cell(revision) or 'unknown'}) is clean: {run_url}. "
+        "Closed.",
     )
 
 

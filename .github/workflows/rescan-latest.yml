@@ -37,7 +37,8 @@ jobs:
   #
   # main only: a manual run from another branch would scan with that
   # branch's allowlist and script yet write the one shared issue (a laxer
-  # .grype.yaml could close a real finding). Such a run skips both jobs.
+  # .grype.yaml could close a real finding). Such a run skips both jobs and
+  # fails in not-main below. main is named, as in publish.yml.
   scan:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -98,6 +99,17 @@ jobs:
           path: ${{ steps.scan.outputs.report-json }}
           retention-days: 7
           if-no-files-found: error
+
+  # Makes a dispatch from another branch fail visibly, not pass as skipped.
+  not-main:
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - run: |
+          echo "::error::rescan-latest runs on main only (this run is on $GITHUB_REF); nothing was scanned"
+          exit 1
 
   # The only job with a write permission, and only issues: write. It runs no
   # scanner and reads only the scan job's JSON report.

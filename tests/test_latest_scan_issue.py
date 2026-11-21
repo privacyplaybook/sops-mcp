@@ -250,7 +250,11 @@ def test_body_length_is_capped_with_long_cells():
         for c in ln.strip("| ").split(" | ")
     ]
     longest = max(len(c) for c in cells)
-    assert longest <= lsi.MAX_CELL
+    capped = [c for c in cells if not c.startswith(("GHSA", "v9.9.9"))]
+    assert max(len(c) for c in capped) <= lsi.MAX_CELL
+    # The id and the fix versions are never cut.
+    assert ", ".join(["v9.9.9"] * 100) in body
+    assert longest > lsi.MAX_CELL
 
 
 def test_fingerprint_tracks_digest_and_findings():
@@ -263,10 +267,26 @@ def test_fingerprint_tracks_digest_and_findings():
 # --- find_open_issue ---------------------------------------------------------
 
 
-def test_find_skips_prs_and_keys_on_the_label_not_the_title():
-    # The API returned only labelled issues; a retitled one still counts.
-    gh = FakeGitHub([_issue(1, pr=True), _issue(2, title="CVE-x in glibc"), _issue(3)])
+MARKER = "<!-- rescan-latest:fingerprint " + "0" * 64 + " -->"
+
+
+def test_find_skips_prs_and_finds_a_retitled_issue_by_its_marker():
+    # The API returned only labelled issues; a retitled one of ours counts.
+    gh = FakeGitHub(
+        [_issue(1, pr=True), _issue(2, title="CVE-x in glibc", body=MARKER), _issue(3)]
+    )
     assert lsi.find_open_issue(gh)["number"] == 2
+
+
+def test_issue_someone_else_labelled_is_never_touched():
+    theirs = _issue(5, title="Tuning the scanner", body="hand-written notes")
+    gh = FakeGitHub([theirs])
+    assert _report(gh) == "opened #99"
+    assert ("PATCH", "repos/{owner}/{repo}/issues/5") not in gh.writes()
+    gh = FakeGitHub([theirs])
+    out = lsi.report_clean(gh, image=IMAGE, digest=DIGEST, revision=REV, run_url=RUN)
+    assert out == "clean; no open issue"
+    assert gh.writes() == []
 
 
 def test_find_none():
@@ -373,7 +393,7 @@ def test_clean_with_no_issue_writes_nothing():
 
 
 def test_clean_closes_every_labelled_issue():
-    gh = FakeGitHub([_issue(7), _issue(8, title="retitled")])
+    gh = FakeGitHub([_issue(7), _issue(8, title="retitled", body=MARKER)])
     out = lsi.report_clean(gh, image=IMAGE, digest=DIGEST, revision=REV, run_url=RUN)
     assert out == "clean; closed #7, #8"
     assert ("PATCH", "repos/{owner}/{repo}/issues/8") in gh.writes()
@@ -383,9 +403,10 @@ def test_clean_closes_the_open_issue_with_a_comment():
     gh = FakeGitHub([_issue(7)])
     out = lsi.report_clean(gh, image=IMAGE, digest=DIGEST, revision=REV, run_url=RUN)
     assert out == "clean; closed #7"
+    # Closed before the comment, so a failed close leaves no "Closed." note.
     assert gh.writes() == [
-        ("POST", "repos/{owner}/{repo}/issues/7/comments"),
         ("PATCH", "repos/{owner}/{repo}/issues/7"),
+        ("POST", "repos/{owner}/{repo}/issues/7/comments"),
     ]
     assert gh.field("PATCH", "/issues/7", "state") == "closed"
 
@@ -454,6 +475,8 @@ def test_workflow_runs_on_main_only():
     jobs = _workflow()["jobs"]
     assert jobs["scan"]["if"] == "github.ref == 'refs/heads/main'"
     assert jobs["issue"]["needs"] == "scan"
+    assert jobs["not-main"]["if"] == "github.ref != 'refs/heads/main'"
+    assert jobs["not-main"]["permissions"] == {}
 
 
 def test_only_the_issue_job_can_write():
