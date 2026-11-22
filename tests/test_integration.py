@@ -475,3 +475,206 @@ async def test_rotate_refuses_each_kind_of_undescribed_key(
     assert "TOKEN" not in message
     for value in extra.values():
         assert value not in message
+
+
+# --- sops_add_metadata repairs a partial block (#72) ----------------------
+
+
+async def _partial(server):
+    """A legacy file given one new key by sops_add_secrets: its block lists
+    only NEW_TOKEN, so rotation refuses it (#46)."""
+    legacy = server.encryptor.encrypt(
+        {"LEGACY_A": "value-a-zz91", "LEGACY_B": "value-b-zz92"},
+        _domain(server),
+    )
+    return await server._add_secrets({
+        "encrypted_content": legacy,
+        "secrets": [
+            {"key_name": "NEW_TOKEN", "source": "generated", "length": 24},
+        ],
+    })
+
+
+async def test_add_secrets_says_the_block_leaves_keys_out(server):
+    added = await _partial(server)
+    summary = "\n".join(r.text for r in added[1:])
+    assert "does not describe 2 key(s): LEGACY_A, LEGACY_B" in summary
+    assert "sops_add_metadata" in summary
+    assert "value-a-zz91" not in summary
+
+    # A file whose block is complete gets no such note.
+    again = await server._add_secrets({
+        "encrypted_content": (await server._create_secrets({
+            "secrets": [{"key_name": "A", "source": "generated"}],
+        }))[0].text,
+        "secrets": [{"key_name": "B", "source": "generated"}],
+    })
+    assert "does not describe" not in "\n".join(r.text for r in again[1:])
+
+
+async def test_partial_block_can_be_repaired_then_rotated(server):
+    domain = _domain(server)
+    partial = (await _partial(server))[0].text
+    before = server.encryptor.decrypt(partial, domain)
+    new_token_entry = yaml.safe_load(partial)["_meta_unencrypted"]["secrets"][
+        "NEW_TOKEN"
+    ]
+
+    repaired = await server._add_metadata({
+        "encrypted_content": partial,
+        "secret_metadata": {
+            "LEGACY_A": {"source": "external", "description": "kept"},
+            "LEGACY_B": {"source": "generated"},
+        },
+    })
+    summary = repaired[1].text
+    assert "LEGACY_A: external - kept" in summary
+    assert "Kept existing entries: NEW_TOKEN" in summary
+    block = yaml.safe_load(repaired[0].text)["_meta_unencrypted"]
+    assert block["domain"] == "default"
+    # The existing entry is kept exactly; the new ones are added.
+    assert block["secrets"]["NEW_TOKEN"] == new_token_entry
+    assert block["secrets"]["LEGACY_A"]["source"] == "external"
+    assert block["secrets"]["LEGACY_B"]["source"] == "generated"
+    # Nothing dropped, nothing changed.
+    after_repair = server.encryptor.decrypt(repaired[0].text, domain)
+    assert {k: v for k, v in after_repair.items() if k != "_meta_unencrypted"} == {
+        k: v for k, v in before.items() if k != "_meta_unencrypted"
+    }
+
+    rotated = await server._rotate_generated(
+        {"encrypted_content": repaired[0].text}
+    )
+    values = server.encryptor.decrypt(rotated[0].text, domain)
+    assert set(values) == {"LEGACY_A", "LEGACY_B", "NEW_TOKEN", "_meta_unencrypted"}
+    assert values["LEGACY_A"] == "value-a-zz91"  # external: kept
+    assert values["LEGACY_B"] != "value-b-zz92"  # generated: rotated
+    assert len(values["LEGACY_B"]) == 32
+    assert values["NEW_TOKEN"] != before["NEW_TOKEN"]
+    assert len(values["NEW_TOKEN"]) == 24  # its own entry still governs it
+
+
+async def test_add_metadata_never_replaces_a_described_key(server):
+    partial = (await _partial(server))[0].text
+    with pytest.raises(ValueError, match="already describes NEW_TOKEN"):
+        await server._add_metadata({
+            "encrypted_content": partial,
+            "secret_metadata": {
+                "LEGACY_A": {"source": "external"},
+                "LEGACY_B": {"source": "external"},
+                "NEW_TOKEN": {"source": "external"},
+            },
+        })
+
+
+async def test_add_metadata_must_describe_every_undescribed_key(server):
+    partial = (await _partial(server))[0].text
+    with pytest.raises(
+        ValueError, match="Keys in file but not in metadata: LEGACY_B"
+    ):
+        await server._add_metadata({
+            "encrypted_content": partial,
+            "secret_metadata": {"LEGACY_A": {"source": "external"}},
+        })
+    with pytest.raises(ValueError, match="Keys in metadata but not in file: X"):
+        await server._add_metadata({
+            "encrypted_content": partial,
+            "secret_metadata": {
+                "LEGACY_A": {"source": "external"},
+                "LEGACY_B": {"source": "external"},
+                "X": {"source": "external"},
+            },
+        })
+
+
+async def test_add_metadata_refuses_a_complete_block(server):
+    created = await server._create_secrets({
+        "secrets": [{"key_name": "A", "source": "generated"}],
+    })
+    with pytest.raises(ValueError, match="already describes every key"):
+        await server._add_metadata({
+            "encrypted_content": created[0].text,
+            "secret_metadata": {"A": {"source": "external"}},
+        })
+
+
+async def test_add_metadata_derives_from_a_described_key(server):
+    partial = (await _partial(server))[0].text
+    repaired = await server._add_metadata({
+        "encrypted_content": partial,
+        "secret_metadata": {
+            "LEGACY_A": {"source": "external"},
+            "LEGACY_B": {
+                "source": "derived",
+                "transform": "sha256_hex",
+                "from": "NEW_TOKEN",
+            },
+        },
+    })
+    rotated = await server._rotate_generated(
+        {"encrypted_content": repaired[0].text}
+    )
+    values = server.encryptor.decrypt(rotated[0].text, _domain(server))
+    assert values["LEGACY_B"] == hashlib.sha256(
+        values["NEW_TOKEN"].encode()
+    ).hexdigest()
+
+
+async def test_add_metadata_replaces_a_non_mapping_entry(server):
+    """A bare entry doesn't describe its key (rotation refuses it), so it
+    counts as undescribed and gets its new entry."""
+    content = await _with_extra(
+        server, {"LEGACY_A": "value-zz93"}, {"LEGACY_A": "external"}
+    )
+    repaired = await server._add_metadata({
+        "encrypted_content": content,
+        "secret_metadata": {"LEGACY_A": {"source": "external"}},
+    })
+    block = yaml.safe_load(repaired[0].text)["_meta_unencrypted"]["secrets"]
+    assert block["LEGACY_A"] == {"source": "external"}
+    assert block["TOKEN"]["source"] == "generated"
+    rotated = await server._rotate_generated(
+        {"encrypted_content": repaired[0].text}
+    )
+    values = server.encryptor.decrypt(rotated[0].text, _domain(server))
+    assert values["LEGACY_A"] == "value-zz93"
+
+
+@pytest.mark.parametrize("with_block", [True, False])
+async def test_add_metadata_refuses_rather_than_drops_underscore_keys(
+    server, with_block
+):
+    """Entries need ^[A-Z]... names, so a '_'-prefixed key can't be
+    described. It used to be dropped from the file silently; now it is
+    refused and named, never its value."""
+    domain = _domain(server)
+    if with_block:
+        content = await _with_extra(
+            server, {"_note": "value-zz94", "LEGACY_A": "value-zz95"}
+        )
+    else:
+        content = server.encryptor.encrypt(
+            {"_note": "value-zz94", "LEGACY_A": "value-zz95"},
+            domain,
+            carried={"_note"},
+        )
+    with pytest.raises(ValueError, match="no metadata entry can describe") as e:
+        await server._add_metadata({
+            "encrypted_content": content,
+            "secret_metadata": {"LEGACY_A": {"source": "external"}},
+        })
+    assert "_note" in str(e.value)
+    assert "value-zz94" not in str(e.value)
+
+
+async def test_add_metadata_refuses_a_malformed_block(server):
+    domain = _domain(server)
+    content = server.encryptor.encrypt(
+        {"A": "v", "_meta_unencrypted": {"version": 1, "secrets": ["A"]}},
+        domain,
+    )
+    with pytest.raises(ValueError, match="block is malformed"):
+        await server._add_metadata({
+            "encrypted_content": content,
+            "secret_metadata": {"A": {"source": "external"}},
+        })

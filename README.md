@@ -85,7 +85,7 @@ A generated secret's effective entropy is length × log2(charset size, after exc
 | `sops_update_external` | Replace the value of an `external` secret. Cascades to any derived secrets that reference it. Rejects attempts to update `generated` or `derived`. |
 | `sops_rename_secret` | Rename a key, preserving its value and metadata. Updates `from:` references in any derived secrets. |
 | `sops_delete_secrets` | Remove one or more keys. Rejects deleting a secret that another derived secret still references (unless the dependent is deleted in the same call). |
-| `sops_add_metadata` | Retrofit `_meta_unencrypted` onto a legacy SOPS file that lacks it. Supports `generated`, `external`, and `derived` entries. |
+| `sops_add_metadata` | Retrofit `_meta_unencrypted` onto a legacy SOPS file that lacks it, or describe the keys a partial block leaves out (`sops_add_secrets` on a legacy file writes one), so `sops_rotate_generated` accepts the file. Supports `generated`, `external`, and `derived` entries. Existing entries are kept, never replaced. |
 | `sops_rekey` | Re-encrypt a file onto its domain's current recipient list. Run this after a domain's recipients change, or to clear a "recipients do not match" refusal. Requires an explicit `domain`. Leaves a legacy file without a metadata block untouched in that respect, so `sops_add_metadata` still works on it. |
 
 Every tool takes a `domain` argument except `sops_list_domains`, which needs none. It is optional everywhere but `sops_rekey`, where it is required because the call changes who can read the file. See [Key domains](#key-domains).

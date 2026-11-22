@@ -859,10 +859,14 @@ class SopsMcpServer:
                     name="sops_add_metadata",
                     description=(
                         "Add _meta_unencrypted metadata to an existing "
-                        "SOPS-encrypted file that lacks it. Decrypts the "
-                        "file, adds metadata, and re-encrypts preserving "
-                        "original plaintext values. Requires a private key "
-                        "for the target domain."
+                        "SOPS-encrypted file that lacks it, or describe the "
+                        "keys a partial block leaves out. secret_metadata "
+                        "must name exactly the keys the block doesn't "
+                        "describe (every key, for a file with no block); "
+                        "existing entries are kept and never replaced. "
+                        "Decrypts the file, adds metadata, and re-encrypts "
+                        "preserving original plaintext values. Requires a "
+                        "private key for the target domain."
                     ),
                     inputSchema={
                         "type": "object",
@@ -1713,9 +1717,10 @@ class SopsMcpServer:
                 f"{len(undescribed)} key(s) in this file: "
                 f"{', '.join(undescribed)}. Rotation rebuilds the file from "
                 "the block, so it would drop them; nothing was changed. "
-                "With the sops CLI, give each one an entry in the block "
-                "(source 'external' keeps its value; 'generated' replaces "
-                "it), or remove it, then rotate again."
+                "Describe them with sops_add_metadata (source 'external' "
+                "keeps a value; 'generated' replaces it on rotation), or "
+                "delete them, then rotate again. A '_'-prefixed key can't "
+                "be given an entry: rename or remove it with the sops CLI."
             )
 
         now = datetime.now(UTC).isoformat()
@@ -1867,6 +1872,21 @@ class SopsMcpServer:
         summary_lines = ["Secrets added:", *summary]
         if preserved:
             summary_lines.append(f"Preserved: {', '.join(preserved)}")
+        # A legacy file (no block, or a partial one) comes back with a block
+        # that leaves its older keys out, and sops_rotate_generated refuses
+        # such a file (#46). Say so now, and how to repair it (#72).
+        undescribed = sorted(
+            str(k)
+            for k in resolved
+            if not isinstance(merged_meta.get(k), dict)
+        )
+        if undescribed:
+            summary_lines.append(
+                "Note: the _meta_unencrypted block does not describe "
+                f"{len(undescribed)} key(s): {', '.join(undescribed)}. "
+                "sops_rotate_generated refuses this file until they are "
+                "described; describe them with sops_add_metadata."
+            )
 
         return _mutation_response(
             encrypted_yaml, summary_lines, derived_plaintexts, "new"
@@ -1882,22 +1902,75 @@ class SopsMcpServer:
         secret_metadata = arguments.get("secret_metadata", {})
         if not secret_metadata:
             raise ValueError("No secret_metadata provided")
+        if not isinstance(secret_metadata, dict):
+            raise ValueError("secret_metadata must be an object")
 
         parsed = self._parse_for_mutation(content)
 
-        if "_meta_unencrypted" in parsed:
+        # Two cases (#72). A legacy file has no block: describe every key.
+        # A file with a partial block (sops_add_secrets on a legacy file
+        # writes one) gets entries for the keys the block doesn't describe,
+        # and only those: an entry already there is never replaced, so this
+        # can't be used to change how a described key rotates. "Described"
+        # means what sops_rotate_generated's guard means: a mapping entry.
+        has_block = "_meta_unencrypted" in parsed
+        meta = parsed.get("_meta_unencrypted")
+        existing: dict = {}
+        if has_block:
+            existing_secrets = (
+                meta.get("secrets", {}) if isinstance(meta, dict) else None
+            )
+            if not isinstance(existing_secrets, dict):
+                raise ValueError(
+                    "The file's _meta_unencrypted block is malformed (it, or "
+                    "its 'secrets', is not a mapping). Fix it with the sops "
+                    "CLI; nothing was changed."
+                )
+            existing = existing_secrets
+
+        file_keys = [
+            k for k in parsed if k not in ("sops", "_meta_unencrypted")
+        ]
+        # The file is rebuilt from its decrypted keys, and a key no entry
+        # can describe (entries need ^[A-Z][A-Z0-9_]*$) would either be
+        # dropped or left for sops_rotate_generated to refuse. Refuse here
+        # instead, naming it (never its value).
+        indescribable = sorted(
+            str(k)
+            for k in file_keys
+            if not isinstance(k, str) or k.startswith("_")
+        )
+        if indescribable:
             raise ValueError(
-                "File already has _meta_unencrypted block. "
-                "Use sops_rotate_generated or sops_create_secrets instead."
+                f"File has {len(indescribable)} root key(s) that no "
+                f"metadata entry can describe: {', '.join(indescribable)}. "
+                "Rename or remove them with the sops CLI first; nothing "
+                "was changed."
             )
 
-        file_keys = sorted(
-            k for k in parsed if k != "sops" and not k.startswith("_")
+        described = sorted(
+            k for k in file_keys if isinstance(existing.get(k), dict)
         )
-        meta_keys = sorted(secret_metadata.keys())
+        undescribed = sorted(k for k in file_keys if k not in described)
+        if has_block and not undescribed:
+            raise ValueError(
+                "The file's _meta_unencrypted block already describes every "
+                "key. Use sops_rotate_generated, sops_add_secrets or "
+                "sops_update_external instead."
+            )
 
-        if file_keys != meta_keys:
-            missing_from_meta = set(file_keys) - set(meta_keys)
+        already = sorted(set(secret_metadata) & set(described))
+        if already:
+            raise ValueError(
+                "The _meta_unencrypted block already describes "
+                f"{', '.join(already)}. sops_add_metadata only adds entries "
+                "for keys the block doesn't describe, and never replaces "
+                "one; leave these out."
+            )
+
+        meta_keys = sorted(secret_metadata.keys())
+        if undescribed != meta_keys:
+            missing_from_meta = set(undescribed) - set(meta_keys)
             extra_in_meta = set(meta_keys) - set(file_keys)
             parts = []
             if missing_from_meta:
@@ -1914,18 +1987,24 @@ class SopsMcpServer:
                 f"Key mismatch between file and metadata. {'; '.join(parts)}"
             )
 
-        known_keys = set(secret_metadata.keys())
-        for key_name, meta in secret_metadata.items():
+        # A derived entry may build on any key in the file: one the block
+        # already describes, or one described in this call.
+        known_keys = set(file_keys)
+        for key_name, spec in secret_metadata.items():
             _validate_key_name(key_name)
-            source = meta.get("source")
+            if not isinstance(spec, dict):
+                raise ValueError(
+                    f"Metadata for {key_name} must be an object"
+                )
+            source = spec.get("source")
             if source not in VALID_SOURCES:
                 raise ValueError(
                     f"Invalid source {source!r} for {key_name}. "
                     f"Must be one of: {', '.join(VALID_SOURCES)}"
                 )
             if source == "derived":
-                transform = meta.get("transform")
-                from_key = meta.get("from")
+                transform = spec.get("transform")
+                from_key = spec.get("from")
                 if not transform:
                     raise ValueError(
                         f"Derived metadata for {key_name} requires 'transform'"
@@ -1948,21 +2027,22 @@ class SopsMcpServer:
                         f"{from_key!r} is not in the file"
                     )
 
-        # A legacy file has no _meta_unencrypted block to read a domain
-        # hint from — that is the whole point of this tool — so the domain
-        # comes from the argument or the default.
-        domain = self._resolve_domain(arguments)
+        # A legacy file has no block to read a domain hint from, so its
+        # domain comes from the argument or the default. A partial block's
+        # hint is used like any other tool's: _check_recipients is what
+        # makes trusting it safe.
+        domain = self._resolve_domain(arguments, meta if has_block else None)
         self._check_recipients(content, domain)
 
         decrypted = self.encryptor.decrypt(content, domain)
 
         now = datetime.now(UTC).isoformat()
-        meta_secrets = {}
-        for key_name, meta in secret_metadata.items():
-            source = meta["source"]
+        new_entries: dict[str, Any] = {}
+        for key_name, meta_in in secret_metadata.items():
+            source = meta_in["source"]
             entry: dict[str, Any] = {"source": source}
-            if meta.get("description"):
-                entry["description"] = meta["description"]
+            if meta_in.get("description"):
+                entry["description"] = meta_in["description"]
             if source == "generated":
                 entry["generation"] = {
                     "length": 32,
@@ -1971,30 +2051,43 @@ class SopsMcpServer:
                 entry["last_rotated"] = now
             elif source == "derived":
                 entry["derivation"] = {
-                    "transform": meta["transform"],
-                    "from": meta["from"],
+                    "transform": meta_in["transform"],
+                    "from": meta_in["from"],
                 }
                 entry["last_rotated"] = now
-            meta_secrets[key_name] = entry
+            new_entries[key_name] = entry
 
-        new_data = {}
-        for key in decrypted:
-            if key.startswith("_"):
-                continue
-            new_data[key] = decrypted[key]
+        # Existing entries are kept as they are, including any for a key
+        # not in the file; an undescribed key's non-mapping entry (a bare
+        # name, say) is replaced by its new one.
+        meta_secrets = {**existing, **new_entries}
 
-        new_data["_meta_unencrypted"] = self._meta_block(meta_secrets, domain)
+        new_data = {
+            key: value
+            for key, value in decrypted.items()
+            if key != "_meta_unencrypted"
+        }
+
+        new_data["_meta_unencrypted"] = self._meta_block(
+            meta_secrets,
+            domain,
+            meta.get("version", 1) if isinstance(meta, dict) else 1,
+        )
 
         encrypted_yaml = self.encryptor.encrypt(
             new_data, domain, carried=decrypted.keys()
         )
 
         summary_lines = ["Added metadata:"]
-        for key_name, entry in meta_secrets.items():
+        for key_name, entry in new_entries.items():
             source = entry["source"]
             desc = entry.get("description", "")
             desc_str = f" - {desc}" if desc else ""
             summary_lines.append(f"  {key_name}: {source}{desc_str}")
+        if described:
+            summary_lines.append(
+                f"Kept existing entries: {', '.join(described)}"
+            )
 
         return [
             TextContent(type="text", text=encrypted_yaml),
