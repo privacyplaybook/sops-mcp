@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The base-image signature check pins Chainguard's signer and fails the
+  build.** `lib/verify_base_images.py` and `lib/pin_base_images.py` ran
+  `cosign verify` with `--certificate-identity-regexp .*` and
+  `--certificate-oidc-issuer-regexp .*`, which any Sigstore signature
+  passes, and the `verify` job didn't install cosign, so the check only
+  ever warned. Now `cgr.dev/chainguard/*` images must be signed by
+  `https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main`
+  via `https://token.actions.githubusercontent.com`, other registries are
+  refused, a lock entry recorded as unsigned is an error, and a missing,
+  failed or timed-out verification fails the job. cosign 3.1.4 is
+  installed, version- and SHA-256-pinned, by a new
+  `.github/actions/install-cosign` action in `supply-chain.yml` and in
+  `publish.yml`'s `verify-supply-chain` job (#66).
 - **The image scan refuses unknown keys in a `.grype.yaml` rule.** Grype
   ignores a key it doesn't know, so a misspelled `pacakge:` left a rule
   that silenced its CVE in every package, and the check passed it. Each

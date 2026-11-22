@@ -424,12 +424,12 @@ The Docker build is hardened with three layers of verification, enforced by a CI
 
 ### Base image digest pinning
 
-The Dockerfile builds on `cgr.dev/chainguard/python` (Wolfi), pinned by SHA-256 digest (`@sha256:...`) so Docker always pulls the exact image that was audited rather than whatever the tag currently points to. Two stages are pinned separately: `:latest-dev` for the build stage, which has apk, a shell and a build toolchain, and `:latest` for the runtime stage, which is distroless — no shell, no package manager. Both digests and their cosign signature status are tracked in `base-images.lock.json`.
+The Dockerfile builds on `cgr.dev/chainguard/python` (Wolfi), pinned by SHA-256 digest (`@sha256:...`) so Docker always pulls the exact image that was audited rather than whatever the tag currently points to. Two stages are pinned separately: `:latest-dev` for the build stage, which has apk, a shell and a build toolchain, and `:latest` for the runtime stage, which is distroless — no shell, no package manager. Both digests and their cosign signature status are tracked in `base-images.lock.json`. `"cosign_signed": true` there means the digest verified against Chainguard's own signing identity (its `chainguard-images/images` release workflow, through GitHub Actions OIDC), not merely against some Sigstore signature: the identity and issuer are pinned per registry in `TRUSTED_SIGNERS` in `lib/verify_base_images.py`, and a base image from any other registry is refused.
 
 Update the base image (when upstream publishes security patches):
 
 ```bash
-pip install requests  # one-time; cosign on PATH is needed for the signature checks
+pip install requests  # one-time; cosign on PATH is required for the signature checks
 python3 lib/pin_base_images.py
 ```
 
@@ -440,20 +440,23 @@ the `Dockerfile` and nothing else. It does not touch
 `base-images.lock.json`, so the PR's `verify` check fails:
 `lib/verify_base_images.py` requires every `FROM` digest to be the one the
 lock records for that image, and every image in either file to be in the
-other. (The advisory cosign check in that script verifies the lock's
-digests, so a stale lock would have it vouch for images no longer in use.)
+other. (The cosign check in that script, which fails the job unless each
+locked digest is signed by Chainguard, verifies the lock's digests, so a
+stale lock would have it vouch for images no longer in use.)
 The PR stays red until the lock is regenerated on its branch:
 
 ```bash
 gh pr checkout <number>
-pip install requests  # one-time; cosign on PATH for the signature checks
+pip install requests  # one-time; cosign on PATH is required
 python3 lib/pin_base_images.py
 ```
 
 Commit only if the script exited 0 and its summary reads
 `2/2 pinned, 2/2 cosign verified`. If a tag failed to resolve it exits 1
-and writes `"digest": null`; without cosign on PATH it writes
-`"cosign_signed": false`. Either way, fix that and re-run. Then:
+and writes `"digest": null`; if an image didn't verify against its pinned
+signer (or cosign isn't on PATH) it exits 1 and writes
+`"cosign_signed": false`, which the `verify` job also fails. Either way,
+fix that and re-run. Then:
 
 ```bash
 git add Dockerfile base-images.lock.json
@@ -520,7 +523,7 @@ lib/compile_requirements.sh
 
 ### CI verification
 
-The `supply-chain.yml` workflow runs `lib/verify_requirements.py`, `lib/verify_base_images.py` and `lib/verify_version.py`, then audits the lockfile for known advisories. It runs on every pull request to `main`, and on pushes to `main` that touch the Dockerfile, a lockfile, `pyproject.toml`, `server.json` or `lib/`. It checks that lockfiles are well-formed, that every Dockerfile `FROM` line is digest-pinned, that `server.json` matches the version in `pyproject.toml`, and that no pinned dependency has a published vulnerability.
+The `supply-chain.yml` workflow runs `lib/verify_requirements.py`, `lib/verify_base_images.py` and `lib/verify_version.py`, then audits the lockfile for known advisories. It runs on every pull request to `main`, and on pushes to `main` that touch the Dockerfile, a lockfile, `pyproject.toml`, `server.json` or `lib/`. It checks that lockfiles are well-formed, that every Dockerfile `FROM` line is digest-pinned and matches `base-images.lock.json`, that each base image is cosign-signed by Chainguard's pinned identity (a version- and SHA-256-pinned cosign is installed for this; a missing or failed signature fails the job), that `server.json` matches the version in `pyproject.toml`, and that no pinned dependency has a published vulnerability.
 
 The audit is the same gate the publish workflow runs, so a lockfile that would block a release now blocks the pull request instead. Because it queries live advisory data, an unrelated pull request can start failing when a new advisory lands against a pinned dependency. That is the intended trade-off; the fix is to refresh the lockfile.
 
