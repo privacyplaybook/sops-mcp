@@ -450,9 +450,9 @@ async def test_listing_does_not_call_a_pgp_file_a_match(env):
 async def test_rekey_does_not_stamp_metadata_onto_a_legacy_file(env):
     """Stamping an empty block would dead-end sops_add_metadata.
 
-    sops_add_metadata refuses a file that already has a block, and
-    sops_rotate_generated refuses a block with no secrets, so a legacy file
-    given an empty one has no way back.
+    sops_rotate_generated refuses a block with no secrets. sops_add_metadata
+    can now fill in an empty block (#72), but a legacy file should still not
+    gain one it didn't ask for.
     """
     legacy = env.encryptor.encrypt({"TOKEN": "v"}, env.domains["alpha"])
     assert "_meta_unencrypted" not in yaml.safe_load(legacy)
@@ -646,3 +646,27 @@ async def test_listing_a_shamir_file_does_not_advise_rekey(env):
     text = listed[0].text
     assert "cannot reproduce" in text
     assert "run sops_rekey" not in text
+
+
+async def test_add_metadata_on_a_partial_block_uses_its_domain(env):
+    """A partial block's domain hint is used like any other tool's (#72),
+    and the recipient check still guards it."""
+    blob = await _create(env, "beta")
+    values = env.encryptor.decrypt(blob, env.domains["beta"])
+    values["LEGACY"] = "old"
+    partial = env.encryptor.encrypt(values, env.domains["beta"])
+
+    repaired = await env._add_metadata({
+        "encrypted_content": partial,
+        "secret_metadata": {"LEGACY": {"source": "external"}},
+    })
+    block = yaml.safe_load(repaired[0].text)["_meta_unencrypted"]
+    assert block["domain"] == "beta"
+    assert set(block["secrets"]) == {"TOKEN", "LEGACY"}
+
+    with pytest.raises(ValueError, match="Refusing to re-encrypt"):
+        await env._add_metadata({
+            "encrypted_content": partial,
+            "domain": "alpha",
+            "secret_metadata": {"LEGACY": {"source": "external"}},
+        })

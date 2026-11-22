@@ -106,7 +106,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file it returned. `sops_add_secrets` on a legacy file makes exactly such
   a file: its new block lists only the added keys. Rotation now refuses
   such a file and names the undescribed keys (never their values);
-  describe or remove them with the sops CLI, then rotate.
+  describe them with `sops_add_metadata` (below) or delete them, then
+  rotate.
+- **`sops_add_metadata` repairs a partial metadata block** (#72). It used
+  to refuse any file that already had a `_meta_unencrypted` block, so a
+  legacy file given one by `sops_add_secrets` could be made rotatable again
+  only with the sops CLI. It now also accepts a block that leaves keys out:
+  `secret_metadata` must name exactly the undescribed keys, existing entries
+  are kept as they are and never replaced, and a block that already
+  describes every key is still refused. `sops_add_secrets` now says when
+  the file it returns has keys its block doesn't describe.
+  It also refuses metadata whose derivations would form a cycle, which
+  rotation would refuse anyway.
+- **`sops_add_metadata` no longer drops `_`-prefixed root keys.** No entry
+  can describe such a key, and the file used to come back without it. It
+  now refuses the file and names the key, as it does any key whose name an
+  entry can't take; rename it first (`sops_rename_secret`, or the sops CLI
+  for a `_`-prefixed key).
 
 ### Security
 
