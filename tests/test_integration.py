@@ -4,11 +4,14 @@ throwaway age keypair. Requires `sops` and `age-keygen` on PATH.
 
 import hashlib
 import math
+import os
 import subprocess
+import sys
 
 import pytest
 import yaml
 
+from sops_mcp import sops as sops_module
 from sops_mcp.domains import load_domains
 from sops_mcp.server import SopsMcpServer
 from sops_mcp.sops import SopsEncryptor, SopsError
@@ -942,11 +945,50 @@ async def test_integers_keep_exact_value_and_type(server):
         assert type(values[key]) is type(expected)
 
 
-async def test_infinite_number_is_a_clear_decrypt_error(server):
+@pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+async def test_infinite_number_is_refused_at_encrypt(server, value):
+    with pytest.raises(SopsError, match="infinite or NaN"):
+        server.encryptor.encrypt({"A": {"deep": [value]}}, _domain(server))
+
+
+@pytest.mark.parametrize("value", [2**63, -(2**63) - 1, 2**64])
+async def test_integer_outside_int64_is_refused_at_encrypt(server, value):
+    with pytest.raises(SopsError, match="64-bit range"):
+        server.encryptor.encrypt({"A": value}, _domain(server))
+
+
+async def test_infinite_number_from_the_cli_is_a_clear_decrypt_error(
+    server, monkeypatch
+):
+    # As the sops CLI would write it: sops-mcp's own encrypt refuses .inf.
     domain = _domain(server)
+    monkeypatch.setattr(sops_module, "_check_numbers", lambda _value: None)
     content = server.encryptor.encrypt({"A": math.inf}, domain)
+    monkeypatch.undo()
     with pytest.raises(SopsError, match="infinite or NaN"):
         server.encryptor.decrypt(content, domain)
+
+
+def test_non_ascii_round_trips_in_an_ascii_locale(age_keys, tmp_path):
+    # Run in a child with the C locale and no UTF-8 mode, where open()
+    # and subprocess text default to ASCII.
+    script = tmp_path / "roundtrip.py"
+    script.write_text(
+        "import sys\n"
+        "from sops_mcp.domains import load_domains\n"
+        "from sops_mcp.sops import SopsEncryptor\n"
+        "domain = load_domains()['default']\n"
+        "enc = SopsEncryptor()\n"
+        "out = enc.decrypt(enc.encrypt({'A': 'caf\\u00e9 \\u2603'}, domain), domain)\n"
+        "assert out == {'A': 'caf\\u00e9 \\u2603'}, out\n"
+    )
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C",
+           "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 async def test_null_exclude_chars_means_no_exclusions(server):

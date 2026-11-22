@@ -102,8 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one. Plaintext now goes to sops with every string quoted and comes back
   as JSON, and sops' YAML is read with YAML 1.2 rules. Wrong-typed
   `charset`, `exclude_chars` or `length` metadata is now a clear
-  `ValueError`, not a `TypeError` (#77). A file holding an infinite or NaN
-  number can't be decrypted any more: quote it with `sops edit`.
+  `ValueError`, not a `TypeError` (#77). Numbers sops can't store exactly
+  (infinity, NaN, integers outside 64 bits) are refused at encrypt, and a
+  file the sops CLI wrote with an infinite or NaN value can't be decrypted
+  any more: quote it with `sops edit`. Plaintext is now read and written
+  as UTF-8 whatever the locale.
 
 - **`initialize` reports sops-mcp's own version.** `serverInfo.version`
   was the `mcp` SDK's version (0.12.0 reported 1.30.0), because the server

@@ -39,10 +39,10 @@ class SopsError(Exception):
 # sops writes unquoted for the strings "=" and "<<", make PyYAML's safe_load
 # fail. So plaintext goes to sops as YAML with every string double-quoted
 # (_QuotedStrDumper: ints, floats, bools and nulls keep their YAML types,
-# which JSON input would turn into float64), comes back as JSON (exact
-# types, nothing to resolve), and the YAML sops writes (the encrypted file,
-# whose `_meta_unencrypted` block is plaintext) is read with the YAML 1.2
-# core schema below (#77).
+# which JSON input would turn into float64), comes back as JSON (nothing
+# to resolve, though an integral float such as 5.0 comes back as int 5),
+# and the YAML sops writes (the encrypted file, whose `_meta_unencrypted`
+# block is plaintext) is read with the YAML 1.2 core schema below (#77).
 _INT_RE = re.compile(r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+")
 _FLOAT_RE = re.compile(
     r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
@@ -112,8 +112,41 @@ def _represent_quoted_str(dumper: yaml.SafeDumper, value: str) -> yaml.Node:
 _QuotedStrDumper.add_representer(str, _represent_quoted_str)
 
 
+_INT64 = range(-(2**63), 2**63)
+
+
+def _check_numbers(value: Any) -> None:
+    """Refuse numbers sops can't store and give back exactly.
+
+    sops keeps ints as int64 (larger ones fail or turn into float64), and
+    decrypting to JSON can't write an infinite or NaN float.
+    """
+    if isinstance(value, dict):
+        for item in value.values():
+            _check_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            _check_numbers(item)
+    elif isinstance(value, bool):
+        return
+    elif isinstance(value, int) and value not in _INT64:
+        raise SopsError(
+            "an integer is outside the 64-bit range sops can store; "
+            "store it as a string"
+        )
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise SopsError(
+            "an infinite or NaN number can't be stored; store it as a string"
+        )
+
+
 def _dump_for_sops(data: Any) -> str:
-    """Plaintext YAML for sops to encrypt, with no ambiguous scalars."""
+    """Plaintext YAML for sops to encrypt, with no ambiguous scalars.
+
+    Raises:
+        SopsError: If a number is one sops can't store exactly.
+    """
+    _check_numbers(data)
     return yaml.dump(
         data,
         Dumper=_QuotedStrDumper,
@@ -464,7 +497,7 @@ class SopsEncryptor:
             os.mkdir(scratch_home, 0o700)
             empty_config = _write_empty_config(tmpdir)
             fd = os.open(tmpfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(plaintext)
 
             result = subprocess.run(
@@ -480,6 +513,7 @@ class SopsEncryptor:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 env=self._child_env(domain, scratch_home, with_keys=False),
                 check=False,
@@ -542,6 +576,7 @@ class SopsEncryptor:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 env=self._child_env(domain, scratch_home, with_keys=True),
                 check=False,
@@ -549,12 +584,14 @@ class SopsEncryptor:
 
             if result.returncode != 0:
                 stderr = result.stderr.strip()
-                if "unsupported value" in stderr:
-                    # Go's JSON encoder has no infinity or NaN.
+                if re.search(r"json: unsupported value: (?:[+-]Inf|NaN)", stderr):
+                    # Go's JSON encoder has no infinity or NaN. Its message
+                    # names only the value kind, never the plaintext.
                     raise SopsError(
                         "sops decrypt failed: the file holds an infinite or "
                         "NaN number, which sops-mcp can't read. Quote it "
-                        "with the sops CLI (sops edit), then try again."
+                        "with the sops CLI (sops edit), then try again. "
+                        f"({stderr})"
                     )
                 raise SopsError(f"sops decrypt failed: {stderr}")
 

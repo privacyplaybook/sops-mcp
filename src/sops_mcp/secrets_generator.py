@@ -31,14 +31,15 @@ CHARSETS = {
 }
 
 
-def _check_charset(charset: str, exclude_chars: str) -> None:
+def _check_charset(charset: str, exclude_chars: str | None) -> None:
     """Refuse a charset or exclusions that aren't strings, or an unknown charset.
 
     Both can come from a file's metadata block, which anything may have
     written: a list or mapping would raise TypeError, and a number would
     be silently wrong (a file written before #77 could store an all-digit
     `exclude_chars` as a number, dropping a leading zero). A null
-    `exclude_chars` (an empty `exclude_chars:` line) means no exclusions.
+    `exclude_chars` (an empty `exclude_chars:` line) means no exclusions;
+    only exclude_chars may be null, as only it has an empty meaning.
     """
     if not isinstance(charset, str):
         raise ValueError(
@@ -59,7 +60,7 @@ def _check_charset(charset: str, exclude_chars: str) -> None:
         )
 
 
-def _alphabet(charset: str, exclude_chars: str = "") -> str:
+def _alphabet(charset: str, exclude_chars: str | None = "") -> str:
     """The characters a secret is drawn from, after exclusions.
 
     Raises:
@@ -78,7 +79,7 @@ def _alphabet(charset: str, exclude_chars: str = "") -> str:
 def entropy_bits(
     length: int,
     charset: str = "alphanumeric",
-    exclude_chars: str = "",
+    exclude_chars: str | None = "",
 ) -> float:
     """Effective entropy of a generated secret: length x log2(alphabet size).
 
@@ -91,7 +92,7 @@ def entropy_bits(
 def entropy_warning(
     length: int,
     charset: str = "alphanumeric",
-    exclude_chars: str = "",
+    exclude_chars: str | None = "",
 ) -> str | None:
     """A warning if a secret with these parameters is weak, else None.
 
@@ -113,7 +114,7 @@ def entropy_warning(
 def generate_secret(
     length: int = 32,
     charset: str = "alphanumeric",
-    exclude_chars: str = "",
+    exclude_chars: str | None = "",
 ) -> str:
     """Generate a cryptographically random secret string.
 
