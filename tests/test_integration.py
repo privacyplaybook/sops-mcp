@@ -1055,8 +1055,10 @@ def test_non_ascii_round_trips_in_an_ascii_locale(age_keys, tmp_path):
         "from sops_mcp.sops import SopsEncryptor\n"
         "domain = load_domains()['default']\n"
         "enc = SopsEncryptor()\n"
-        "out = enc.decrypt(enc.encrypt({'A': 'caf\\u00e9 \\u2603'}, domain), domain)\n"
-        "assert out == {'A': 'caf\\u00e9 \\u2603'}, out\n"
+        "data = {'A': 'caf\\u00e9 \\u2603',\n"
+        "        '_meta_unencrypted': {'note': 'caf\\u00e9'}}\n"
+        "out = enc.decrypt(enc.encrypt(data, domain), domain)\n"
+        "assert out == data, out\n"
     )
     env = {**os.environ, "LC_ALL": "C", "LANG": "C",
            "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}

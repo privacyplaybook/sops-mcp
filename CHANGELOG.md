@@ -104,9 +104,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `charset`, `exclude_chars` or `length` metadata is now a clear
   `ValueError`, not a `TypeError` (#77). Numbers sops can't store exactly
   (infinity, NaN, integers outside 64 bits) are refused when they are new
-  input. A whole-number float already in a file, which sops hands back as
-  a big integer, is written back as the same float, so files #77 already
-  changed can still be edited. A
+  input. A whole-number float beyond the 64-bit integer range already in
+  a file, which sops hands back as a big integer, is written back as the
+  same float, so files #77 already changed can still be edited. Smaller
+  whole-number floats (`1.0`, `8080.0`) are written back as integers, as
+  before. A
   file the sops CLI wrote with an infinite or NaN value can't be decrypted
   any more: quote it with `sops edit`. Plaintext is now read and written
   as UTF-8 whatever the locale.
