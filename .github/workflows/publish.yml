@@ -22,7 +22,12 @@ jobs:
           python-version: "3.13"
       - name: Verify requirements lockfile
         run: python3 lib/verify_requirements.py
-      - name: Verify base images are digest-pinned
+      # cosign is required: lib/verify_base_images.py fails without it,
+      # and fails unless each base image is signed by the identity
+      # pinned for its registry (TRUSTED_SIGNERS).
+      - name: Install cosign
+        uses: ./.github/actions/install-cosign
+      - name: Verify base images are digest-pinned, match the lock, and are signed by Chainguard
         run: python3 lib/verify_base_images.py
       - name: Gate on a clean dependency vulnerability scan
         uses: ./.github/actions/vuln-scan

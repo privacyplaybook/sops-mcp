@@ -3,8 +3,11 @@
 
 Finds all Dockerfiles in the repo, resolves the current digest for each
 base image tag via the registry v2 API, and rewrites FROM lines to include
-@sha256:... digests. Also attempts cosign signature verification for each
-image and records the results in base-images.lock.json.
+@sha256:... digests. Also verifies each digest with cosign against the
+signer pinned for its registry (TRUSTED_SIGNERS in verify_base_images.py)
+and records the results in base-images.lock.json. Exits 1 if any image
+could not be pinned or did not verify: lib/verify_base_images.py would
+fail that lock in CI.
 
 Usage:
     python3 lib/pin_base_images.py          # from repo root
@@ -18,6 +21,9 @@ import subprocess
 import sys
 
 import requests
+
+# Run as `python3 lib/pin_base_images.py`, so lib/ is on sys.path.
+from verify_base_images import cosign_verify
 
 # --- Registry helpers ---
 
@@ -148,24 +154,13 @@ def resolve_digest(image_ref: str) -> str | None:
 # --- Cosign verification ---
 
 def check_cosign(image_with_digest: str) -> tuple[bool, str]:
-    """Attempt keyless cosign verification. Returns (success, details)."""
-    try:
-        result = subprocess.run(
-            [
-                "cosign", "verify",
-                "--certificate-identity-regexp", ".*",
-                "--certificate-oidc-issuer-regexp", ".*",
-                image_with_digest,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            return True, "keyless verification passed"
-        return False, result.stderr.strip().split("\n")[-1] if result.stderr else "unknown error"
-    except FileNotFoundError:
-        return False, "cosign not installed"
-    except subprocess.TimeoutExpired:
-        return False, "verification timed out"
+    """Verify the image against its registry's pinned signer.
+
+    The signer table and the cosign call are verify_base_images's, so the
+    lock records exactly what the CI check later re-verifies. Returns
+    (success, details).
+    """
+    return cosign_verify(image_with_digest)
 
 
 # --- Dockerfile processing ---
@@ -316,8 +311,17 @@ def main():
     signed = sum(1 for v in lock_data.values() if v["cosign_signed"])
     print(f"\nSummary: {pinned}/{total} pinned, {signed}/{total} cosign verified")
 
+    failed = False
     if pinned < total:
-        print("WARNING: Some images could not be pinned!")
+        print("ERROR: Some images could not be pinned!")
+        failed = True
+    if signed < total:
+        print(
+            "ERROR: Some images did not verify against their pinned signer; "
+            "lib/verify_base_images.py will fail this lock. Do not commit it."
+        )
+        failed = True
+    if failed:
         sys.exit(1)
 
 
