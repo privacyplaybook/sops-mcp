@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 
 VALID_SOURCES = ("generated", "external", "derived")
+
+# Where to send a key whose name no metadata entry can take (#72).
+_RENAME_HINT = (
+    "sops_rename_secret, or the sops CLI for a '_'-prefixed or non-string key"
+)
 VALID_CHARSETS = tuple(CHARSETS.keys())
 
 
@@ -1719,8 +1724,9 @@ class SopsMcpServer:
                 "the block, so it would drop them; nothing was changed. "
                 "Describe them with sops_add_metadata (source 'external' "
                 "keeps a value; 'generated' replaces it on rotation), or "
-                "delete them, then rotate again. A '_'-prefixed key can't "
-                "be given an entry: rename or remove it with the sops CLI."
+                "delete them, then rotate again. A key whose name doesn't "
+                "match ^[A-Z][A-Z0-9_]*$ can't be given an entry: rename "
+                f"it first ({_RENAME_HINT})."
             )
 
         now = datetime.now(UTC).isoformat()
@@ -1885,7 +1891,9 @@ class SopsMcpServer:
                 "Note: the _meta_unencrypted block does not describe "
                 f"{len(undescribed)} key(s): {', '.join(undescribed)}. "
                 "sops_rotate_generated refuses this file until they are "
-                "described; describe them with sops_add_metadata."
+                "described; describe them with sops_add_metadata (rename "
+                "any whose name doesn't match ^[A-Z][A-Z0-9_]*$ first: "
+                f"{_RENAME_HINT})."
             )
 
         return _mutation_response(
@@ -1938,14 +1946,14 @@ class SopsMcpServer:
         indescribable = sorted(
             str(k)
             for k in file_keys
-            if not isinstance(k, str) or k.startswith("_")
+            if not isinstance(k, str) or not KEY_NAME_PATTERN.fullmatch(k)
         )
         if indescribable:
             raise ValueError(
                 f"File has {len(indescribable)} root key(s) that no "
                 f"metadata entry can describe: {', '.join(indescribable)}. "
-                "Rename or remove them with the sops CLI first; nothing "
-                "was changed."
+                "Entries need names matching ^[A-Z][A-Z0-9_]*$. Rename them "
+                f"first ({_RENAME_HINT}); nothing was changed."
             )
 
         described = sorted(
@@ -2061,6 +2069,17 @@ class SopsMcpServer:
         # not in the file; an undescribed key's non-mapping entry (a bare
         # name, say) is replaced by its new one.
         meta_secrets = {**existing, **new_entries}
+        # Refuse a block rotation would refuse anyway: a derivation cycle
+        # (a new entry deriving from a key whose entry derives from it, or
+        # two new ones from each other) or a dangling one.
+        try:
+            topological_order(meta_secrets)
+        except ValueError as exc:
+            raise ValueError(
+                f"The resulting metadata would not rotate: {exc}. Nothing "
+                "was changed."
+            ) from exc
+        stale = sorted(str(k) for k in existing if k not in file_keys)
 
         new_data = {
             key: value
@@ -2087,6 +2106,14 @@ class SopsMcpServer:
         if described:
             summary_lines.append(
                 f"Kept existing entries: {', '.join(described)}"
+            )
+        if stale:
+            summary_lines.append(
+                "Note: the block also has entries for key(s) not in the "
+                f"file: {', '.join(stale)}. They were kept. "
+                "sops_rotate_generated refuses an 'external' or 'derived' "
+                "one and re-creates a 'generated' one; remove any you don't "
+                "want with the sops CLI."
             )
 
         return [

@@ -678,3 +678,76 @@ async def test_add_metadata_refuses_a_malformed_block(server):
             "encrypted_content": content,
             "secret_metadata": {"A": {"source": "external"}},
         })
+
+
+async def test_add_metadata_names_a_key_it_cannot_describe(server):
+    """A legacy name an entry can't take is refused up front with the way
+    out (rename), and once renamed the repair works (#72 review)."""
+    domain = _domain(server)
+    legacy = server.encryptor.encrypt(
+        {"db_password": "value-zz97"}, domain, carried={"db_password"}
+    )
+    added = await server._add_secrets({
+        "encrypted_content": legacy,
+        "secrets": [{"key_name": "NEW", "source": "generated"}],
+    })
+    assert "sops_rename_secret" in added[1].text
+    with pytest.raises(ValueError, match="describe: db_password") as e:
+        await server._add_metadata({
+            "encrypted_content": added[0].text,
+            "secret_metadata": {"db_password": {"source": "external"}},
+        })
+    assert "sops_rename_secret" in str(e.value)
+    assert "value-zz97" not in str(e.value)
+
+    renamed = await server._rename_secret({
+        "encrypted_content": added[0].text,
+        "old_name": "db_password",
+        "new_name": "DB_PASSWORD",
+    })
+    repaired = await server._add_metadata({
+        "encrypted_content": renamed[0].text,
+        "secret_metadata": {"DB_PASSWORD": {"source": "external"}},
+    })
+    rotated = await server._rotate_generated(
+        {"encrypted_content": repaired[0].text}
+    )
+    values = server.encryptor.decrypt(rotated[0].text, domain)
+    assert values["DB_PASSWORD"] == "value-zz97"
+
+
+async def test_add_metadata_refuses_a_derivation_cycle(server):
+    """A new derived entry may name a described key, but not one whose
+    entry derives from it: rotation would refuse the result."""
+    domain = _domain(server)
+    legacy = server.encryptor.encrypt({"PW": "value-zz98"}, domain)
+    added = await server._add_secrets({
+        "encrypted_content": legacy,
+        "secrets": [{"key_name": "HASH", "source": "derived",
+                     "transform": "sha256_hex", "from": "PW"}],
+    })
+    with pytest.raises(ValueError, match="would not rotate"):
+        await server._add_metadata({
+            "encrypted_content": added[0].text,
+            "secret_metadata": {
+                "PW": {"source": "derived", "transform": "sha256_hex",
+                       "from": "HASH"},
+            },
+        })
+
+
+async def test_add_metadata_names_stale_entries(server):
+    """An entry for a key no longer in the file is kept (it isn't this
+    tool's to remove) but named, since rotation refuses an external one."""
+    content = await _with_extra(
+        server,
+        {"LEGACY_A": "value-zz99"},
+        {"GONE": {"source": "external"}},
+    )
+    repaired = await server._add_metadata({
+        "encrypted_content": content,
+        "secret_metadata": {"LEGACY_A": {"source": "external"}},
+    })
+    assert "not in the file: GONE" in repaired[1].text
+    block = yaml.safe_load(repaired[0].text)["_meta_unencrypted"]["secrets"]
+    assert block["GONE"] == {"source": "external"}

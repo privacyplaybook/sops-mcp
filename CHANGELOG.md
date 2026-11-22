@@ -103,10 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are kept as they are and never replaced, and a block that already
   describes every key is still refused. `sops_add_secrets` now says when
   the file it returns has keys its block doesn't describe.
+  It also refuses metadata whose derivations would form a cycle, which
+  rotation would refuse anyway.
 - **`sops_add_metadata` no longer drops `_`-prefixed root keys.** No entry
   can describe such a key, and the file used to come back without it. It
-  now refuses the file and names the key; rename or remove it with the
-  sops CLI first.
+  now refuses the file and names the key, as it does any key whose name an
+  entry can't take; rename it first (`sops_rename_secret`, or the sops CLI
+  for a `_`-prefixed key).
 
 ### Security
 
