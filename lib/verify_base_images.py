@@ -6,11 +6,14 @@ neither side has an image the other lacks). A Dependabot base-image PR
 changes only the Dockerfile, so it fails here until the lock is
 regenerated with lib/pin_base_images.py.
 
-Optionally runs cosign verification for images recorded as signed
-in base-images.lock.json.
+Then verifies, with cosign, that every locked digest is signed by the
+identity pinned for its registry (TRUSTED_SIGNERS): for cgr.dev/chainguard,
+Chainguard's release workflow. A missing cosign, an unsigned image, a
+registry with no pinned signer, or a signature from anyone else fails the
+check.
 
-This is a CI check — it validates structure and (when cosign is
-available) provenance. It does NOT re-resolve digests from registries.
+This is a CI check: it validates structure and provenance. It does NOT
+re-resolve tags to digests from registries.
 """
 
 import glob
@@ -32,6 +35,12 @@ FIX_HINT = (
     "Run 'python3 lib/pin_base_images.py' on this branch and commit the "
     "resulting Dockerfile and base-images.lock.json (see \"Base image "
     "updates from Dependabot\" in README.md)."
+)
+COSIGN_HINT = (
+    "Every base image must verify with cosign against the signer pinned for "
+    "its registry (TRUSTED_SIGNERS). Check cosign is on PATH and the "
+    "registry is reachable; if the signature itself fails, do not merge: "
+    "the image is not the one its publisher signed."
 )
 
 
@@ -120,54 +129,110 @@ def check_lock_agreement(root: str) -> list[str]:
     return errors
 
 
-def check_cosign_signatures(root: str) -> list[str]:
-    """Verify cosign signatures for images marked as signed in lock file.
-    Returns list of warnings (non-fatal)."""
-    lock_path = os.path.join(root, "base-images.lock.json")
-    if not os.path.exists(lock_path):
-        return ["base-images.lock.json not found — skipping cosign checks"]
+# The signer each registry's images must carry, as (certificate identity,
+# OIDC issuer). cosign verify takes both exactly, never as regexps, so a
+# signature from any other Sigstore identity fails. A base image from a
+# registry not listed here is refused: there is no signer to pin it to.
+#
+# Chainguard's public images are signed keylessly by the release workflow of
+# chainguard-images/images on main, through GitHub Actions OIDC. Read from
+# the signing certificates of the pinned cgr.dev/chainguard/python digests
+# and of the current :latest and :latest-dev (2026-11-22): `cosign verify
+# --certificate-identity-regexp '.*' --certificate-oidc-issuer-regexp '.*'
+# <image> | jq '.[].optional | {Issuer, Subject}'`. If Chainguard changes
+# its signer, this check fails closed until the pin here is updated.
+# The trailing slash keeps cgr.dev/chainguard-private/... and the like out.
+TRUSTED_SIGNERS = {
+    "cgr.dev/chainguard/": (
+        "https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main",
+        "https://token.actions.githubusercontent.com",
+    ),
+}
 
-    # Check if cosign is available
+COSIGN_TIMEOUT = 60
+
+
+def signer_for(image: str) -> tuple[str, str] | None:
+    """The (identity, issuer) an image must be signed by, or None.
+
+    `image` is a fully qualified reference (registry included), with or
+    without a tag or digest.
+    """
+    for prefix, signer in TRUSTED_SIGNERS.items():
+        if image.startswith(prefix):
+            return signer
+    return None
+
+
+def cosign_verify(image_with_digest: str) -> tuple[bool, str]:
+    """Verify `image_with_digest` was signed by its registry's pinned signer.
+
+    Returns (ok, detail). Never raises for a cosign failure: a missing
+    cosign, a timeout, an unlisted registry and a wrong signer all come
+    back as (False, reason).
+    """
+    signer = signer_for(image_with_digest)
+    if signer is None:
+        return False, (
+            "no pinned signer for this registry (TRUSTED_SIGNERS in "
+            "lib/verify_base_images.py)"
+        )
+    identity, issuer = signer
     try:
-        subprocess.run(["cosign", "version"], capture_output=True, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return ["cosign not available — skipping signature checks"]
-
-    with open(lock_path) as f:
-        lock_data = json.load(f)
-
-    warnings = []
-    for ref, info in lock_data.items():
-        if not info.get("cosign_signed"):
-            continue
-        digest = info.get("digest")
-        if not digest:
-            continue
-
-        # Build the full ref for cosign
-        parts = ref.split("/")
-        if "." not in parts[0] and len(parts) <= 2:
-            # Docker Hub image
-            repo = ref if "/" in ref else f"library/{ref}"
-            cosign_ref = f"docker.io/{repo.split(':')[0]}@{digest}"
-        else:
-            cosign_ref = f"{ref.split(':')[0]}@{digest}"
-
         result = subprocess.run(
             [
                 "cosign", "verify",
-                "--certificate-identity-regexp", ".*",
-                "--certificate-oidc-issuer-regexp", ".*",
-                cosign_ref,
+                "--certificate-identity", identity,
+                "--certificate-oidc-issuer", issuer,
+                image_with_digest,
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=COSIGN_TIMEOUT,
         )
-        if result.returncode != 0:
-            warnings.append(f"Cosign verification FAILED for {ref}: {result.stderr.strip().split(chr(10))[-1]}")
-        else:
-            print(f"  Cosign OK: {ref}")
+    except FileNotFoundError:
+        return False, "cosign not installed"
+    except subprocess.TimeoutExpired:
+        return False, f"verification timed out after {COSIGN_TIMEOUT}s"
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        return False, lines[-1] if lines else f"cosign exited {result.returncode}"
+    return True, f"verified: signed by {identity} (issuer {issuer})"
 
-    return warnings
+
+def _cosign_ref(ref: str, digest: str) -> str:
+    """The fully qualified ref@digest cosign needs for a lock key."""
+    parts = ref.split("/")
+    if "." not in parts[0] and len(parts) <= 2:
+        # Docker Hub image
+        repo = ref if "/" in ref else f"library/{ref}"
+        return f"docker.io/{repo.split(':')[0]}@{digest}"
+    return f"{ref.split(':')[0]}@{digest}"
+
+
+def check_cosign_signatures(root: str) -> list[str]:
+    """Verify every lock entry's digest against its pinned signer.
+
+    Returns a list of errors. Every base image must verify: an entry the
+    lock records as unsigned is an error too, so `"cosign_signed": false`
+    can't be used to skip the check. Runs only once check_lock_agreement
+    has passed, so the lock is a JSON object of entries with digests.
+    """
+    with open(os.path.join(root, LOCK_FILE)) as f:
+        lock_data = json.load(f)
+
+    errors = []
+    for ref, info in sorted(lock_data.items()):
+        if not info.get("cosign_signed"):
+            errors.append(
+                f"{ref}: {LOCK_FILE} records it as not cosign-signed; every "
+                f"base image must carry a signature from its pinned signer"
+            )
+            continue
+        ok, detail = cosign_verify(_cosign_ref(ref, info["digest"]))
+        if ok:
+            print(f"  Cosign OK: {ref} ({detail})")
+        else:
+            errors.append(f"{ref}: cosign verification failed: {detail}")
+    return errors
 
 
 def main(root: str | None = None) -> int:
@@ -198,25 +263,31 @@ def main(root: str | None = None) -> int:
     else:
         print(f"  Dockerfile digests match {LOCK_FILE}.")
 
-    # Check 3: Cosign signatures (advisory for now)
+    # Check 3: Cosign signatures (mandatory). Only once both checks pass:
+    # on a malformed lock this would crash, and on a stale lock or an
+    # unpinned FROM it would verify digests the Dockerfile does not use.
     print("\nChecking cosign signatures...")
-    # Only once both checks pass: on a malformed lock this would crash, and
-    # on a stale lock or an unpinned FROM it would verify digests the
-    # Dockerfile does not use.
     if errors or lock_errors:
-        warnings = ["skipped until the checks above pass"]
+        print("  Skipped until the checks above pass.")
+        cosign_errors = []
     else:
-        warnings = check_cosign_signatures(root)
-    if warnings:
-        for w in warnings:
-            print(f"  WARNING: {w}")
+        cosign_errors = check_cosign_signatures(root)
+        if cosign_errors:
+            for err in cosign_errors:
+                print(f"  ERROR: {err}")
+        else:
+            print("  Every base image is signed by its pinned signer.")
 
-    if errors or lock_errors:
+    if errors or lock_errors or cosign_errors:
         print(
             f"\n{len(errors)} digest pin error(s), "
-            f"{len(lock_errors)} lock mismatch error(s) found."
+            f"{len(lock_errors)} lock mismatch error(s), "
+            f"{len(cosign_errors)} signature error(s) found."
         )
-        print(FIX_HINT)
+        if errors or lock_errors:
+            print(FIX_HINT)
+        else:
+            print(COSIGN_HINT)
         return 1
 
     print("\nAll base image checks passed.")

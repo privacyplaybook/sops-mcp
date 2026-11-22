@@ -154,3 +154,164 @@ def test_pin_error_skips_cosign(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(verifier, "check_cosign_signatures", _cosign)
     assert verifier.main(str(tmp_path)) == 1
+
+
+# --- cosign signer pinning (#66) ---
+
+CHAINGUARD_IDENTITY = (
+    "https://github.com/chainguard-images/images/.github/workflows/"
+    "release.yaml@refs/heads/main"
+)
+GITHUB_OIDC = "https://token.actions.githubusercontent.com"
+
+
+class _FakeCosign:
+    """Stands in for subprocess.run: passes only Chainguard's real signer.
+
+    Records each call, and fails a verify whose identity or issuer flags
+    differ from what Chainguard's certificates carry, as cosign would.
+    """
+
+    def __init__(self, signer=(CHAINGUARD_IDENTITY, GITHUB_OIDC)):
+        self.signer = signer
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        import subprocess
+
+        self.calls.append(args)
+        flags = dict(zip(args[2:-1:2], args[3:-1:2]))
+        ok = (
+            flags.get("--certificate-identity") == self.signer[0]
+            and flags.get("--certificate-oidc-issuer") == self.signer[1]
+            and set(flags) == {"--certificate-identity", "--certificate-oidc-issuer"}
+        )
+        stderr = "" if ok else "error: no matching signatures: none of the expected identities matched"
+        return subprocess.CompletedProcess(args, 0 if ok else 12, "", stderr)
+
+
+def _real_cosign_check():
+    # The autouse fixture stubs check_cosign_signatures out; these tests
+    # exercise the real one, with subprocess.run faked instead.
+    return _load_verifier()
+
+
+def test_chainguard_images_pin_chainguard_signer() -> None:
+    assert verifier.signer_for(f"{RUN}@{D1}") == (CHAINGUARD_IDENTITY, GITHUB_OIDC)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "docker.io/library/python@" + D1,
+        "ghcr.io/chainguard/python@" + D1,
+        "cgr.dev/chainguard-private/python@" + D1,
+        "cgr.dev/other/python@" + D1,
+    ],
+)
+def test_other_registries_have_no_signer(image) -> None:
+    assert verifier.signer_for(image) is None
+
+
+def test_cosign_is_called_with_exact_identity(tmp_path: Path, monkeypatch) -> None:
+    """No regexp flags: the identity and issuer are matched exactly."""
+    v = _real_cosign_check()
+    fake = _FakeCosign()
+    monkeypatch.setattr(v.subprocess, "run", fake)
+    _write(tmp_path, DOCKERFILE, LOCK)
+    assert v.check_cosign_signatures(str(tmp_path)) == []
+    assert len(fake.calls) == 2
+    for args in fake.calls:
+        assert not any("regexp" in a for a in args)
+        assert args[args.index("--certificate-identity") + 1] == CHAINGUARD_IDENTITY
+        assert args[args.index("--certificate-oidc-issuer") + 1] == GITHUB_OIDC
+    assert {a[-1] for a in fake.calls} == {
+        f"cgr.dev/chainguard/python@{D1}",
+        f"cgr.dev/chainguard/python@{D2}",
+    }
+
+
+def test_wrong_signer_fails_the_check(tmp_path: Path, monkeypatch) -> None:
+    """An image signed by anyone but the pinned identity fails main()."""
+    v = _real_cosign_check()
+    monkeypatch.setattr(
+        v.subprocess, "run",
+        _FakeCosign(signer=("https://github.com/evil/images/.github/workflows/release.yaml@refs/heads/main", GITHUB_OIDC)),
+    )
+    _write(tmp_path, DOCKERFILE, LOCK)
+    errors = v.check_cosign_signatures(str(tmp_path))
+    assert len(errors) == 2
+    assert all("no matching signatures" in e for e in errors)
+    assert v.main(str(tmp_path)) == 1
+
+
+def test_wrong_issuer_fails_the_check(tmp_path: Path, monkeypatch) -> None:
+    v = _real_cosign_check()
+    monkeypatch.setattr(
+        v.subprocess, "run",
+        _FakeCosign(signer=(CHAINGUARD_IDENTITY, "https://accounts.google.com")),
+    )
+    _write(tmp_path, DOCKERFILE, LOCK)
+    assert len(v.check_cosign_signatures(str(tmp_path))) == 2
+
+
+def test_unsigned_lock_entry_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    """cosign_signed: false can't be used to skip verification."""
+    v = _real_cosign_check()
+    fake = _FakeCosign()
+    monkeypatch.setattr(v.subprocess, "run", fake)
+    lock = {DEV: _entry(D1), RUN: {**_entry(D2), "cosign_signed": False}}
+    _write(tmp_path, DOCKERFILE, lock)
+    errors = v.check_cosign_signatures(str(tmp_path))
+    assert len(errors) == 1
+    assert RUN in errors[0]
+    assert v.main(str(tmp_path)) == 1
+
+
+def test_unlisted_registry_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    v = _real_cosign_check()
+    fake = _FakeCosign()
+    monkeypatch.setattr(v.subprocess, "run", fake)
+    other = "docker.io/library/python:3.13"
+    _write(tmp_path, f"FROM {other}@{D3}\n", {other: _entry(D3)})
+    errors = v.check_cosign_signatures(str(tmp_path))
+    assert len(errors) == 1
+    assert "no pinned signer" in errors[0]
+    assert fake.calls == []
+    assert v.main(str(tmp_path)) == 1
+
+
+def test_missing_cosign_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    """Without cosign the check fails; it no longer passes with a warning."""
+    v = _real_cosign_check()
+
+    def _missing(args, **kwargs):
+        raise FileNotFoundError("cosign")
+
+    monkeypatch.setattr(v.subprocess, "run", _missing)
+    _write(tmp_path, DOCKERFILE, LOCK)
+    errors = v.check_cosign_signatures(str(tmp_path))
+    assert len(errors) == 2
+    assert all("cosign not installed" in e for e in errors)
+    assert v.main(str(tmp_path)) == 1
+
+
+def test_cosign_timeout_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    v = _real_cosign_check()
+
+    def _slow(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+
+    monkeypatch.setattr(v.subprocess, "run", _slow)
+    _write(tmp_path, DOCKERFILE, LOCK)
+    assert all("timed out" in e for e in v.check_cosign_signatures(str(tmp_path)))
+    assert v.main(str(tmp_path)) == 1
+
+
+def test_pin_script_uses_the_same_signers() -> None:
+    """pin_base_images.py records what verify_base_images.py re-checks."""
+    text = (ROOT / "lib" / "pin_base_images.py").read_text()
+    assert "from verify_base_images import cosign_verify" in text
+    assert "regexp" not in text
