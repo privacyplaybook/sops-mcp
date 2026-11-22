@@ -81,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was built without one. It now passes `sops_mcp.__version__`, read from
   the package metadata, so a client or operator can tell which release is
   running (#37).
+- **`sops_rotate_generated` no longer drops keys its metadata block
+  doesn't describe** (#46). It rebuilds the file from the
+  `_meta_unencrypted` block, so any other key was silently left out of the
+  file it returned. `sops_add_secrets` on a legacy file makes exactly such
+  a file: its new block lists only the added keys. Rotation now refuses
+  such a file and names the undescribed keys (never their values);
+  describe or remove them with the sops CLI, then rotate.
 
 ### Security
 

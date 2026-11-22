@@ -80,7 +80,7 @@ A generated secret's effective entropy is length × log2(charset size, after exc
 
 | Tool | What it does |
 |------|--------------|
-| `sops_rotate_generated` | Regenerate all `generated` secrets. Derived secrets whose source was rotated are recomputed; others are preserved. External secrets are preserved. |
+| `sops_rotate_generated` | Regenerate all `generated` secrets. Derived secrets whose source was rotated are recomputed; others are preserved. External secrets are preserved. Refuses a file holding keys its metadata block doesn't describe, naming them, rather than dropping them. |
 | `sops_add_secrets` | Add new secrets to an existing file. Supports all three sources. Rejects collisions with existing keys. |
 | `sops_update_external` | Replace the value of an `external` secret. Cascades to any derived secrets that reference it. Rejects attempts to update `generated` or `derived`. |
 | `sops_rename_secret` | Rename a key, preserving its value and metadata. Updates `from:` references in any derived secrets. |

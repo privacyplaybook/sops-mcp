@@ -1688,6 +1688,36 @@ class SopsMcpServer:
 
         decrypted = self.encryptor.decrypt(content, domain)
 
+        # The file is rebuilt from the block alone, so a key it doesn't
+        # describe would be silently left out of the result (#46:
+        # sops_add_secrets on a legacy file writes a block listing only the
+        # new keys). Refuse and name them; never values. Every decrypted key
+        # but the block itself counts, '_'-prefixed ones included, since
+        # they would be dropped too. An entry that isn't a mapping doesn't
+        # describe its key: topological_order skips it, so its value would
+        # be dropped as well. Names are stringified because YAML 1.1 loads
+        # keys such as NO or 2024 as bool or int.
+        def _described(key: Any) -> bool:
+            return isinstance(meta_secrets, dict) and isinstance(
+                meta_secrets.get(key), dict
+            )
+
+        undescribed = sorted(
+            str(key)
+            for key in decrypted
+            if key != "_meta_unencrypted" and not _described(key)
+        )
+        if undescribed:
+            raise ValueError(
+                "The _meta_unencrypted block does not describe "
+                f"{len(undescribed)} key(s) in this file: "
+                f"{', '.join(undescribed)}. Rotation rebuilds the file from "
+                "the block, so it would drop them; nothing was changed. "
+                "With the sops CLI, give each one an entry in the block "
+                "(source 'external' keeps its value; 'generated' replaces "
+                "it), or remove it, then rotate again."
+            )
+
         now = datetime.now(UTC).isoformat()
         new_data: dict[str, Any] = {}
         rotated: list[str] = []
