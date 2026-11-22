@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Collection
-from typing import Any, ClassVar
+from typing import Any
 
 import yaml
 
@@ -61,7 +61,8 @@ class SopsYamlLoader(yaml.SafeLoader):
     as strings here is the safe side. A `<<` key is still a merge key.
     """
 
-    yaml_implicit_resolvers: ClassVar[dict] = {}
+    # Emptied, not inherited: only the resolvers added below apply.
+    yaml_implicit_resolvers: dict = {}  # noqa: RUF012 - BaseResolver declares it
 
 
 def _construct_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int:
