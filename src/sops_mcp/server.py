@@ -52,10 +52,20 @@ logger = logging.getLogger(__name__)
 
 VALID_SOURCES = ("generated", "external", "derived")
 
-# Where to send a key whose name no metadata entry can take (#72).
-_RENAME_HINT = (
-    "sops_rename_secret, or the sops CLI for a '_'-prefixed or non-string key"
-)
+def _rename_hint(names: Any) -> str:
+    """Where to send keys whose names no metadata entry can take (#72).
+
+    sops_rename_secret rebuilds the file without '_'-prefixed root keys
+    and fails on a non-string one, so it is offered only when every name
+    is a string without that prefix.
+    """
+    if all(
+        isinstance(n, str) and not n.startswith("_")
+        for n in names
+        if n != "_meta_unencrypted"
+    ):
+        return "with sops_rename_secret"
+    return "with the sops CLI"
 VALID_CHARSETS = tuple(CHARSETS.keys())
 
 
@@ -1726,7 +1736,7 @@ class SopsMcpServer:
                 "keeps a value; 'generated' replaces it on rotation), or "
                 "delete them, then rotate again. A key whose name doesn't "
                 "match ^[A-Z][A-Z0-9_]*$ can't be given an entry: rename "
-                f"it first ({_RENAME_HINT})."
+                f"it first {_rename_hint(decrypted)}."
             )
 
         now = datetime.now(UTC).isoformat()
@@ -1892,8 +1902,8 @@ class SopsMcpServer:
                 f"{len(undescribed)} key(s): {', '.join(undescribed)}. "
                 "sops_rotate_generated refuses this file until they are "
                 "described; describe them with sops_add_metadata (rename "
-                "any whose name doesn't match ^[A-Z][A-Z0-9_]*$ first: "
-                f"{_RENAME_HINT})."
+                "any whose name doesn't match ^[A-Z][A-Z0-9_]*$ first, "
+                f"{_rename_hint(decrypted)})."
             )
 
         return _mutation_response(
@@ -1953,7 +1963,7 @@ class SopsMcpServer:
                 f"File has {len(indescribable)} root key(s) that no "
                 f"metadata entry can describe: {', '.join(indescribable)}. "
                 "Entries need names matching ^[A-Z][A-Z0-9_]*$. Rename them "
-                f"first ({_RENAME_HINT}); nothing was changed."
+                f"first, {_rename_hint(file_keys)}; nothing was changed."
             )
 
         described = sorted(
@@ -2035,15 +2045,6 @@ class SopsMcpServer:
                         f"{from_key!r} is not in the file"
                     )
 
-        # A legacy file has no block to read a domain hint from, so its
-        # domain comes from the argument or the default. A partial block's
-        # hint is used like any other tool's: _check_recipients is what
-        # makes trusting it safe.
-        domain = self._resolve_domain(arguments, meta if has_block else None)
-        self._check_recipients(content, domain)
-
-        decrypted = self.encryptor.decrypt(content, domain)
-
         now = datetime.now(UTC).isoformat()
         new_entries: dict[str, Any] = {}
         for key_name, meta_in in secret_metadata.items():
@@ -2069,16 +2070,37 @@ class SopsMcpServer:
         # not in the file; an undescribed key's non-mapping entry (a bare
         # name, say) is replaced by its new one.
         meta_secrets = {**existing, **new_entries}
-        # Refuse a block rotation would refuse anyway: a derivation cycle
-        # (a new entry deriving from a key whose entry derives from it, or
-        # two new ones from each other) or a dangling one.
+        # Refuse a derivation cycle this call would create (a new entry
+        # deriving from a key whose entry derives from it, or two new ones
+        # from each other): rotation would refuse the result. A problem the
+        # existing block already had isn't this call's; it is only named.
+        # The baseline counts the keys described here as present (a partial
+        # block's derived entry may name one), but not as deriving.
         try:
-            topological_order(meta_secrets)
+            topological_order({
+                **existing,
+                **{k: {"source": "external"} for k in new_entries},
+            })
+            existing_problem = ""
         except ValueError as exc:
-            raise ValueError(
-                f"The resulting metadata would not rotate: {exc}. Nothing "
-                "was changed."
-            ) from exc
+            existing_problem = str(exc)
+        if not existing_problem:
+            try:
+                topological_order(meta_secrets)
+            except ValueError as exc:
+                raise ValueError(
+                    f"The resulting metadata would not rotate: {exc}. "
+                    "Nothing was changed."
+                ) from exc
+        # A legacy file has no block to read a domain hint from, so its
+        # domain comes from the argument or the default. A partial block's
+        # hint is used like any other tool's: _check_recipients is what
+        # makes trusting it safe.
+        domain = self._resolve_domain(arguments, meta if has_block else None)
+        self._check_recipients(content, domain)
+
+        decrypted = self.encryptor.decrypt(content, domain)
+
         stale = sorted(str(k) for k in existing if k not in file_keys)
 
         new_data = {
@@ -2111,9 +2133,16 @@ class SopsMcpServer:
             summary_lines.append(
                 "Note: the block also has entries for key(s) not in the "
                 f"file: {', '.join(stale)}. They were kept. "
-                "sops_rotate_generated refuses an 'external' or 'derived' "
-                "one and re-creates a 'generated' one; remove any you don't "
-                "want with the sops CLI."
+                "sops_rotate_generated refuses an 'external' one, re-creates "
+                "a 'generated' one, and re-creates a 'derived' one when its "
+                "source rotates (refusing it otherwise); remove any you "
+                "don't want with the sops CLI."
+            )
+        if existing_problem:
+            summary_lines.append(
+                "Note: the existing metadata already fails rotation's "
+                f"derivation check ({existing_problem}); fix it with the "
+                "sops CLI."
             )
 
         return [

@@ -751,3 +751,63 @@ async def test_add_metadata_names_stale_entries(server):
     assert "not in the file: GONE" in repaired[1].text
     block = yaml.safe_load(repaired[0].text)["_meta_unencrypted"]["secrets"]
     assert block["GONE"] == {"source": "external"}
+
+
+async def test_add_metadata_refuses_two_new_entries_deriving_from_each_other(
+    server,
+):
+    legacy = server.encryptor.encrypt({"A": "va", "B": "vb"}, _domain(server))
+    with pytest.raises(ValueError, match="would not rotate"):
+        await server._add_metadata({
+            "encrypted_content": legacy,
+            "secret_metadata": {
+                "A": {"source": "derived", "transform": "sha256_hex",
+                      "from": "B"},
+                "B": {"source": "derived", "transform": "sha256_hex",
+                      "from": "A"},
+            },
+        })
+
+
+async def test_add_metadata_names_but_accepts_an_existing_dangling_entry(
+    server,
+):
+    """A derivation the block already got wrong isn't this call's to
+    refuse: the repair goes ahead, and the summary names the problem."""
+    content = await _with_extra(
+        server,
+        {"LEGACY_A": "value-zz99"},
+        {"X": {"source": "derived",
+               "derivation": {"transform": "sha256_hex", "from": "GONE"}}},
+    )
+    repaired = await server._add_metadata({
+        "encrypted_content": content,
+        "secret_metadata": {"LEGACY_A": {"source": "external"}},
+    })
+    assert "already fails rotation's derivation check" in repaired[1].text
+    assert "X" in yaml.safe_load(repaired[0].text)["_meta_unencrypted"][
+        "secrets"
+    ]
+
+
+async def test_rename_hint_avoids_rename_when_underscore_keys_exist(server):
+    """sops_rename_secret drops '_'-prefixed keys, so it isn't offered for
+    a file that holds one."""
+    content = server.encryptor.encrypt(
+        {"db_password": "value-zz97", "_note": "value-zz94"},
+        _domain(server),
+        carried={"db_password", "_note"},
+    )
+    with pytest.raises(ValueError, match="sops CLI") as e:
+        await server._add_metadata({
+            "encrypted_content": content,
+            "secret_metadata": {"DB": {"source": "external"}},
+        })
+    assert "sops_rename_secret" not in str(e.value)
+
+
+async def test_rotate_refusal_offers_rename_for_a_plain_bad_name(server):
+    content = await _with_extra(server, {"db_password": "value-zz97"})
+    with pytest.raises(ValueError, match="does not describe") as e:
+        await server._rotate_generated({"encrypted_content": content})
+    assert "with sops_rename_secret" in str(e.value)
