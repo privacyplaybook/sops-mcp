@@ -198,8 +198,11 @@ class _FakeCosign:
 
 def _real_cosign_check():
     # The autouse fixture stubs check_cosign_signatures out; these tests
-    # exercise the real one, with subprocess.run faked instead.
-    return _load_verifier()
+    # exercise the real one, with subprocess.run faked instead, and
+    # without sleeping between retries.
+    v = _load_verifier()
+    v.time = type("_NoSleep", (), {"sleep": staticmethod(lambda s: None)})
+    return v
 
 
 def test_chainguard_images_pin_chainguard_signer() -> None:
@@ -390,3 +393,71 @@ def test_success_detail_names_no_identity(monkeypatch) -> None:
     ok, detail = v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")
     assert ok
     assert "https://" not in detail
+
+
+def test_multiline_wrong_signer_is_not_retried(monkeypatch) -> None:
+    """Several signatures: cosign's last stderr line lacks the prefix."""
+    import subprocess
+
+    v = _real_cosign_check()
+    calls = []
+
+    def _two_sigs(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 12, "", (
+            "Error: no matching signatures:\n"
+            "  none of the expected identities matched what was in the "
+            "certificate, got subjects [a]\n"
+            "  none of the expected identities matched what was in the "
+            "certificate, got subjects [b]\n"
+        ))
+
+    monkeypatch.setattr(v.subprocess, "run", _two_sigs)
+    ok, _ = v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")
+    assert not ok
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "stderr", ["Error: no signatures found", "MANIFEST_UNKNOWN: manifest unknown"]
+)
+def test_unsigned_or_missing_image_is_not_retried(monkeypatch, stderr) -> None:
+    import subprocess
+
+    v = _real_cosign_check()
+    calls = []
+
+    def _final(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "", stderr)
+
+    monkeypatch.setattr(v.subprocess, "run", _final)
+    assert not v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")[0]
+    assert len(calls) == 1
+
+
+def test_retries_wait_between_attempts(monkeypatch) -> None:
+    import subprocess
+
+    v = _real_cosign_check()
+    slept = []
+    v.time = type("_Rec", (), {"sleep": staticmethod(slept.append)})
+    monkeypatch.setattr(
+        v.subprocess, "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 1, "", "Error: 503"),
+    )
+    assert not v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")[0]
+    assert slept == list(v.RETRY_DELAYS)
+
+
+def test_only_unsigned_prints_no_contradicting_hint(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    v = _real_cosign_check()
+    monkeypatch.setattr(v.subprocess, "run", _FakeCosign())
+    lock = {DEV: _entry(D1), RUN: {**_entry(D2), "cosign_signed": False}}
+    _write(tmp_path, DOCKERFILE, lock)
+    assert v.main(str(tmp_path)) == 1
+    out = capsys.readouterr().out
+    assert "lib/pin_base_images.py" in out
+    assert v.COSIGN_HINT not in out

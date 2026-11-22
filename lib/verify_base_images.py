@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 FROM_RE = re.compile(
     r"^FROM\s+(\S+)",
@@ -151,10 +152,19 @@ TRUSTED_SIGNERS = {
 
 COSIGN_TIMEOUT = 60
 # The check reaches cgr.dev, Rekor and Sigstore's TUF CDN on every PR, so a
-# timeout or other non-signature failure is retried; a signature that
-# doesn't match the pinned signer is not.
-COSIGN_ATTEMPTS = 3
-NO_MATCH = "no matching signatures"
+# timeout or network failure is retried after RETRY_DELAYS seconds; a
+# FINAL_ERRORS answer is not.
+RETRY_DELAYS = (2, 5)
+COSIGN_ATTEMPTS = len(RETRY_DELAYS) + 1
+# cosign errors that are a final answer, not a network blip: a signature
+# that isn't the pinned signer's, no signature at all, or no such digest.
+# Retrying won't change them. Matched anywhere in stderr, since with several
+# signatures cosign puts per-signature errors on later lines.
+FINAL_ERRORS = (
+    "no matching signatures",
+    "no signatures found",
+    "MANIFEST_UNKNOWN",
+)
 UNSIGNED = "records it as not cosign-signed"
 
 
@@ -191,7 +201,9 @@ def cosign_verify(image_with_digest: str) -> tuple[bool, str]:
         image_with_digest,
     ]
     detail = ""
-    for _attempt in range(COSIGN_ATTEMPTS):
+    for attempt in range(COSIGN_ATTEMPTS):
+        if attempt:
+            time.sleep(RETRY_DELAYS[attempt - 1])
         try:
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=COSIGN_TIMEOUT,
@@ -207,9 +219,7 @@ def cosign_verify(image_with_digest: str) -> tuple[bool, str]:
             return True, "verified against the pinned signer"
         lines = result.stderr.strip().splitlines()
         detail = lines[-1] if lines else f"cosign exited {result.returncode}"
-        if NO_MATCH in detail:
-            # A real answer, not a network blip: the signature is not the
-            # pinned signer's, and retrying won't change that.
+        if any(e in result.stderr for e in FINAL_ERRORS):
             break
     return False, detail
 
@@ -300,9 +310,17 @@ def main(root: str | None = None) -> int:
             f"{len(lock_errors)} lock mismatch error(s), "
             f"{len(cosign_errors)} signature error(s) found."
         )
-        if errors or lock_errors or any(UNSIGNED in e for e in cosign_errors):
+        only_unsigned = cosign_errors and all(
+            UNSIGNED in e for e in cosign_errors
+        )
+        if errors or lock_errors or only_unsigned:
             print(FIX_HINT)
-        if cosign_errors:
+        if only_unsigned:
+            print(
+                "If the regenerated lock still records an image as unsigned, "
+                "do not merge: it did not verify against its pinned signer."
+            )
+        elif cosign_errors:
             print(COSIGN_HINT)
         return 1
 
