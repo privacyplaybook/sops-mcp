@@ -116,6 +116,19 @@ _QuotedStrDumper.add_representer(str, _represent_quoted_str)
 _INT64 = range(-(2**63), 2**63)
 
 
+def _parse_stored_int(text: str) -> int | float:
+    """Read an integer from sops' decrypted JSON as the value sops holds.
+
+    sops keeps an int as int64, so a JSON integer outside that range is a
+    float64 that Go wrote without an exponent (1.2345678901234567e+19 comes
+    out as 12345678901234567000). Read back as a float it is that same
+    float64, and re-encrypting it writes the stored value unchanged instead
+    of an int that `_check_numbers` refuses as new input.
+    """
+    value = int(text)
+    return value if value in _INT64 else float(text)
+
+
 def _check_numbers(value: Any) -> None:
     """Refuse numbers sops can't store and give back exactly.
 
@@ -597,7 +610,9 @@ class SopsEncryptor:
                 raise SopsError(f"sops decrypt failed: {stderr}")
 
             try:
-                return json.loads(result.stdout) or {}
+                return json.loads(
+                    result.stdout, parse_int=_parse_stored_int
+                ) or {}
             except json.JSONDecodeError:
                 # Not chained or echoed: the text is decrypted plaintext.
                 raise SopsError(

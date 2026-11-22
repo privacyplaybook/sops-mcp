@@ -957,6 +957,82 @@ async def test_integer_outside_int64_is_refused_at_encrypt(server, value):
         server.encryptor.encrypt({"A": value}, _domain(server))
 
 
+# A stored integral float outside int64, which sops' JSON writes as a bare
+# integer: what #77 made of the external value "012345678901234567890".
+_STORED_BIG = 1.2345678901234567e19
+
+
+async def test_stored_big_float_survives_an_update_of_another_key(server):
+    domain = _domain(server)
+    created = await server._create_secrets({
+        "secrets": [
+            {"key_name": "PIN", "source": "external", "value": "x"},
+            {"key_name": "OTHER", "source": "external", "value": "x"},
+        ]
+    })
+    values = server.encryptor.decrypt(created[0].text, domain)
+    values["PIN"] = _STORED_BIG
+    content = server.encryptor.encrypt(values, domain)
+
+    updated = await server._update_external({
+        "encrypted_content": content, "key_name": "OTHER", "value": "y",
+    })
+    after = server.encryptor.decrypt(updated[0].text, domain)
+    assert after["OTHER"] == "y"
+    assert after["PIN"] == _STORED_BIG
+    assert type(after["PIN"]) is float
+
+
+def _sops_cli_encrypt(plaintext, domain, tmp_path):
+    """Encrypt plaintext YAML with the sops CLI, as a user would."""
+    plain = tmp_path / "plain.yaml"
+    plain.write_text(plaintext)
+    config = tmp_path / "empty-sops-config.yaml"
+    config.write_text("")
+    return subprocess.run(
+        ["sops", "--config", str(config), "encrypt",
+         "--age", domain.age_argument, "--input-type", "yaml",
+         "--output-type", "yaml", str(plain)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
+async def test_cli_file_with_a_big_integer_can_still_be_added_to(
+    server, tmp_path
+):
+    # Written by the sops CLI, which stores 99999999999999999999 as the
+    # float64 1e+20.
+    domain = _domain(server)
+    content = _sops_cli_encrypt(
+        "BIG: 99999999999999999999\nOTHER: x\n", domain, tmp_path
+    )
+    before = server.encryptor.decrypt(content, domain)["BIG"]
+    assert before == 1e20
+
+    # No metadata block, so add a key rather than update one.
+    updated = await server._add_secrets({
+        "encrypted_content": content,
+        "secrets": [{"key_name": "NEW", "source": "external", "value": "y"}],
+    })
+    after = server.encryptor.decrypt(updated[0].text, domain)
+    assert after["NEW"] == "y"
+    assert after["OTHER"] == "x"
+    assert after["BIG"] == before
+    assert type(after["BIG"]) is float
+
+
+async def test_new_integer_outside_int64_is_still_refused_with_a_stored_one(
+    server,
+):
+    # Stored values pass through; an integer the caller adds does not.
+    domain = _domain(server)
+    content = server.encryptor.encrypt({"PIN": _STORED_BIG}, domain)
+    values = server.encryptor.decrypt(content, domain)
+    values["NEW"] = 2**63
+    with pytest.raises(SopsError, match="64-bit range"):
+        server.encryptor.encrypt(values, domain)
+
+
 async def test_infinite_number_from_the_cli_is_a_clear_decrypt_error(
     server, monkeypatch
 ):
