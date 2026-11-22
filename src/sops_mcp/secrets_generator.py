@@ -37,13 +37,14 @@ def _check_charset(charset: str, exclude_chars: str) -> None:
     Both can come from a file's metadata block, which anything may have
     written: a list or mapping would raise TypeError, and a number would
     be silently wrong (a file written before #77 could store an all-digit
-    `exclude_chars` as a number, dropping a leading zero).
+    `exclude_chars` as a number, dropping a leading zero). A null
+    `exclude_chars` (an empty `exclude_chars:` line) means no exclusions.
     """
     if not isinstance(charset, str):
         raise ValueError(
             f"charset must be a string, got {type(charset).__name__}"
         )
-    if not isinstance(exclude_chars, str):
+    if exclude_chars is not None and not isinstance(exclude_chars, str):
         raise ValueError(
             f"exclude_chars must be a string, got "
             f"{type(exclude_chars).__name__}. A file written by sops-mcp "

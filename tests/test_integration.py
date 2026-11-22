@@ -3,6 +3,7 @@ throwaway age keypair. Requires `sops` and `age-keygen` on PATH.
 """
 
 import hashlib
+import math
 import subprocess
 
 import pytest
@@ -10,7 +11,7 @@ import yaml
 
 from sops_mcp.domains import load_domains
 from sops_mcp.server import SopsMcpServer
-from sops_mcp.sops import SopsEncryptor
+from sops_mcp.sops import SopsEncryptor, SopsError
 
 
 def _require(binary: str) -> None:
@@ -922,3 +923,41 @@ async def test_numeric_exclude_chars_from_an_old_file_is_a_clear_error(server):
     content = server.encryptor.encrypt(values, domain)
     with pytest.raises(ValueError, match="exclude_chars must be a string"):
         await server._rotate_generated({"encrypted_content": content})
+
+
+# --- Numbers keep their exact value and type through sops (#84 review) ---
+
+
+async def test_integers_keep_exact_value_and_type(server):
+    domain = _domain(server)
+    big = 2**53 + 1  # a float64 would round it
+    data = {"BIG": big, "MAX": 2**63 - 1, "PORT": 8080, "RATIO": 0.5,
+            "FLAG": True, "NOTHING": None, "TEXT": "0189"}
+    content = server.encryptor.encrypt(data, domain)
+    assert "type:int" in content
+    assert "type:float" in content
+    values = server.encryptor.decrypt(content, domain)
+    for key, expected in data.items():
+        assert values[key] == expected
+        assert type(values[key]) is type(expected)
+
+
+async def test_infinite_number_is_a_clear_decrypt_error(server):
+    domain = _domain(server)
+    content = server.encryptor.encrypt({"A": math.inf}, domain)
+    with pytest.raises(SopsError, match="infinite or NaN"):
+        server.encryptor.decrypt(content, domain)
+
+
+async def test_null_exclude_chars_means_no_exclusions(server):
+    domain = _domain(server)
+    created = await server._create_secrets({
+        "secrets": [{"key_name": "S", "source": "generated", "length": 8}]
+    })
+    values = server.encryptor.decrypt(created[0].text, domain)
+    values["_meta_unencrypted"]["secrets"]["S"]["generation"][
+        "exclude_chars"
+    ] = None
+    content = server.encryptor.encrypt(values, domain)
+    rotated = await server._rotate_generated({"encrypted_content": content})
+    assert len(server.encryptor.decrypt(rotated[0].text, domain)["S"]) == 8

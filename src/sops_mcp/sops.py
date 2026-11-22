@@ -34,13 +34,15 @@ class SopsError(Exception):
 
 # sops reads and writes YAML 1.2 (Go), and PyYAML speaks YAML 1.1. The two
 # disagree about plain scalars: `0189`, `1e3`, `0o17` and `0123456789` are
-# strings to PyYAML, so yaml.dump leaves them unquoted, and numbers to sops,
-# which then stores them as numbers; `=` and `!!merge <<`, which sops writes
-# unquoted for the strings "=" and "<<", make PyYAML's safe_load fail. So
-# plaintext goes to and comes back from sops as JSON, which has no implicit
-# types, and the YAML sops writes (the encrypted file, whose
-# `_meta_unencrypted` block is plaintext) is read with the YAML 1.2 core
-# schema below (#77).
+# strings to PyYAML, so a plain yaml.dump leaves them unquoted, and numbers
+# to sops, which then stores them as numbers; `=` and `!!merge <<`, which
+# sops writes unquoted for the strings "=" and "<<", make PyYAML's safe_load
+# fail. So plaintext goes to sops as YAML with every string double-quoted
+# (_QuotedStrDumper: ints, floats, bools and nulls keep their YAML types,
+# which JSON input would turn into float64), comes back as JSON (exact
+# types, nothing to resolve), and the YAML sops writes (the encrypted file,
+# whose `_meta_unencrypted` block is plaintext) is read with the YAML 1.2
+# core schema below (#77).
 _INT_RE = re.compile(r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+")
 _FLOAT_RE = re.compile(
     r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
@@ -49,11 +51,14 @@ _FLOAT_RE = re.compile(
 
 
 class SopsYamlLoader(yaml.SafeLoader):
-    """A safe loader with the YAML 1.2 core schema, as sops resolves it.
+    """A safe loader with the YAML 1.2 core schema.
 
-    Plain scalars resolve only to null, bool, int and float as YAML 1.2
-    defines them, and to str otherwise: no YAML 1.1 `yes`/`on` booleans,
-    sexagesimals, timestamps, `=` or `<<` merge keys.
+    Plain scalars resolve only to null, bool, int and float as the YAML 1.2
+    core schema defines them, and to str otherwise: no YAML 1.1 `yes`/`on`
+    booleans, sexagesimals, timestamps or `=`. sops' own resolver (Go
+    yaml.v3) accepts a little more as numbers (`0b101`, `1_000`, and `0123`
+    as octal), so it quotes those strings when it writes them; reading them
+    as strings here is the safe side. A `<<` key is still a merge key.
     """
 
     yaml_implicit_resolvers: ClassVar[dict] = {}
@@ -93,6 +98,30 @@ SopsYamlLoader.add_constructor("tag:yaml.org,2002:float", _construct_float)
 # sops writes the string "<<" as `!!merge <<`. As a value it is that string;
 # SafeLoader still treats a `<<` *key* as a merge.
 SopsYamlLoader.add_constructor("tag:yaml.org,2002:merge", _construct_str)
+
+
+class _QuotedStrDumper(yaml.SafeDumper):
+    """A safe dumper that writes every string double-quoted, so neither
+    YAML 1.1 nor 1.2 can read one as anything else."""
+
+
+def _represent_quoted_str(dumper: yaml.SafeDumper, value: str) -> yaml.Node:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style='"')
+
+
+_QuotedStrDumper.add_representer(str, _represent_quoted_str)
+
+
+def _dump_for_sops(data: Any) -> str:
+    """Plaintext YAML for sops to encrypt, with no ambiguous scalars."""
+    return yaml.dump(
+        data,
+        Dumper=_QuotedStrDumper,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+        width=math.inf,
+    )
 
 
 def load_sops_yaml(content: str) -> Any:
@@ -419,8 +448,8 @@ class SopsEncryptor:
             # metadata block. A manifest (encrypted_regex) has its own root
             # keys, and its caller validates the keys under stringData.
             _check_flat_root_keys(data, carried)
-        # JSON, not YAML: see SopsYamlLoader. sops still writes YAML.
-        plaintext = json.dumps(data, allow_nan=False)
+        # Every string quoted: see SopsYamlLoader.
+        plaintext = _dump_for_sops(data)
         # sops refuses more than one encryption-mode flag, so exactly one.
         mode = (
             ["--encrypted-regex", encrypted_regex]
@@ -428,7 +457,7 @@ class SopsEncryptor:
             else ["--unencrypted-suffix", UNENCRYPTED_SUFFIX]
         )
         tmpdir = _make_secure_tempdir()
-        tmpfile = os.path.join(tmpdir, "secrets.json")
+        tmpfile = os.path.join(tmpdir, "secrets.yaml")
         scratch_home = os.path.join(tmpdir, "home")
 
         try:
@@ -445,7 +474,7 @@ class SopsEncryptor:
                     "encrypt",
                     "--age", domain.age_argument,
                     *mode,
-                    "--input-type", "json",
+                    "--input-type", "yaml",
                     "--output-type", "yaml",
                     tmpfile,
                 ],
@@ -519,7 +548,15 @@ class SopsEncryptor:
             )
 
             if result.returncode != 0:
-                raise SopsError(f"sops decrypt failed: {result.stderr.strip()}")
+                stderr = result.stderr.strip()
+                if "unsupported value" in stderr:
+                    # Go's JSON encoder has no infinity or NaN.
+                    raise SopsError(
+                        "sops decrypt failed: the file holds an infinite or "
+                        "NaN number, which sops-mcp can't read. Quote it "
+                        "with the sops CLI (sops edit), then try again."
+                    )
+                raise SopsError(f"sops decrypt failed: {stderr}")
 
             try:
                 return json.loads(result.stdout) or {}
