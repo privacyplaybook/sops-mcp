@@ -163,6 +163,9 @@ CHAINGUARD_IDENTITY = (
     "release.yaml@refs/heads/main"
 )
 GITHUB_OIDC = "https://token.actions.githubusercontent.com"
+EVIL_IDENTITY = (
+    "https://github.com/evil/images/.github/workflows/release.yaml@refs/heads/main"
+)
 
 
 class _FakeCosign:
@@ -180,13 +183,16 @@ class _FakeCosign:
         import subprocess
 
         self.calls.append(args)
-        flags = dict(zip(args[2:-1:2], args[3:-1:2]))
+        flags = dict(zip(args[2:-1:2], args[3:-1:2], strict=True))
         ok = (
             flags.get("--certificate-identity") == self.signer[0]
             and flags.get("--certificate-oidc-issuer") == self.signer[1]
             and set(flags) == {"--certificate-identity", "--certificate-oidc-issuer"}
         )
-        stderr = "" if ok else "error: no matching signatures: none of the expected identities matched"
+        stderr = "" if ok else (
+            "error: no matching signatures: "
+            "none of the expected identities matched"
+        )
         return subprocess.CompletedProcess(args, 0 if ok else 12, "", stderr)
 
 
@@ -236,7 +242,7 @@ def test_wrong_signer_fails_the_check(tmp_path: Path, monkeypatch) -> None:
     v = _real_cosign_check()
     monkeypatch.setattr(
         v.subprocess, "run",
-        _FakeCosign(signer=("https://github.com/evil/images/.github/workflows/release.yaml@refs/heads/main", GITHUB_OIDC)),
+        _FakeCosign(signer=(EVIL_IDENTITY, GITHUB_OIDC)),
     )
     _write(tmp_path, DOCKERFILE, LOCK)
     errors = v.check_cosign_signatures(str(tmp_path))
@@ -315,3 +321,72 @@ def test_pin_script_uses_the_same_signers() -> None:
     text = (ROOT / "lib" / "pin_base_images.py").read_text()
     assert "from verify_base_images import cosign_verify" in text
     assert "regexp" not in text
+
+
+def test_transient_failure_is_retried(tmp_path: Path, monkeypatch) -> None:
+    """A timeout or network error is retried; the second try can pass."""
+    import subprocess
+
+    v = _real_cosign_check()
+    fake = _FakeCosign()
+    failures = {"left": 2}
+
+    def _flaky(args, **kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            if failures["left"]:
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+            return subprocess.CompletedProcess(args, 1, "", "Error: Rekor 503")
+        return fake(args, **kwargs)
+
+    monkeypatch.setattr(v.subprocess, "run", _flaky)
+    ok, detail = v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")
+    assert ok, detail
+    assert len(fake.calls) == 1
+
+
+def test_wrong_signer_is_not_retried(monkeypatch) -> None:
+    v = _real_cosign_check()
+    fake = _FakeCosign(signer=(EVIL_IDENTITY, GITHUB_OIDC))
+    monkeypatch.setattr(v.subprocess, "run", fake)
+    ok, _ = v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")
+    assert not ok
+    assert len(fake.calls) == 1
+
+
+def test_persistent_network_failure_fails(monkeypatch) -> None:
+    import subprocess
+
+    v = _real_cosign_check()
+    calls = []
+
+    def _down(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "Error: Rekor 503")
+
+    monkeypatch.setattr(v.subprocess, "run", _down)
+    ok, detail = v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")
+    assert not ok
+    assert "503" in detail
+    assert len(calls) == v.COSIGN_ATTEMPTS
+
+
+def test_unsigned_entry_points_at_pin_script(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The fix for a lock recorded unsigned is regenerating it."""
+    v = _real_cosign_check()
+    monkeypatch.setattr(v.subprocess, "run", _FakeCosign())
+    lock = {DEV: _entry(D1), RUN: {**_entry(D2), "cosign_signed": False}}
+    _write(tmp_path, DOCKERFILE, lock)
+    assert v.main(str(tmp_path)) == 1
+    assert "lib/pin_base_images.py" in capsys.readouterr().out
+
+
+def test_success_detail_names_no_identity(monkeypatch) -> None:
+    """The printed detail carries no identity or issuer (CodeQL, PR #80)."""
+    v = _real_cosign_check()
+    monkeypatch.setattr(v.subprocess, "run", _FakeCosign())
+    ok, detail = v.cosign_verify(f"cgr.dev/chainguard/python@{D1}")
+    assert ok
+    assert "https://" not in detail

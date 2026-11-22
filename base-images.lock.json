@@ -1,6 +1,6 @@
 {
   "cgr.dev/chainguard/python:latest": {
-    "cosign_detail": "keyless verification passed",
+    "cosign_detail": "verified against the pinned signer",
     "cosign_signed": true,
     "digest": "sha256:f6e5c2e056393d48fa8afa1ea58a1394db4cd5de1a8f0f48105c8e88fcd4f9d3",
     "used_in": [
@@ -8,7 +8,7 @@
     ]
   },
   "cgr.dev/chainguard/python:latest-dev": {
-    "cosign_detail": "keyless verification passed",
+    "cosign_detail": "verified against the pinned signer",
     "cosign_signed": true,
     "digest": "sha256:c047e6d1e47b09144a771bfde6595a00c49dc8571caa7dd62df88634e84304ae",
     "used_in": [

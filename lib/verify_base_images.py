@@ -150,6 +150,12 @@ TRUSTED_SIGNERS = {
 }
 
 COSIGN_TIMEOUT = 60
+# The check reaches cgr.dev, Rekor and Sigstore's TUF CDN on every PR, so a
+# timeout or other non-signature failure is retried; a signature that
+# doesn't match the pinned signer is not.
+COSIGN_ATTEMPTS = 3
+NO_MATCH = "no matching signatures"
+UNSIGNED = "records it as not cosign-signed"
 
 
 def signer_for(image: str) -> tuple[str, str] | None:
@@ -178,24 +184,34 @@ def cosign_verify(image_with_digest: str) -> tuple[bool, str]:
             "lib/verify_base_images.py)"
         )
     identity, issuer = signer
-    try:
-        result = subprocess.run(
-            [
-                "cosign", "verify",
-                "--certificate-identity", identity,
-                "--certificate-oidc-issuer", issuer,
-                image_with_digest,
-            ],
-            capture_output=True, text=True, timeout=COSIGN_TIMEOUT,
-        )
-    except FileNotFoundError:
-        return False, "cosign not installed"
-    except subprocess.TimeoutExpired:
-        return False, f"verification timed out after {COSIGN_TIMEOUT}s"
-    if result.returncode != 0:
+    args = [
+        "cosign", "verify",
+        "--certificate-identity", identity,
+        "--certificate-oidc-issuer", issuer,
+        image_with_digest,
+    ]
+    detail = ""
+    for _attempt in range(COSIGN_ATTEMPTS):
+        try:
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=COSIGN_TIMEOUT,
+            )
+        except FileNotFoundError:
+            return False, "cosign not installed"
+        except subprocess.TimeoutExpired:
+            detail = f"verification timed out after {COSIGN_TIMEOUT}s"
+            continue
+        if result.returncode == 0:
+            # The identity is not in the detail: it is printed, and CodeQL
+            # reads the issuer URL as a secret (clear-text logging).
+            return True, "verified against the pinned signer"
         lines = result.stderr.strip().splitlines()
-        return False, lines[-1] if lines else f"cosign exited {result.returncode}"
-    return True, f"verified: signed by {identity} (issuer {issuer})"
+        detail = lines[-1] if lines else f"cosign exited {result.returncode}"
+        if NO_MATCH in detail:
+            # A real answer, not a network blip: the signature is not the
+            # pinned signer's, and retrying won't change that.
+            break
+    return False, detail
 
 
 def _cosign_ref(ref: str, digest: str) -> str:
@@ -223,8 +239,8 @@ def check_cosign_signatures(root: str) -> list[str]:
     for ref, info in sorted(lock_data.items()):
         if not info.get("cosign_signed"):
             errors.append(
-                f"{ref}: {LOCK_FILE} records it as not cosign-signed; every "
-                f"base image must carry a signature from its pinned signer"
+                f"{ref}: {LOCK_FILE} {UNSIGNED}; every base image must "
+                f"carry a signature from its pinned signer"
             )
             continue
         ok, detail = cosign_verify(_cosign_ref(ref, info["digest"]))
@@ -284,9 +300,9 @@ def main(root: str | None = None) -> int:
             f"{len(lock_errors)} lock mismatch error(s), "
             f"{len(cosign_errors)} signature error(s) found."
         )
-        if errors or lock_errors:
+        if errors or lock_errors or any(UNSIGNED in e for e in cosign_errors):
             print(FIX_HINT)
-        else:
+        if cosign_errors:
             print(COSIGN_HINT)
         return 1
 
