@@ -31,17 +31,41 @@ CHARSETS = {
 }
 
 
-def _alphabet(charset: str, exclude_chars: str = "") -> str:
-    """The characters a secret is drawn from, after exclusions.
+def _check_charset(charset: str, exclude_chars: str) -> None:
+    """Refuse a charset or exclusions that aren't strings, or an unknown charset.
 
-    Raises:
-        ValueError: If charset is unknown or exclusions leave nothing.
+    Both can come from a file's metadata block, which anything may have
+    written: a list or mapping would raise TypeError, and a number would
+    be silently wrong (a file written before #77 could store an all-digit
+    `exclude_chars` as a number, dropping a leading zero).
     """
+    if not isinstance(charset, str):
+        raise ValueError(
+            f"charset must be a string, got {type(charset).__name__}"
+        )
+    if not isinstance(exclude_chars, str):
+        raise ValueError(
+            f"exclude_chars must be a string, got "
+            f"{type(exclude_chars).__name__}. A file written by sops-mcp "
+            "0.12.0 or earlier may store an all-digit exclude_chars as a "
+            "number; set it to the quoted string in the _meta_unencrypted "
+            "block with the sops CLI (sops edit), then try again."
+        )
     if charset not in CHARSETS:
         raise ValueError(
             f"Unknown charset {charset!r}. "
             f"Valid options: {', '.join(sorted(CHARSETS))}"
         )
+
+
+def _alphabet(charset: str, exclude_chars: str = "") -> str:
+    """The characters a secret is drawn from, after exclusions.
+
+    Raises:
+        ValueError: If charset or exclude_chars is not a string, charset is
+            unknown, or exclusions leave nothing.
+    """
+    _check_charset(charset, exclude_chars)
     chars = CHARSETS[charset]
     if exclude_chars:
         chars = "".join(c for c in chars if c not in exclude_chars)
@@ -107,10 +131,10 @@ def generate_secret(
         ValueError: If charset is unknown, length is invalid, or exclusions
                     leave an empty character set.
     """
-    if charset not in CHARSETS:
+    _check_charset(charset, exclude_chars)
+    if not isinstance(length, int) or isinstance(length, bool):
         raise ValueError(
-            f"Unknown charset {charset!r}. "
-            f"Valid options: {', '.join(sorted(CHARSETS))}"
+            f"Length must be an integer, got {type(length).__name__}"
         )
     if not MIN_LENGTH <= length <= MAX_LENGTH:
         raise ValueError(

@@ -1,12 +1,14 @@
 """SOPS encryption/decryption via CLI with secure temp file handling."""
 
+import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 from collections.abc import Collection
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
 
@@ -28,6 +30,78 @@ _AGE_KEY_ENV_VARS = (
 
 class SopsError(Exception):
     """Raised when a sops CLI operation fails."""
+
+
+# sops reads and writes YAML 1.2 (Go), and PyYAML speaks YAML 1.1. The two
+# disagree about plain scalars: `0189`, `1e3`, `0o17` and `0123456789` are
+# strings to PyYAML, so yaml.dump leaves them unquoted, and numbers to sops,
+# which then stores them as numbers; `=` and `!!merge <<`, which sops writes
+# unquoted for the strings "=" and "<<", make PyYAML's safe_load fail. So
+# plaintext goes to and comes back from sops as JSON, which has no implicit
+# types, and the YAML sops writes (the encrypted file, whose
+# `_meta_unencrypted` block is plaintext) is read with the YAML 1.2 core
+# schema below (#77).
+_INT_RE = re.compile(r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+")
+_FLOAT_RE = re.compile(
+    r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+    r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)"
+)
+
+
+class SopsYamlLoader(yaml.SafeLoader):
+    """A safe loader with the YAML 1.2 core schema, as sops resolves it.
+
+    Plain scalars resolve only to null, bool, int and float as YAML 1.2
+    defines them, and to str otherwise: no YAML 1.1 `yes`/`on` booleans,
+    sexagesimals, timestamps, `=` or `<<` merge keys.
+    """
+
+    yaml_implicit_resolvers: ClassVar[dict] = {}
+
+
+def _construct_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int:
+    value = loader.construct_scalar(node)
+    if value.startswith(("0o", "0x")):
+        return int(value, 0)
+    return int(value, 10)  # 1.2: a leading zero is decimal, not octal
+
+
+def _construct_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float:
+    value = loader.construct_scalar(node).lower()
+    if value.endswith(".inf"):
+        return -math.inf if value.startswith("-") else math.inf
+    if value == ".nan":
+        return math.nan
+    return float(value)
+
+
+def _construct_str(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str:
+    return loader.construct_scalar(node)
+
+
+for _tag, _regexp, _first in (
+    ("tag:yaml.org,2002:null", r"~|null|Null|NULL|", [*"~nN", ""]),
+    ("tag:yaml.org,2002:bool", r"true|True|TRUE|false|False|FALSE", list("tTfF")),
+    ("tag:yaml.org,2002:int", _INT_RE.pattern, list("-+0123456789")),
+    ("tag:yaml.org,2002:float", _FLOAT_RE.pattern, list("-+.0123456789")),
+):
+    SopsYamlLoader.add_implicit_resolver(
+        _tag, re.compile(rf"^(?:{_regexp})$"), _first
+    )
+SopsYamlLoader.add_constructor("tag:yaml.org,2002:int", _construct_int)
+SopsYamlLoader.add_constructor("tag:yaml.org,2002:float", _construct_float)
+# sops writes the string "<<" as `!!merge <<`. As a value it is that string;
+# SafeLoader still treats a `<<` *key* as a merge.
+SopsYamlLoader.add_constructor("tag:yaml.org,2002:merge", _construct_str)
+
+
+def load_sops_yaml(content: str) -> Any:
+    """Parse YAML that sops wrote (or reads) with sops' own scalar rules.
+
+    Raises:
+        yaml.YAMLError: If the content is not valid YAML.
+    """
+    return yaml.load(content, Loader=SopsYamlLoader)  # noqa: S506 - a SafeLoader
 
 
 def _write_empty_config(tmpdir: str) -> str:
@@ -176,7 +250,7 @@ _ENCRYPTION_MODE_KEYS = (
 def _envelope_of(encrypted_content: str) -> dict:
     """Return the `sops` metadata block, or raise if it isn't there."""
     try:
-        parsed = yaml.safe_load(encrypted_content)
+        parsed = load_sops_yaml(encrypted_content)
     except yaml.YAMLError as exc:
         raise SopsError(f"content is not valid YAML: {exc}") from exc
     return envelope_from(parsed)
@@ -345,7 +419,8 @@ class SopsEncryptor:
             # metadata block. A manifest (encrypted_regex) has its own root
             # keys, and its caller validates the keys under stringData.
             _check_flat_root_keys(data, carried)
-        plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
+        # JSON, not YAML: see SopsYamlLoader. sops still writes YAML.
+        plaintext = json.dumps(data, allow_nan=False)
         # sops refuses more than one encryption-mode flag, so exactly one.
         mode = (
             ["--encrypted-regex", encrypted_regex]
@@ -353,7 +428,7 @@ class SopsEncryptor:
             else ["--unencrypted-suffix", UNENCRYPTED_SUFFIX]
         )
         tmpdir = _make_secure_tempdir()
-        tmpfile = os.path.join(tmpdir, "secrets.yaml")
+        tmpfile = os.path.join(tmpdir, "secrets.json")
         scratch_home = os.path.join(tmpdir, "home")
 
         try:
@@ -361,7 +436,7 @@ class SopsEncryptor:
             empty_config = _write_empty_config(tmpdir)
             fd = os.open(tmpfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as f:
-                f.write(plaintext_yaml)
+                f.write(plaintext)
 
             result = subprocess.run(
                 [
@@ -370,7 +445,7 @@ class SopsEncryptor:
                     "encrypt",
                     "--age", domain.age_argument,
                     *mode,
-                    "--input-type", "yaml",
+                    "--input-type", "json",
                     "--output-type", "yaml",
                     tmpfile,
                 ],
@@ -432,7 +507,8 @@ class SopsEncryptor:
                     "--config", empty_config,
                     "decrypt",
                     "--input-type", "yaml",
-                    "--output-type", "yaml",
+                    # JSON keeps the type sops stored: see SopsYamlLoader.
+                    "--output-type", "json",
                     tmpfile,
                 ],
                 capture_output=True,
@@ -445,7 +521,13 @@ class SopsEncryptor:
             if result.returncode != 0:
                 raise SopsError(f"sops decrypt failed: {result.stderr.strip()}")
 
-            return yaml.safe_load(result.stdout) or {}
+            try:
+                return json.loads(result.stdout) or {}
+            except json.JSONDecodeError:
+                # Not chained or echoed: the text is decrypted plaintext.
+                raise SopsError(
+                    "sops decrypt returned output that is not JSON"
+                ) from None
 
         finally:
             self._secure_cleanup(tmpfile, tmpdir)
