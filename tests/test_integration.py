@@ -8,6 +8,7 @@ import subprocess
 import pytest
 import yaml
 
+import sops_mcp.sops as sops_module
 from sops_mcp.domains import load_domains
 from sops_mcp.server import SopsMcpServer
 from sops_mcp.sops import SopsEncryptor
@@ -378,3 +379,99 @@ def test_charset_schema_lists_urlsafe_and_documents_base64():
     assert "base64" in charset["enum"]
     assert "not base64 encoding" in charset["description"]
     assert "warning" in charset["description"]
+
+
+async def test_rotate_refuses_keys_the_metadata_block_does_not_describe(server):
+    """#46: sops_add_secrets on a legacy file writes a block that lists only
+    the new key. Rotation used to rebuild the file from that block alone, so
+    it returned a file without the legacy keys. It must refuse instead, name
+    the undescribed keys (never their values), and drop nothing."""
+    domain = _domain(server)
+    legacy = server.encryptor.encrypt(
+        {"LEGACY_A": "value-a-zz91", "LEGACY_B": "value-b-zz92"}, domain
+    )
+
+    added = await server._add_secrets({
+        "encrypted_content": legacy,
+        "secrets": [
+            {"key_name": "NEW_TOKEN", "source": "generated", "length": 24},
+        ],
+    })
+    partial = added[0].text
+    assert set(yaml.safe_load(partial)["_meta_unencrypted"]["secrets"]) == {
+        "NEW_TOKEN"
+    }
+    before = server.encryptor.decrypt(partial, domain)
+
+    with pytest.raises(ValueError, match="does not describe") as excinfo:
+        await server._rotate_generated({"encrypted_content": partial})
+    message = str(excinfo.value)
+    assert "LEGACY_A" in message
+    assert "LEGACY_B" in message
+    assert "NEW_TOKEN" not in message
+    for value in before.values():
+        if isinstance(value, str):
+            assert value not in message
+
+    # Nothing returned, so nothing dropped: the input still decrypts to
+    # every key it held.
+    after = server.encryptor.decrypt(partial, domain)
+    assert after == before
+    assert {"LEGACY_A", "LEGACY_B", "NEW_TOKEN"} <= set(after)
+
+
+async def _with_extra(server, extra, entries=None):
+    """A file made by sops_create_secrets (so its block is complete), then
+    re-encrypted with `extra` keys added and `entries` merged into the
+    block's secrets, the way a hand edit with the sops CLI would.
+
+    encrypt() refuses root keys no tool may write, such as '_note' (#65),
+    so `extra` is passed as `carried`, as for any legacy file: the sops
+    CLI writes such keys, and rotate has to cope with them."""
+    domain = _domain(server)
+    created = await server._create_secrets({
+        "secrets": [
+            {"key_name": "TOKEN", "source": "generated", "length": 16},
+        ],
+    })
+    values = server.encryptor.decrypt(created[0].text, domain)
+    values.update(extra)
+    values["_meta_unencrypted"]["secrets"].update(entries or {})
+    return server.encryptor.encrypt(values, domain, carried=set(extra))
+
+
+@pytest.mark.parametrize(
+    ("extra", "entries", "named"),
+    [
+        # A bare or scalar entry doesn't describe the key: topological_order
+        # skips it, so rotating would drop the value and keep the entry.
+        ({"LEGACY_A": "value-zz93"}, {"LEGACY_A": None}, "LEGACY_A"),
+        ({"LEGACY_A": "value-zz93"}, {"LEGACY_A": "external"}, "LEGACY_A"),
+        # '_'-prefixed keys would be dropped too.
+        ({"_note": "value-zz94"}, {}, "_note"),
+        # An unquoted NO, which PyYAML (YAML 1.1) would load as False. sops
+        # keeps it a string key and quotes it on decrypt, so it is named as
+        # written (the guard's str() is only a backstop).
+        ({"NO": "value-zz95", "LEGACY_B": "value-zz96"}, {}, "NO"),
+    ],
+)
+async def test_rotate_refuses_each_kind_of_undescribed_key(
+    server, extra, entries, named, monkeypatch
+):
+    real_dump = sops_module.yaml.dump
+
+    def unquoted_no(data, *args, **kwargs):
+        # yaml.dump quotes 'NO'; a hand-written file wouldn't.
+        return real_dump(data, *args, **kwargs).replace("'NO':", "NO:")
+
+    with monkeypatch.context() as patch:
+        if "NO" in extra:
+            patch.setattr(sops_module.yaml, "dump", unquoted_no)
+        content = await _with_extra(server, extra, entries)
+    with pytest.raises(ValueError, match="does not describe") as excinfo:
+        await server._rotate_generated({"encrypted_content": content})
+    message = str(excinfo.value)
+    assert named in message
+    assert "TOKEN" not in message
+    for value in extra.values():
+        assert value not in message
