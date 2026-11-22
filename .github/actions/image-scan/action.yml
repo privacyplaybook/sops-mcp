@@ -36,6 +36,25 @@ inputs:
       critical). Only vulnerabilities with a fix available count. Callers
       state it explicitly, so the threshold is visible in the workflow.
     required: true
+  on-findings:
+    description: >
+      What a finding at or above `fail-on` does. `fail` (the default, for
+      the PR and publish gates) fails the step. `report` passes it and sets
+      the `findings` output to true, for a caller that reports findings
+      itself (rescan-latest.yml). A scan error fails the step either way.
+    required: false
+    default: fail
+
+outputs:
+  findings:
+    description: >
+      `true` when Grype found a fixable vulnerability at or above `fail-on`,
+      else `false`. Set under either `on-findings`; with `fail` the step
+      also fails, so only a `continue-on-error` caller would read it.
+    value: ${{ steps.scan.outputs.findings }}
+  report-json:
+    description: Path of Grype's JSON report (matches after the allowlist).
+    value: ${{ steps.scan.outputs.report-json }}
 
 runs:
   using: composite
@@ -81,10 +100,12 @@ runs:
         echo "$dir" >> "$GITHUB_PATH"
 
     - name: Scan ${{ inputs.image }}
+      id: scan
       shell: bash
       env:
         IMAGE: ${{ inputs.image }}
         FAIL_ON: ${{ inputs.fail-on }}
+        ON_FINDINGS: ${{ inputs.on-findings }}
         GRYPE_CHECK_FOR_APP_UPDATE: "false"
         # The vulnerability DB is downloaded fresh each run (~70 MB) and
         # Grype refuses one older than 5 days, so a stale DB fails the
@@ -95,24 +116,48 @@ runs:
       # Default scope (squashed): what the final filesystem holds, which is
       # what runs. all-layers would also report package versions a later
       # layer upgraded away, as false positives.
+      #
+      # Grype's exit status: 0 clean, 2 a vulnerability at or above
+      # --fail-on, 1 any error (checked against v0.121.1). Only 2 counts as
+      # findings, and only with a JSON report that parsed, so an error never
+      # passes as `on-findings: report`.
       run: |
         set -euo pipefail
+        case "$ON_FINDINGS" in fail|report) ;; *)
+          echo "::error::on-findings must be fail or report, not '$ON_FINDINGS'"
+          exit 1;;
+        esac
         report="$RUNNER_TEMP/grype-report.txt"
+        json="$RUNNER_TEMP/grype-report.json"
+        rm -f "$report" "$json"
         set +e
         grype "$IMAGE" -c .grype.yaml \
-          --only-fixed --fail-on "$FAIL_ON" -o table --file "$report"
+          --only-fixed --fail-on "$FAIL_ON" -o "table=$report" -o "json=$json"
         rc=$?
         set -e
+        findings=false
+        if [ "$rc" -eq 2 ] && jq -e '.matches | length > 0' "$json" >/dev/null 2>&1; then
+          findings=true
+        fi
+        {
+          echo "findings=$findings"
+          echo "report-json=$json"
+        } >> "$GITHUB_OUTPUT"
         {
           echo "### Image scan: \`$IMAGE\`"
           echo
-          echo "Fails on fixable vulnerabilities of severity **$FAIL_ON** or above (allowlist: \`.grype.yaml\`)."
+          if [ "$ON_FINDINGS" = report ]; then verb=Reports; else verb="Fails on"; fi
+          echo "$verb fixable vulnerabilities of severity **$FAIL_ON** or above (allowlist: \`.grype.yaml\`)."
           echo
           echo '```'
           cat "$report" 2>/dev/null || echo "(no report)"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
         cat "$report" 2>/dev/null || true
+        if [ "$findings" = true ] && [ "$ON_FINDINGS" = report ]; then
+          echo "::warning::fixable vulnerabilities at or above $FAIL_ON; reported, not failed (on-findings: report)"
+          exit 0
+        fi
         if [ "$rc" -ne 0 ]; then
           echo "::error::grype exited $rc: fixable vulnerabilities at or above $FAIL_ON (or a scan error). See the table above."
         fi

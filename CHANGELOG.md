@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sops_add_secrets`, `sops_create_k8s_secret` and `sops_rotate_generated`
   add a `WARNING` line to their summary naming the key and its parameters,
   never its value. Nothing is refused: existing callers keep working (#62).
+- **The published `:latest` image is re-scanned daily.** A scheduled
+  workflow (`rescan-latest.yml`) runs the same Grype scan, threshold and
+  allowlist as the build-time gate against `ghcr.io/privacyplaybook/sops-mcp:latest`,
+  and opens or updates a single `scheduled-image-scan` issue on a finding;
+  a clean scan closes it (#61). The scanner job holds no write token; only
+  the issue job has `issues: write`.
 
 ### Documentation
 

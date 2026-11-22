@@ -491,6 +491,13 @@ on `sops` or `age`, a rebuild picks up Wolfi's newest (see below). To accept
 a finding instead, add an `ignore:` rule naming the `vulnerability:` with a
 `reason:` to `.grype.yaml`.
 
+Those scans run when an image is built. A vulnerability published later is
+caught by `rescan-latest.yml`, which scans the published `:latest` daily
+(05:23 UTC, or on demand from the Actions tab) at the same threshold and with
+the same allowlist. On a finding it opens one issue labelled
+`scheduled-image-scan`, or updates the open one, and the first clean scan
+closes it.
+
 A pushed version tag reaches PyPI and the GitHub Release only after
 `publish.yml` has pushed and signed that tag's image: `publish-pypi.yml`
 waits for the signature before it uploads. (A Release made by hand, by
