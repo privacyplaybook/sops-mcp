@@ -1,5 +1,7 @@
 """SOPS encryption/decryption via CLI with secure temp file handling."""
 
+import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +30,154 @@ _AGE_KEY_ENV_VARS = (
 
 class SopsError(Exception):
     """Raised when a sops CLI operation fails."""
+
+
+# sops reads and writes YAML 1.2 (Go), and PyYAML speaks YAML 1.1. The two
+# disagree about plain scalars: `0189`, `1e3`, `0o17` and `0123456789` are
+# strings to PyYAML, so a plain yaml.dump leaves them unquoted, and numbers
+# to sops, which then stores them as numbers; `=` and `!!merge <<`, which
+# sops writes unquoted for the strings "=" and "<<", make PyYAML's safe_load
+# fail. So plaintext goes to sops as YAML with every string double-quoted
+# (_QuotedStrDumper: ints, floats, bools and nulls keep their YAML types,
+# which JSON input would turn into float64), comes back as JSON (nothing
+# to resolve, though an integral float such as 5.0 comes back as int 5),
+# and the YAML sops writes (the encrypted file, whose `_meta_unencrypted`
+# block is plaintext) is read with the YAML 1.2 core schema below (#77).
+_INT_RE = re.compile(r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+")
+_FLOAT_RE = re.compile(
+    r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+    r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)"
+)
+
+
+class SopsYamlLoader(yaml.SafeLoader):
+    """A safe loader with the YAML 1.2 core schema.
+
+    Plain scalars resolve only to null, bool, int and float as the YAML 1.2
+    core schema defines them, and to str otherwise: no YAML 1.1 `yes`/`on`
+    booleans, sexagesimals, timestamps or `=`. sops' own resolver (Go
+    yaml.v3) accepts a little more as numbers (`0b101`, `1_000`, and `0123`
+    as octal), so it quotes those strings when it writes them; reading them
+    as strings here is the safe side. A `<<` key is still a merge key.
+    """
+
+    # Emptied, not inherited: only the resolvers added below apply.
+    yaml_implicit_resolvers: dict = {}  # noqa: RUF012 - BaseResolver declares it
+
+
+def _construct_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int:
+    value = loader.construct_scalar(node)
+    if value.startswith(("0o", "0x")):
+        return int(value, 0)
+    return int(value, 10)  # 1.2: a leading zero is decimal, not octal
+
+
+def _construct_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float:
+    value = loader.construct_scalar(node).lower()
+    if value.endswith(".inf"):
+        return -math.inf if value.startswith("-") else math.inf
+    if value == ".nan":
+        return math.nan
+    return float(value)
+
+
+def _construct_str(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str:
+    return loader.construct_scalar(node)
+
+
+for _tag, _regexp, _first in (
+    ("tag:yaml.org,2002:null", r"~|null|Null|NULL|", [*"~nN", ""]),
+    ("tag:yaml.org,2002:bool", r"true|True|TRUE|false|False|FALSE", list("tTfF")),
+    ("tag:yaml.org,2002:int", _INT_RE.pattern, list("-+0123456789")),
+    ("tag:yaml.org,2002:float", _FLOAT_RE.pattern, list("-+.0123456789")),
+):
+    SopsYamlLoader.add_implicit_resolver(
+        _tag, re.compile(rf"^(?:{_regexp})$"), _first
+    )
+SopsYamlLoader.add_constructor("tag:yaml.org,2002:int", _construct_int)
+SopsYamlLoader.add_constructor("tag:yaml.org,2002:float", _construct_float)
+# sops writes the string "<<" as `!!merge <<`. As a value it is that string;
+# SafeLoader still treats a `<<` *key* as a merge.
+SopsYamlLoader.add_constructor("tag:yaml.org,2002:merge", _construct_str)
+
+
+class _QuotedStrDumper(yaml.SafeDumper):
+    """A safe dumper that writes every string double-quoted, so neither
+    YAML 1.1 nor 1.2 can read one as anything else."""
+
+
+def _represent_quoted_str(dumper: yaml.SafeDumper, value: str) -> yaml.Node:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style='"')
+
+
+_QuotedStrDumper.add_representer(str, _represent_quoted_str)
+
+
+_INT64 = range(-(2**63), 2**63)
+
+
+def _parse_stored_int(text: str) -> int | float:
+    """Read an integer from sops' decrypted JSON as the value sops holds.
+
+    sops keeps an int as int64, so a JSON integer outside that range is a
+    float64 that Go wrote without an exponent (1.2345678901234567e+19 comes
+    out as 12345678901234567000). Read back as a float it is that same
+    float64, and re-encrypting it writes the stored value unchanged instead
+    of an int that `_check_numbers` refuses as new input.
+    """
+    value = int(text)
+    return value if value in _INT64 else float(text)
+
+
+def _check_numbers(value: Any) -> None:
+    """Refuse numbers sops can't store and give back exactly.
+
+    sops keeps ints as int64 (larger ones fail or turn into float64), and
+    decrypting to JSON can't write an infinite or NaN float.
+    """
+    if isinstance(value, dict):
+        for item in value.values():
+            _check_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            _check_numbers(item)
+    elif isinstance(value, bool):
+        return
+    elif isinstance(value, int) and value not in _INT64:
+        raise SopsError(
+            "an integer is outside the 64-bit range sops can store; "
+            "store it as a string"
+        )
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise SopsError(
+            "an infinite or NaN number can't be stored; store it as a string"
+        )
+
+
+def _dump_for_sops(data: Any) -> str:
+    """Plaintext YAML for sops to encrypt, with no ambiguous scalars.
+
+    Raises:
+        SopsError: If a number is one sops can't store exactly.
+    """
+    _check_numbers(data)
+    return yaml.dump(
+        data,
+        Dumper=_QuotedStrDumper,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+        width=math.inf,
+    )
+
+
+def load_sops_yaml(content: str) -> Any:
+    """Parse YAML that sops wrote (or reads) with sops' own scalar rules.
+
+    Raises:
+        yaml.YAMLError: If the content is not valid YAML.
+    """
+    return yaml.load(content, Loader=SopsYamlLoader)  # noqa: S506 - a SafeLoader
 
 
 def _write_empty_config(tmpdir: str) -> str:
@@ -176,7 +326,7 @@ _ENCRYPTION_MODE_KEYS = (
 def _envelope_of(encrypted_content: str) -> dict:
     """Return the `sops` metadata block, or raise if it isn't there."""
     try:
-        parsed = yaml.safe_load(encrypted_content)
+        parsed = load_sops_yaml(encrypted_content)
     except yaml.YAMLError as exc:
         raise SopsError(f"content is not valid YAML: {exc}") from exc
     return envelope_from(parsed)
@@ -345,7 +495,8 @@ class SopsEncryptor:
             # metadata block. A manifest (encrypted_regex) has its own root
             # keys, and its caller validates the keys under stringData.
             _check_flat_root_keys(data, carried)
-        plaintext_yaml = yaml.dump(data, default_flow_style=False, sort_keys=False)
+        # Every string quoted: see SopsYamlLoader.
+        plaintext = _dump_for_sops(data)
         # sops refuses more than one encryption-mode flag, so exactly one.
         mode = (
             ["--encrypted-regex", encrypted_regex]
@@ -360,8 +511,8 @@ class SopsEncryptor:
             os.mkdir(scratch_home, 0o700)
             empty_config = _write_empty_config(tmpdir)
             fd = os.open(tmpfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(plaintext_yaml)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(plaintext)
 
             result = subprocess.run(
                 [
@@ -376,6 +527,7 @@ class SopsEncryptor:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 env=self._child_env(domain, scratch_home, with_keys=False),
                 check=False,
@@ -423,7 +575,7 @@ class SopsEncryptor:
             os.mkdir(scratch_home, 0o700)
             empty_config = _write_empty_config(tmpdir)
             fd = os.open(tmpfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(encrypted_content)
 
             result = subprocess.run(
@@ -432,20 +584,40 @@ class SopsEncryptor:
                     "--config", empty_config,
                     "decrypt",
                     "--input-type", "yaml",
-                    "--output-type", "yaml",
+                    # JSON keeps the type sops stored: see SopsYamlLoader.
+                    "--output-type", "json",
                     tmpfile,
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 env=self._child_env(domain, scratch_home, with_keys=True),
                 check=False,
             )
 
             if result.returncode != 0:
-                raise SopsError(f"sops decrypt failed: {result.stderr.strip()}")
+                stderr = result.stderr.strip()
+                if re.search(r"json: unsupported value: (?:[+-]Inf|NaN)", stderr):
+                    # Go's JSON encoder has no infinity or NaN. Its message
+                    # names only the value kind, never the plaintext.
+                    raise SopsError(
+                        "sops decrypt failed: the file holds an infinite or "
+                        "NaN number, which sops-mcp can't read. Quote it "
+                        "with the sops CLI (sops edit), then try again. "
+                        f"({stderr})"
+                    )
+                raise SopsError(f"sops decrypt failed: {stderr}")
 
-            return yaml.safe_load(result.stdout) or {}
+            try:
+                return json.loads(
+                    result.stdout, parse_int=_parse_stored_int
+                ) or {}
+            except json.JSONDecodeError:
+                # Not chained or echoed: the text is decrypted plaintext.
+                raise SopsError(
+                    "sops decrypt returned output that is not JSON"
+                ) from None
 
         finally:
             self._secure_cleanup(tmpfile, tmpdir)

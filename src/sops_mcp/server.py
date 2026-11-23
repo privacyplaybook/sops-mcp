@@ -43,6 +43,7 @@ from .sops import (
     encryption_mode_features_of,
     envelope_from,
     key_features_of,
+    load_sops_yaml,
     recipients_of,
     unsupported_key_features,
 )
@@ -676,7 +677,7 @@ class SopsMcpServer:
     def _reject_unsupported_content(cls, content: str) -> None:
         """:meth:`_reject_unsupported_envelope`, from the raw content."""
         try:
-            parsed = yaml.safe_load(content)
+            parsed = load_sops_yaml(content)
         except yaml.YAMLError as exc:
             raise SopsError(f"content is not valid YAML: {exc}") from exc
         cls._reject_unsupported_envelope(parsed)
@@ -735,7 +736,7 @@ class SopsMcpServer:
         later checks, which already report it.
         """
         try:
-            parsed = yaml.safe_load(content)
+            parsed = load_sops_yaml(content)
         except yaml.YAMLError as exc:
             # Not echoed: a parser error quotes the offending line, and
             # this content may be a decrypted file pasted by mistake.
@@ -1363,7 +1364,7 @@ class SopsMcpServer:
         if not content:
             raise ValueError("No encrypted content provided")
 
-        parsed = yaml.safe_load(content)
+        parsed = load_sops_yaml(content)
         if not isinstance(parsed, dict):
             raise ValueError("Content is not valid YAML")
 
@@ -1714,8 +1715,8 @@ class SopsMcpServer:
         # but the block itself counts, '_'-prefixed ones included, since
         # they would be dropped too. An entry that isn't a mapping doesn't
         # describe its key: topological_order skips it, so its value would
-        # be dropped as well. Names are stringified because YAML 1.1 loads
-        # keys such as NO or 2024 as bool or int.
+        # be dropped as well. Names are stringified because YAML loads
+        # keys such as true or 2024 as bool or int.
         def _described(key: Any) -> bool:
             return isinstance(meta_secrets, dict) and isinstance(
                 meta_secrets.get(key), dict

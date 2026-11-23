@@ -37,7 +37,8 @@ ENV PATH=/opt/venv/bin:$PATH
 #
 # pyyaml is the one sdist: 6.0.3 has no cp315 wheel. It builds without
 # libyaml (this stage has no libyaml-dev), i.e. the pure-Python loader;
-# sops-mcp only calls safe_load and dump. Don't add libyaml-dev here: the
+# sops-mcp only uses the pure-Python SafeLoader and SafeDumper (safe_load,
+# and yaml.load / yaml.dump with subclasses of them). Don't add libyaml-dev: the
 # runtime stage has no libyaml.so, so a C extension built against it would
 # fail to load there and pyyaml would fall back to pure Python anyway.
 #

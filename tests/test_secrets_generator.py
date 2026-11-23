@@ -121,3 +121,27 @@ def test_weak_secret_is_still_generated():
 def test_entropy_rejects_an_unknown_charset():
     with pytest.raises(ValueError, match="Unknown charset"):
         entropy_bits(10, "nope")
+
+
+# --- Metadata of the wrong type is a ValueError, not a TypeError (#77) ---
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"charset": ["numeric"]}, "charset must be a string"),
+        ({"charset": {"a": 1}}, "charset must be a string"),
+        ({"exclude_chars": 123456789.0}, "exclude_chars must be a string"),
+        ({"exclude_chars": 12}, "exclude_chars must be a string"),
+        ({"exclude_chars": ["a"]}, "exclude_chars must be a string"),
+        ({"length": "8"}, "Length must be an integer"),
+        ({"length": 8.0}, "Length must be an integer"),
+        ({"length": True}, "Length must be an integer"),
+    ],
+)
+def test_wrong_types_are_value_errors(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        generate_secret(**kwargs)
+    if "length" not in kwargs:
+        with pytest.raises(ValueError, match=match):
+            entropy_warning(8, **kwargs)

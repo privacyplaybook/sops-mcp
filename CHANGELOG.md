@@ -70,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--upgrade` (pydantic-core 2.46.5 had no cp315 wheel; 2.50.4 does).
   PyYAML 6.0.3 has no cp315 wheel yet, so the build stage compiles it from
   its hash-pinned sdist, without libyaml (the pure-Python loader; sops-mcp
-  only uses `safe_load` and `dump`). Python 3.15 is added to the CI matrix
+  only uses the pure-Python `SafeLoader` and `SafeDumper`). Python 3.15 is added to the CI matrix
   and the package classifiers.
 - **Build tools are hash-pinned too.** A new `requirements-build.lock.txt`
   (hatchling, setuptools, Cython) is installed hash-checked, sdists build
@@ -94,6 +94,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.grype.yaml`, one `vulnerability:` and `reason:` per rule.
 
 ### Fixed
+
+- **Secret values that look like numbers keep their type.** A string such as
+  `0189`, `0123456789`, `1e3` or `0o17`, a generated all-digit secret
+  included, could come back from sops as a number and lose its leading zero,
+  because PyYAML (YAML 1.1) left it unquoted and sops (YAML 1.2) read it as
+  one. Plaintext now goes to sops with every string quoted and comes back
+  as JSON, and sops' YAML is read with YAML 1.2 rules. Wrong-typed
+  `charset`, `exclude_chars` or `length` metadata is now a clear
+  `ValueError`, not a `TypeError` (#77). Numbers sops can't store exactly
+  (infinity, NaN, integers outside 64 bits) are refused when they are new
+  input. A whole-number float beyond the 64-bit integer range already in
+  a file, which sops hands back as a big integer, is written back as the
+  same float, so files #77 already changed can still be edited. Smaller
+  whole-number floats (`1.0`, `8080.0`) are written back as integers, as
+  before. A
+  file the sops CLI wrote with an infinite or NaN value can't be decrypted
+  any more: quote it with `sops edit`. Plaintext is now read and written
+  as UTF-8 whatever the locale.
 
 - **`initialize` reports sops-mcp's own version.** `serverInfo.version`
   was the `mcp` SDK's version (0.12.0 reported 1.30.0), because the server
